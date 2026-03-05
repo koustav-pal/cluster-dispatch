@@ -104,7 +104,7 @@ What this does:
   `ssh <host> mkdir -p <remote_root>`
 - creates default target in config
 
-If `--default-target` is omitted, it defaults to your current directory name.
+If `--target` is omitted, it defaults to your current directory name.
 
 ### 3. Set analysis and tags
 
@@ -186,7 +186,7 @@ Key options:
 - `--scheduler` (required: `sge|univa|pbs|slurm|lsf|none`)
 - `--remote-root` (required, absolute remote path)
 - `--template-file` (required)
-- `--default-target` (optional)
+- `--target` (optional)
 - default resource options:
   - `--cpus`
   - `--memory`

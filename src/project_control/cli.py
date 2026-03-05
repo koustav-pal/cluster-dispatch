@@ -143,7 +143,9 @@ def init(
     host: str = typer.Option(..., help="SSH host alias for the default target"),
     scheduler: str = typer.Option(..., help="Default scheduler for this project: sge|univa|pbs|slurm|lsf|none"),
     default_target: Optional[str] = typer.Option(
-        None, help="Default target name (defaults to current project root directory name)"
+        None,
+        "--target",
+        help="Default target name (defaults to current project root directory name)",
     ),
     remote_root: str = typer.Option(..., help="Remote absolute root directory for this project"),
     default_cpus: int = typer.Option(1, "--cpus", help="Default CPUs for this target"),
