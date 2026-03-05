@@ -113,6 +113,9 @@ If `--target` is omitted, it defaults to your current directory name.
 pc analysis use analyses/run_001
 pc analysis tag results
 pc analysis tag reports/figures
+pc analysis tag --remote remote_only_outputs
+pc analysis list
+pc analysis list --remote
 ```
 
 ### 4. Run job
@@ -143,7 +146,7 @@ pc status
 pc status --target cluster-a
 pc status list --analysis analyses/run_001
 pc status global
-pc pull
+pc analysis pull
 ```
 
 ## Multi-target workflow
@@ -214,6 +217,13 @@ Sets active analysis directory (must be under project root).
 
 ### `pc analysis tag <path>`
 Tags a path inside active analysis for pull.
+- default: validates path exists locally under active analysis
+- `--remote`: validates path exists on remote analysis directory (for remote-only paths)
+
+### `pc analysis list [--remote]`
+Lists subdirectories inside active analysis.
+- default: local active analysis directory
+- `--remote`: corresponding remote analysis directory on active target
 
 ### `pc run <command...>`
 Syncs active analysis to remote, renders template, submits job.
@@ -228,8 +238,10 @@ Subcommands:
 Option:
 - `pc status --target <name>` for target-scoped status from any context.
 
-### `pc pull`
+### `pc analysis pull [--remote]`
 Pulls only tagged paths for active analysis from remote run directory.
+- default: pulls tagged paths that already exist locally
+- `--remote`: also pulls tagged paths that are remote-only (not present locally)
 
 ## Files and state
 

@@ -351,6 +351,9 @@ def analysis_use(
 @analysis_app.command("tag")
 def analysis_tag(
     path: Annotated[Path, typer.Argument(help="Path inside active analysis to tag for pull")],
+    remote: bool = typer.Option(
+        False, "--remote", help="Tag path by validating against remote analysis directory"
+    ),
 ) -> None:
     """Tag a path inside active analysis for future pulls."""
     project_root = _project_root()
@@ -363,19 +366,104 @@ def analysis_tag(
     except ValueError as exc:
         raise typer.BadParameter("Tag path must be inside the active analysis directory") from exc
 
-    if not candidate.exists():
-        raise typer.BadParameter(f"Tag path not found: {candidate}")
-
     tag_value = relative_to_analysis.as_posix()
+    if not remote:
+        if not candidate.exists():
+            raise typer.BadParameter(f"Tag path not found locally: {candidate}")
+    else:
+        target_name, target = _active_target(cfg)
+        if not target.remote_root:
+            raise typer.BadParameter(
+                f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+            )
+        analysis_rel = (cfg.active_analysis or "").strip("/")
+        if not analysis_rel:
+            raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+        remote_tag_path = f"{remote_analysis_root}/{tag_value}"
+        proc = subprocess.run(
+            [
+                "ssh",
+                target.host,
+                "bash",
+                "-lc",
+                f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0 or proc.stdout.strip() != "OK":
+            raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+
     analysis_key = cfg.active_analysis or ""
     tags = cfg.analysis_tags.get(analysis_key, [])
     if tag_value not in tags:
         tags.append(tag_value)
         cfg.analysis_tags[analysis_key] = sorted(tags)
         save_config(project_root, cfg)
-        typer.echo(f"Tagged analysis path: {tag_value}")
+        mode = "remote" if remote else "local"
+        typer.echo(f"Tagged analysis path ({mode}): {tag_value}")
     else:
         typer.echo(f"Already tagged: {tag_value}")
+
+
+@analysis_app.command("list")
+def analysis_list(
+    remote: bool = typer.Option(False, "--remote", help="List directories from remote analysis directory"),
+) -> None:
+    """List directories inside the active analysis directory."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    analysis_dir = _require_active_analysis(cfg, project_root)
+
+    if not remote:
+        dirs = sorted([p.name for p in analysis_dir.iterdir() if p.is_dir()])
+        if not dirs:
+            typer.echo("No local subdirectories found in active analysis")
+            return
+        typer.echo(f"Local directories in {cfg.active_analysis}:")
+        for name in dirs:
+            typer.echo(f"- {name}")
+        return
+
+    target_name, target = _active_target(cfg)
+    if not target.remote_root:
+        raise typer.BadParameter(
+            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+        )
+    analysis_rel = (cfg.active_analysis or "").strip("/")
+    if not analysis_rel:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+
+    proc = subprocess.run(
+        [
+            "ssh",
+            target.host,
+            "bash",
+            "-lc",
+            (
+                f"P={shlex.quote(remote_analysis_root)}; "
+                'if [ -d "$P" ]; then '
+                'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; '
+                "fi"
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise typer.BadParameter(proc.stderr.strip() or "Failed to list remote directories")
+
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        typer.echo(f"No remote subdirectories found in {remote_analysis_root}")
+        return
+    typer.echo(f"Remote directories in {remote_analysis_root}:")
+    for name in lines:
+        typer.echo(f"- {name}")
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -763,8 +851,12 @@ def status_global(
     _show_global_status(limit=limit)
 
 
-@app.command()
-def pull() -> None:
+@analysis_app.command("pull")
+def pull(
+    remote: bool = typer.Option(
+        False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
+    ),
+) -> None:
     """Pull all tagged paths from the last run into the active analysis directory."""
     project_root = _project_root()
     cfg = load_config(project_root)
@@ -787,18 +879,31 @@ def pull() -> None:
         )
     remote_analysis_root = last["remote_run_dir"]
     pulled: list[str] = []
+    skipped: list[str] = []
     for tag_dir in analysis_tags:
         clean_tag = tag_dir.strip("/")
         if not clean_tag:
             continue
+        if not remote and not (analysis_dir / clean_tag).exists():
+            skipped.append(clean_tag)
+            continue
         tagged_remote = f"{remote_analysis_root}/./{clean_tag}"
-        _run_cmd(["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"], check=False)
-        pulled.append(clean_tag)
+        proc = _run_cmd(
+            ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"], check=False
+        )
+        if proc.returncode == 0:
+            pulled.append(clean_tag)
+        else:
+            skipped.append(clean_tag)
 
     if pulled:
         typer.echo("Pulled tagged paths:")
         for item in pulled:
             typer.echo(f"- {analysis_dir / item}")
+    if skipped:
+        typer.echo("Skipped tagged paths:")
+        for item in skipped:
+            typer.echo(f"- {item}")
 
 
 if __name__ == "__main__":
