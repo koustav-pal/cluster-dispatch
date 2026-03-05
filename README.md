@@ -115,7 +115,9 @@ pc analysis tag results
 pc analysis tag reports/figures
 pc analysis tag --remote remote_only_outputs
 pc analysis list
+pc analysis list --all
 pc analysis list --remote
+pc analysis list --remote --all
 ```
 
 ### 4. Run job
@@ -224,6 +226,7 @@ Tags a path inside active analysis for pull.
 Lists subdirectories inside active analysis.
 - default: local active analysis directory
 - `--remote`: corresponding remote analysis directory on active target
+- `--all`: include files too (not only directories)
 
 ### `pc run <command...>`
 Syncs active analysis to remote, renders template, submits job.

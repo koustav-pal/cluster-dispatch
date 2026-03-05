@@ -411,19 +411,26 @@ def analysis_tag(
 @analysis_app.command("list")
 def analysis_list(
     remote: bool = typer.Option(False, "--remote", help="List directories from remote analysis directory"),
+    all_entries: bool = typer.Option(False, "--all", help="Include files (not just directories)"),
 ) -> None:
-    """List directories inside the active analysis directory."""
+    """List entries inside the active analysis directory."""
     project_root = _project_root()
     cfg = load_config(project_root)
     analysis_dir = _require_active_analysis(cfg, project_root)
 
     if not remote:
-        dirs = sorted([p.name for p in analysis_dir.iterdir() if p.is_dir()])
-        if not dirs:
-            typer.echo("No local subdirectories found in active analysis")
+        entries = sorted(
+            [p.name for p in analysis_dir.iterdir() if (p.is_dir() if not all_entries else True)]
+        )
+        if not entries:
+            if all_entries:
+                typer.echo("No local entries found in active analysis")
+            else:
+                typer.echo("No local subdirectories found in active analysis")
             return
-        typer.echo(f"Local directories in {cfg.active_analysis}:")
-        for name in dirs:
+        label = "entries" if all_entries else "directories"
+        typer.echo(f"Local {label} in {cfg.active_analysis}:")
+        for name in entries:
             typer.echo(f"- {name}")
         return
 
@@ -446,8 +453,8 @@ def analysis_list(
             (
                 f"P={shlex.quote(remote_analysis_root)}; "
                 'if [ -d "$P" ]; then '
-                'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; '
-                "fi"
+                + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
+                + "fi"
             ),
         ],
         text=True,
@@ -459,9 +466,13 @@ def analysis_list(
 
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
-        typer.echo(f"No remote subdirectories found in {remote_analysis_root}")
+        if all_entries:
+            typer.echo(f"No remote entries found in {remote_analysis_root}")
+        else:
+            typer.echo(f"No remote subdirectories found in {remote_analysis_root}")
         return
-    typer.echo(f"Remote directories in {remote_analysis_root}:")
+    label = "entries" if all_entries else "directories"
+    typer.echo(f"Remote {label} in {remote_analysis_root}:")
     for name in lines:
         typer.echo(f"- {name}")
 
