@@ -40,7 +40,6 @@ class LastJob:
 
 @dataclass
 class ProjectConfig:
-    project_id: str
     scheduler: str
     default_target: str
     targets: dict[str, TargetConfig] = field(default_factory=dict)
@@ -99,7 +98,6 @@ def load_config(project_root: Path) -> ProjectConfig:
 
     raw = yaml.safe_load(cfg_path.read_text())
     return ProjectConfig(
-        project_id=raw["project_id"],
         scheduler=raw.get("scheduler", "none"),
         default_target=raw["default_target"],
         targets=_parse_targets(raw.get("targets", {})),

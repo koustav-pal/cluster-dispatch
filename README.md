@@ -24,7 +24,7 @@ HPC workflows often become hard to manage when commands, job scripts, paths, and
 - `Target`: named remote execution profile (host + scheduler + remote root + default resources + template).
 - `Active analysis`: local directory selected by `pc analysis use`.
 - `Tagged paths`: paths inside active analysis selected by `pc analysis tag`; `pc pull` only pulls these.
-- `Remote analysis root`: `<remote_root>/<project_id>/<active_analysis_path>`
+- `Remote analysis root`: `<remote_root>/<active_analysis_path>`
 
 No timestamped run directories are used. Remote structure mirrors local analysis path.
 
@@ -91,7 +91,6 @@ Optional placeholders:
 
 ```bash
 pc init \
-  --project-id my-project \
   --host cluster-a \
   --scheduler sge \
   --remote-root /scratch/me/projects \
@@ -102,7 +101,7 @@ What this does:
 - creates `.project_control/config.yml`
 - creates local state dirs under `.project_control/`
 - ensures remote project root exists:
-  `ssh <host> mkdir -p <remote_root>/<project_id>`
+  `ssh <host> mkdir -p <remote_root>`
 - creates default target in config
 
 If `--default-target` is omitted, it defaults to your current directory name.
@@ -183,7 +182,6 @@ If template contains `{queue}` or `{parallel_environment}`, those values must re
 Initializes project-control in current directory.
 
 Key options:
-- `--project-id` (required)
 - `--host` (required)
 - `--scheduler` (required: `sge|univa|pbs|slurm|lsf|none`)
 - `--remote-root` (required, absolute remote path)

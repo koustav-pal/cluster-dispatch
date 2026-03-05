@@ -140,7 +140,6 @@ def _render_scheduler_header(
 
 @app.command()
 def init(
-    project_id: str = typer.Option(..., help="Unique project id"),
     host: str = typer.Option(..., help="SSH host alias for the default target"),
     scheduler: str = typer.Option(..., help="Default scheduler for this project: sge|univa|pbs|slurm|lsf|none"),
     default_target: Optional[str] = typer.Option(
@@ -188,10 +187,9 @@ def init(
 
     user_template = template_file.read_text()
     _validate_template_variables(user_template)
-    remote_project_root = f"{remote_root.rstrip('/')}/{project_id}"
-    _run_cmd(["ssh", host, "mkdir", "-p", remote_project_root])
+    _run_cmd(["ssh", host, "mkdir", "-p", remote_root])
 
-    cfg = ProjectConfig(project_id=project_id, scheduler=scheduler, default_target=resolved_default_target)
+    cfg = ProjectConfig(scheduler=scheduler, default_target=resolved_default_target)
     cfg.targets[resolved_default_target] = TargetConfig(
         host=host,
         scheduler=scheduler,
@@ -441,7 +439,7 @@ def run(
     analysis_rel = (cfg.active_analysis or "").strip("/")
     if not analysis_rel:
         raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{cfg.project_id}/{analysis_rel}"
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
     remote_run_dir = remote_analysis_root
     remote_submit_script = f"{remote_analysis_root}/pc_submit.sh"
     remote_log_file = f"{remote_analysis_root}/run.log"
@@ -512,7 +510,6 @@ def run(
         project_root,
         {
             "submitted_at": now,
-            "project_id": cfg.project_id,
             "analysis": cfg.active_analysis,
             "analysis_tags": cfg.analysis_tags.get(cfg.active_analysis or "", []),
             "target": target_name,
