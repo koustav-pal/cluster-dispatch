@@ -492,7 +492,7 @@ def analysis_list(
         typer.echo(f"- {name}")
 
 
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@analysis_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
     ctx: typer.Context,
     interactive: Annotated[bool, typer.Option(help="Run in interactive SSH session (skip scheduler)")] = False,
@@ -520,7 +520,7 @@ def run(
 ) -> None:
     """Sync active analysis, submit command, and store job metadata."""
     if not ctx.args:
-        raise typer.BadParameter("Provide a command to execute, e.g. pc run python main.py")
+        raise typer.BadParameter("Provide a command to execute, e.g. pc analysis run python main.py")
 
     command = " ".join(shlex.quote(arg) for arg in ctx.args)
 
@@ -665,7 +665,7 @@ def _show_last_status(follow: bool = False) -> None:
     state = load_state(project_root)
     last = state.get("last_job")
     if not last:
-        raise typer.BadParameter("No active job in state. Run `pc run ...` first.")
+        raise typer.BadParameter("No active job in state. Run `pc analysis run ...` first.")
 
     job_id = last["job_id"]
     target = last["target"]

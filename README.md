@@ -23,7 +23,7 @@ HPC workflows often become hard to manage when commands, job scripts, paths, and
 - `Project root`: directory where `pc init` is run.
 - `Target`: named remote execution profile (host + scheduler + remote root + default resources + template).
 - `Active analysis`: local directory selected by `pc analysis use`.
-- `Tagged paths`: paths inside active analysis selected by `pc analysis tag`; `pc pull` only pulls these.
+- `Tagged paths`: paths inside active analysis selected by `pc analysis tag`; `pc analysis pull` only pulls these.
 - `Remote analysis root`: `<remote_root>/<active_analysis_path>`
 
 No timestamped run directories are used. Remote structure mirrors local analysis path.
@@ -125,13 +125,13 @@ pc analysis list --remote --all
 Using target defaults only:
 
 ```bash
-pc run python train.py --epochs 20
+pc analysis run python train.py --epochs 20
 ```
 
 Override resources at runtime:
 
 ```bash
-pc run \
+pc analysis run \
   --cpus 8 \
   --memory 32G \
   --time 04:00:00 \
@@ -228,7 +228,7 @@ Lists subdirectories inside active analysis.
 - `--remote`: corresponding remote analysis directory on active target
 - `--all`: include files too (not only directories)
 
-### `pc run <command...>`
+### `pc analysis run <command...>`
 Syncs active analysis to remote, renders template, submits job.
 
 ### `pc status`
@@ -285,7 +285,7 @@ Ensure your template includes:
 
 ### `--queue is required ...`
 Your template references `{queue}` but neither:
-- `pc run --queue ...`, nor
+- `pc analysis run --queue ...`, nor
 - target `default_queue`
 is set.
 
@@ -302,7 +302,7 @@ and set one:
 pc target set <name>
 ```
 
-### `pc pull` says no tags found
+### `pc analysis pull` says no tags found
 Tag paths first:
 
 ```bash
