@@ -883,27 +883,27 @@ def pull(
         False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
     ),
 ) -> None:
-    """Pull all tagged paths from the last run into the active analysis directory."""
+    """Pull all tagged paths into the active analysis directory."""
     project_root = _project_root()
     cfg = load_config(project_root)
     analysis_dir = _require_active_analysis(cfg, project_root)
 
-    state = load_state(project_root)
-    last = state.get("last_job")
-    if not last:
-        raise typer.BadParameter("No active job in state. Run `pc run ...` first.")
+    target_name, target_cfg = _active_target(cfg)
+    if not target_cfg.remote_root:
+        raise typer.BadParameter(
+            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+        )
 
-    target = last["target"]
-    if target not in cfg.targets:
-        raise typer.BadParameter(f"Target '{target}' from state is no longer configured")
+    analysis_rel = (cfg.active_analysis or "").strip("/")
+    if not analysis_rel:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+    remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
 
-    target_cfg = cfg.targets[target]
     analysis_tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
     if not analysis_tags:
         raise typer.BadParameter(
             "No tags found for active analysis. Tag paths with `pc analysis tag <path>` before pulling."
         )
-    remote_analysis_root = last["remote_run_dir"]
     pulled: list[str] = []
     skipped: list[str] = []
     for tag_dir in analysis_tags:
