@@ -410,26 +410,44 @@ def analysis_tag(
 
 @analysis_app.command("list")
 def analysis_list(
+    path: str = typer.Argument(
+        ".",
+        help="Nested path inside active analysis directory.",
+    ),
     remote: bool = typer.Option(False, "--remote", help="List directories from remote analysis directory"),
     all_entries: bool = typer.Option(False, "--all", help="Include files (not just directories)"),
 ) -> None:
-    """List entries inside the active analysis directory."""
+    """List entries from active analysis directory or one of its nested paths."""
     project_root = _project_root()
     cfg = load_config(project_root)
     analysis_dir = _require_active_analysis(cfg, project_root)
+    active_analysis_rel = (cfg.active_analysis or "").strip("/")
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        raise typer.BadParameter("Path must be relative to the active analysis directory")
+    local_target = (analysis_dir / candidate).resolve()
+    try:
+        relative_to_analysis = local_target.relative_to(analysis_dir)
+    except ValueError as exc:
+        raise typer.BadParameter("Path must stay inside the active analysis directory") from exc
+    relative_subpath = relative_to_analysis.as_posix()
 
     if not remote:
-        entries = sorted(
-            [p.name for p in analysis_dir.iterdir() if (p.is_dir() if not all_entries else True)]
-        )
+        if not local_target.exists():
+            raise typer.BadParameter(f"Local path not found: {local_target}")
+        if not local_target.is_dir():
+            raise typer.BadParameter(f"Local path is not a directory: {local_target}")
+
+        entries = sorted([p.name for p in local_target.iterdir() if (p.is_dir() if not all_entries else True)])
         if not entries:
             if all_entries:
-                typer.echo("No local entries found in active analysis")
+                typer.echo(f"No local entries found in {local_target}")
             else:
-                typer.echo("No local subdirectories found in active analysis")
+                typer.echo(f"No local subdirectories found in {local_target}")
             return
         label = "entries" if all_entries else "directories"
-        typer.echo(f"Local {label} in {cfg.active_analysis}:")
+        typer.echo(f"Local {label} in {local_target}:")
         for name in entries:
             typer.echo(f"- {name}")
         return
@@ -439,13 +457,17 @@ def analysis_list(
         raise typer.BadParameter(
             f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
         )
-    analysis_rel = (cfg.active_analysis or "").strip("/")
-    if not analysis_rel:
+    if not active_analysis_rel:
         raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{active_analysis_rel}"
+    remote_list_root = (
+        remote_analysis_root
+        if relative_subpath in ("", ".")
+        else f"{remote_analysis_root.rstrip('/')}/{relative_subpath}"
+    )
 
     remote_cmd = (
-        f"P={shlex.quote(remote_analysis_root)}; "
+        f"P={shlex.quote(remote_list_root)}; "
         'if [ -d "$P" ]; then '
         + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
         + "fi"
@@ -462,12 +484,12 @@ def analysis_list(
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
         if all_entries:
-            typer.echo(f"No remote entries found in {remote_analysis_root}")
+            typer.echo(f"No remote entries found in {remote_list_root}")
         else:
-            typer.echo(f"No remote subdirectories found in {remote_analysis_root}")
+            typer.echo(f"No remote subdirectories found in {remote_list_root}")
         return
     label = "entries" if all_entries else "directories"
-    typer.echo(f"Remote {label} in {remote_analysis_root}:")
+    typer.echo(f"Remote {label} in {remote_list_root}:")
     for name in lines:
         typer.echo(f"- {name}")
 
