@@ -80,12 +80,13 @@ Example SGE template (`my_sge_template.tmpl`):
 ```
 
 Required placeholders:
-- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`
+- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`, `{working_dir}`
 
 Optional placeholders:
 - `{queue}`, `{node}`, `{parallel_environment}`
 
 `{stdout}` and `{stderr}` default to the resolved `job_name`.
+`{working_dir}` resolves to the target `remote_root`.
 
 ### 2. Initialize the project
 
@@ -265,7 +266,7 @@ pc analysis use <path>
 
 ### `Template missing required placeholders`
 Ensure your template includes:
-- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`
+- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`, `{working_dir}`
 
 ### `--queue is required ...`
 Your template references `{queue}` but neither:

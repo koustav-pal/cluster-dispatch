@@ -40,7 +40,7 @@ app.add_typer(status_app, name="status")
 
 TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
-BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr")
+BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 
 
 def _project_root() -> Path:
@@ -72,7 +72,7 @@ def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[
 def _build_submit_script(
     header: str,
     command: str,
-    remote_run_dir: str,
+    working_dir: str,
     remote_log_file: str,
 ) -> str:
     lines: list[str] = ["#!/usr/bin/env bash", "set -euo pipefail"]
@@ -80,8 +80,7 @@ def _build_submit_script(
         lines.extend(header.strip().splitlines())
     lines.extend(
         [
-            f"mkdir -p {shlex.quote(remote_run_dir)}",
-            f"cd {shlex.quote(remote_run_dir)}",
+            f"cd {shlex.quote(working_dir)}",
             "echo \"[project-control] started $(date -Iseconds)\"",
             f"{command} >> {shlex.quote(remote_log_file)} 2>&1",
             "echo \"[project-control] finished $(date -Iseconds)\"",
@@ -114,6 +113,7 @@ def _render_scheduler_header(
     job_name: str,
     stdout: str,
     stderr: str,
+    working_dir: str,
     queue: str,
     node: str,
     parallel_environment: str,
@@ -126,6 +126,7 @@ def _render_scheduler_header(
             job_name=job_name,
             stdout=stdout,
             stderr=stderr,
+            working_dir=working_dir,
             queue=queue,
             node=node,
             parallel_environment=parallel_environment,
@@ -134,7 +135,7 @@ def _render_scheduler_header(
         missing = exc.args[0]
         raise typer.BadParameter(
             f"Scheduler template contains unknown placeholder '{missing}'. "
-            "Allowed: cpus, memory, time, job_name, stdout, stderr, queue, node, parallel_environment."
+            "Allowed: cpus, memory, time, job_name, stdout, stderr, working_dir, queue, node, parallel_environment."
         ) from exc
 
 
@@ -161,7 +162,7 @@ def init(
         "--template-file",
         help=(
             "User-provided scheduler template file. Must include: "
-            "{cpus}, {memory}, {time}, {job_name}, {stdout}, {stderr}. "
+            "{cpus}, {memory}, {time}, {job_name}, {stdout}, {stderr}, {working_dir}. "
             "Optional: {queue}, {node}, {parallel_environment}."
         ),
     ),
@@ -423,6 +424,7 @@ def run(
     resolved_job_name = job_name or f"pc-{secrets.token_hex(4)}"
     resolved_stdout = resolved_job_name
     resolved_stderr = resolved_job_name
+    resolved_working_dir = target.remote_root
     resolved_node = node or target.default_node or "1"
     resolved_queue = queue if queue is not None else target.default_queue
     resolved_parallel_environment = (
@@ -467,12 +469,13 @@ def run(
             job_name=resolved_job_name,
             stdout=resolved_stdout,
             stderr=resolved_stderr,
+            working_dir=resolved_working_dir,
             queue=resolved_queue or "",
             node=resolved_node,
             parallel_environment=resolved_parallel_environment or "",
         ),
         command=command,
-        remote_run_dir=remote_run_dir,
+        working_dir=resolved_working_dir,
         remote_log_file=remote_log_file,
     )
 
@@ -488,7 +491,7 @@ def run(
 
     if interactive:
         subprocess.run(
-            ["ssh", "-t", target.host, "bash", "-lc", f"cd {shlex.quote(remote_run_dir)} && {command}"],
+            ["ssh", "-t", target.host, "bash", "-lc", f"cd {shlex.quote(resolved_working_dir)} && {command}"],
             check=True,
         )
         job_id = "interactive"
@@ -522,6 +525,7 @@ def run(
             "job_name": resolved_job_name,
             "stdout": resolved_stdout,
             "stderr": resolved_stderr,
+            "working_dir": resolved_working_dir,
             "cpus": resolved_cpus,
             "memory": resolved_memory,
             "time": resolved_time,
