@@ -360,6 +360,9 @@ def analysis_tag(
     cfg = load_config(project_root)
     analysis_dir = _require_active_analysis(cfg, project_root)
 
+    if path.is_absolute():
+        raise typer.BadParameter("Tag path must be relative to the active analysis directory")
+
     candidate = (analysis_dir / path).resolve()
     try:
         relative_to_analysis = candidate.relative_to(analysis_dir)
@@ -381,14 +384,9 @@ def analysis_tag(
             raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
         remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
         remote_tag_path = f"{remote_analysis_root}/{tag_value}"
+        remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
         proc = subprocess.run(
-            [
-                "ssh",
-                target.host,
-                "bash",
-                "-lc",
-                f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi",
-            ],
+            ["ssh", target.host, remote_cmd],
             text=True,
             capture_output=True,
             check=False,
