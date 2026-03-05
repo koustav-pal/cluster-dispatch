@@ -444,19 +444,14 @@ def analysis_list(
         raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
 
+    remote_cmd = (
+        f"P={shlex.quote(remote_analysis_root)}; "
+        'if [ -d "$P" ]; then '
+        + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
+        + "fi"
+    )
     proc = subprocess.run(
-        [
-            "ssh",
-            target.host,
-            "bash",
-            "-lc",
-            (
-                f"P={shlex.quote(remote_analysis_root)}; "
-                'if [ -d "$P" ]; then '
-                + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
-                + "fi"
-            ),
-        ],
+        ["ssh", target.host, remote_cmd],
         text=True,
         capture_output=True,
         check=False,
