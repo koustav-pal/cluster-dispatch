@@ -142,7 +142,7 @@ def _render_scheduler_header(
 def init(
     project_id: str = typer.Option(..., help="Unique project id"),
     host: str = typer.Option(..., help="SSH host alias for the default target"),
-    scheduler: str = typer.Option(..., help="Default scheduler for this project: sge|pbs|none"),
+    scheduler: str = typer.Option(..., help="Default scheduler for this project: sge|univa|pbs|slurm|lsf|none"),
     default_target: Optional[str] = typer.Option(
         None, help="Default target name (defaults to current project root directory name)"
     ),
@@ -165,8 +165,8 @@ def init(
 ) -> None:
     """Initialize .project_control/config.yml and local state directories."""
     scheduler = scheduler.lower()
-    if scheduler not in {"sge", "pbs", "none"}:
-        raise typer.BadParameter("scheduler must be one of: sge, pbs, none")
+    if scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
+        raise typer.BadParameter("scheduler must be one of: sge, univa, pbs, slurm, lsf, none")
     if not Path(remote_root).is_absolute():
         raise typer.BadParameter("remote_root must be an absolute remote path")
 
@@ -228,15 +228,17 @@ def target_add(
     default_parallel_environment: Optional[str] = typer.Option(
         None, help="Default parallel environment for this target"
     ),
-    scheduler: Optional[str] = typer.Option(None, help="sge|pbs|none; defaults to project scheduler"),
+    scheduler: Optional[str] = typer.Option(
+        None, help="sge|univa|pbs|slurm|lsf|none; defaults to project scheduler"
+    ),
     template_file: Optional[Path] = typer.Option(None, help="Optional file containing scheduler header template"),
 ) -> None:
     """Add or update a compute target."""
     project_root = _project_root()
     cfg = load_config(project_root)
     scheduler = (scheduler or cfg.scheduler).lower()
-    if scheduler not in {"sge", "pbs", "none"}:
-        raise typer.BadParameter("scheduler must be one of: sge, pbs, none")
+    if scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
+        raise typer.BadParameter("scheduler must be one of: sge, univa, pbs, slurm, lsf, none")
 
     if template_file:
         template_header = template_file.read_text()

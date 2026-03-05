@@ -18,7 +18,7 @@ STATE_FILE = "state.json"
 @dataclass
 class TargetConfig:
     host: str
-    scheduler: str  # sge | pbs | none
+    scheduler: str  # sge | univa | pbs | slurm | lsf | none
     remote_root: str
     template_header: str = ""
     default_cpus: int = 1

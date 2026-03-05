@@ -1,56 +1,318 @@
 # project-control
 
-CLI tool to initialize, run, monitor, and pull analysis jobs on remote SSH compute targets (SGE, PBS, or no scheduler).
+`project-control` is a Python CLI for running analysis jobs on remote SSH compute targets (SGE, Univa, PBS Pro, Slurm, LSF, or no scheduler), while keeping your local analysis directory as the source of truth.
 
-All Project Control metadata is stored under `.project_control/` at the project root.
+It is designed for workflows where you:
+- keep multiple analyses under one project,
+- run jobs across multiple clusters/servers,
+- track job status from your laptop,
+- pull only tagged outputs back to local.
 
-## Install
+## Why this exists
+
+HPC workflows often become hard to manage when commands, job scripts, paths, and output pulls are done ad hoc across many servers.
+
+`project-control` gives you a repeatable interface:
+- one project-level config,
+- explicit target definitions,
+- analysis-level tagging for pull,
+- scheduler template rendering with runtime/default resources.
+
+## Core concepts
+
+- `Project root`: directory where `pc init` is run.
+- `Target`: named remote execution profile (host + scheduler + remote root + default resources + template).
+- `Active analysis`: local directory selected by `pc analysis use`.
+- `Tagged paths`: paths inside active analysis selected by `pc analysis tag`; `pc pull` only pulls these.
+- `Remote analysis root`: `<remote_root>/<project_id>/<active_analysis_path>`
+
+No timestamped run directories are used. Remote structure mirrors local analysis path.
+
+## Current status behavior
+
+`pc status` is context-aware:
+- inside active analysis directory: shows latest job status,
+- outside active analysis directory: shows global status across targets.
+
+You can always force target-specific status:
+- `pc status --target <target_name>`
+
+## Requirements
+
+- Python 3.10+
+- `ssh` installed and configured
+- `rsync` installed
+- reachable remote hosts (directly or via SSH config aliases)
+
+Recommended:
+- configure host aliases in `~/.ssh/config`
+
+## Installation
+
+### From source (recommended currently)
 
 ```bash
+git clone https://github.com/koustav-pal/project-control.git
+cd project-control
 pip install -e .
 ```
 
-## Quickstart
+### Verify
 
 ```bash
-pc init --project-id my-project --host cluster-a --scheduler sge --remote-root /scratch/me/projects --template-file ./my_sge_template.tmpl
-# Add another target later:
-pc target add cluster-b --host cluster-b --scheduler pbs --remote-root /scratch/me/projects
-# Update existing target paths/scheduler later without repeating host:
-pc target add cluster-a --scheduler sge
+pc --help
+```
+
+## Quick start
+
+### 1. Create a scheduler template
+
+Example SGE template (`my_sge_template.tmpl`):
+
+```bash
+#$ -N {job_name}
+#$ -o {stdout}.out
+#$ -e {stderr}.err
+#$ -l h_vmem={memory}
+#$ -l h_rt={time}
+#$ -pe {parallel_environment} {cpus}
+#$ -q {queue}
+```
+
+Required placeholders:
+- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`
+
+Optional placeholders:
+- `{queue}`, `{node}`, `{parallel_environment}`
+
+`{stdout}` and `{stderr}` default to the resolved `job_name`.
+
+### 2. Initialize the project
+
+```bash
+pc init \
+  --project-id my-project \
+  --host cluster-a \
+  --scheduler sge \
+  --remote-root /scratch/me/projects \
+  --template-file ./my_sge_template.tmpl
+```
+
+What this does:
+- creates `.project_control/config.yml`
+- creates local state dirs under `.project_control/`
+- ensures remote project root exists:
+  `ssh <host> mkdir -p <remote_root>/<project_id>`
+- creates default target in config
+
+If `--default-target` is omitted, it defaults to your current directory name.
+
+### 3. Set analysis and tags
+
+```bash
 pc analysis use analyses/run_001
-pc analysis tag results/figures
+pc analysis tag results
+pc analysis tag reports/figures
+```
+
+### 4. Run job
+
+Using target defaults only:
+
+```bash
 pc run python train.py --epochs 20
+```
+
+Override resources at runtime:
+
+```bash
+pc run \
+  --cpus 8 \
+  --memory 32G \
+  --time 04:00:00 \
+  --queue normal \
+  --parallel-environment smp \
+  --job-name run001 \
+  python train.py --epochs 20
+```
+
+### 5. Monitor and pull
+
+```bash
 pc status
 pc status --target cluster-a
-pc status global
 pc status list --analysis analyses/run_001
+pc status global
 pc pull
 ```
 
-## Notes
+## Multi-target workflow
 
-- Requires `ssh` and `rsync` on your machine.
-- Use SSH aliases in `~/.ssh/config` for stable host definitions.
-- Optional `.pcignore` in project root is passed to `rsync --exclude-from`.
-- Main config file is `.project_control/config.yml`.
-- Scheduler template is user-provided during init and stored at `.project_control/templates/scheduler_header.tmpl`.
-- `pc init` also creates the default target using provided `--host`, `--scheduler`, and `--remote-root`.
-- If `--default-target` is omitted, it defaults to the current project root directory name.
-- During `pc init`, Project Control runs `ssh <host> mkdir -p <remote-root>/<project_id>` to ensure the remote project root exists.
-- Required template placeholders: `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`.
-- Optional template placeholders: `{queue}`, `{node}`, `{parallel_environment}`.
-- Each target can define default resources (`cpus`, `memory`, `time`, `node`, `queue`, `parallel_environment`) via `pc init` or `pc target add`.
-- `pc run` uses target defaults for any resource flags not provided at runtime.
-- `--job-name` is optional; if omitted, a random hash-based name is generated.
-- `{stdout}` and `{stderr}` template variables are populated automatically and default to the resolved `job_name`.
-- If template includes `{queue}`, queue must be provided either at runtime (`--queue`) or via target default.
-- If template includes `{parallel_environment}`, it must be provided either at runtime or via target default.
-- `pc analysis use` requires an explicit analysis directory path.
-- `pc analysis tag <dir>` tags any folder inside the active analysis directory for future pulls.
-- `remote_root` is an absolute path on the target where project runs are created.
-- Remote run paths mirror the active analysis path exactly under `<remote_root>/<project_id>/` (no timestamped run folders).
-- `pc pull` only pulls paths that were tagged via `pc analysis tag`.
-- `pc status list` lists recent job IDs/states for an analysis (defaults to active analysis).
-- `pc status` is context-aware: inside active analysis it shows last-job status; outside it shows global cross-target status.
-- `pc status --target <name>` shows scheduler status for that target regardless of current directory context.
+Add another target:
+
+```bash
+pc target add cluster-b \
+  --host cluster-b \
+  --scheduler pbs \
+  --remote-root /scratch/me/projects
+```
+
+Switch active target:
+
+```bash
+pc target set cluster-b
+```
+
+List targets:
+
+```bash
+pc target list
+```
+
+## Resource resolution order
+
+For each run resource (`cpus`, `memory`, `time`, `node`, `queue`, `parallel_environment`):
+1. runtime flag (if provided),
+2. target default from config.
+
+If template contains `{queue}` or `{parallel_environment}`, those values must resolve non-empty (runtime or default), otherwise run fails fast.
+
+## Command reference
+
+### `pc init`
+Initializes project-control in current directory.
+
+Key options:
+- `--project-id` (required)
+- `--host` (required)
+- `--scheduler` (required: `sge|univa|pbs|slurm|lsf|none`)
+- `--remote-root` (required, absolute remote path)
+- `--template-file` (required)
+- `--default-target` (optional)
+- default resource options:
+  - `--default-cpus`
+  - `--default-memory`
+  - `--default-time`
+  - `--default-node`
+  - `--default-queue`
+  - `--default-parallel-environment`
+
+### `pc target add <name>`
+Adds/updates a target by name.
+
+Key options:
+- `--host`
+- `--scheduler`
+- `--remote-root`
+- `--template-file`
+- default resource options (same as init)
+
+### `pc target set <name>`
+Sets active default target.
+
+### `pc analysis use <path>`
+Sets active analysis directory (must be under project root).
+
+### `pc analysis tag <path>`
+Tags a path inside active analysis for pull.
+
+### `pc run <command...>`
+Syncs active analysis to remote, renders template, submits job.
+
+### `pc status`
+Context-aware status (last job in active analysis context, otherwise global).
+
+Subcommands:
+- `pc status list [--analysis ...] [--limit ...]`
+- `pc status global [--limit ...]`
+
+Option:
+- `pc status --target <name>` for target-scoped status from any context.
+
+### `pc pull`
+Pulls only tagged paths for active analysis from remote run directory.
+
+## Files and state
+
+All metadata is under project root `.project_control/`:
+
+- `.project_control/config.yml`:
+  targets, active analysis, analysis tags
+- `.project_control/state.json`:
+  last submitted job
+- `.project_control/jobs/*.json`:
+  per-run job records
+- `.project_control/templates/scheduler_header.tmpl`:
+  active scheduler template
+
+## Example template (PBS Pro)
+
+```bash
+#PBS -N {job_name}
+#PBS -o {stdout}.out
+#PBS -e {stderr}.err
+#PBS -l select={node}:ncpus={cpus}:mem={memory}
+#PBS -l walltime={time}
+#PBS -q {queue}
+```
+
+## Troubleshooting
+
+### `No active analysis set`
+Run:
+
+```bash
+pc analysis use <path>
+```
+
+### `Template missing required placeholders`
+Ensure your template includes:
+- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`
+
+### `--queue is required ...`
+Your template references `{queue}` but neither:
+- `pc run --queue ...`, nor
+- target `default_queue`
+is set.
+
+### `Target '<name>' not found`
+Run:
+
+```bash
+pc target list
+```
+
+and set one:
+
+```bash
+pc target set <name>
+```
+
+### `pc pull` says no tags found
+Tag paths first:
+
+```bash
+pc analysis tag <path-inside-active-analysis>
+```
+
+## Security notes
+
+- This tool executes remote commands via SSH.
+- Review templates and commands before running on shared systems.
+- Prefer least-privilege SSH keys and explicit host aliases.
+
+## Roadmap ideas
+
+- required-file preflight checks before run
+- richer status filtering (`--job-id`, `--state`)
+- retention policies for `.project_control/jobs`
+- optional dry-run mode for sync and submit
+
+## Contributing
+
+Issues and PRs are welcome.
+
+If you propose behavior changes, include:
+- expected CLI UX,
+- compatibility impact,
+- migration behavior for existing config/state.
