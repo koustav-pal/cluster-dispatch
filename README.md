@@ -188,12 +188,12 @@ Key options:
 - `--template-file` (required)
 - `--default-target` (optional)
 - default resource options:
-  - `--default-cpus`
-  - `--default-memory`
-  - `--default-time`
-  - `--default-node`
-  - `--default-queue`
-  - `--default-parallel-environment`
+  - `--cpus`
+  - `--memory`
+  - `--time`
+  - `--node`
+  - `--queue`
+  - `--parallel-environment`
 
 ### `pc target add <name>`
 Adds/updates a target by name.

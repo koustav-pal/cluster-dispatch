@@ -146,12 +146,14 @@ def init(
         None, help="Default target name (defaults to current project root directory name)"
     ),
     remote_root: str = typer.Option(..., help="Remote absolute root directory for this project"),
-    default_cpus: int = typer.Option(1, help="Default CPUs for this target"),
-    default_memory: str = typer.Option("8G", help="Default memory for this target"),
-    default_time: str = typer.Option("01:00:00", help="Default walltime for this target"),
-    default_node: str = typer.Option("1", help="Default node value for this target"),
-    default_queue: str = typer.Option("", help="Default queue for this target"),
-    default_parallel_environment: str = typer.Option("", help="Default parallel environment for this target"),
+    default_cpus: int = typer.Option(1, "--cpus", help="Default CPUs for this target"),
+    default_memory: str = typer.Option("8G", "--memory", help="Default memory for this target"),
+    default_time: str = typer.Option("01:00:00", "--time", help="Default walltime for this target"),
+    default_node: str = typer.Option("1", "--node", help="Default node value for this target"),
+    default_queue: str = typer.Option("", "--queue", help="Default queue for this target"),
+    default_parallel_environment: str = typer.Option(
+        "", "--parallel-environment", help="Default parallel environment for this target"
+    ),
     template_file: Path = typer.Option(
         ...,
         "--template-file",
@@ -218,13 +220,13 @@ def target_add(
     remote_root: Optional[str] = typer.Option(
         None, help="Remote absolute root directory for this project on the target"
     ),
-    default_cpus: Optional[int] = typer.Option(None, help="Default CPUs for this target"),
-    default_memory: Optional[str] = typer.Option(None, help="Default memory for this target"),
-    default_time: Optional[str] = typer.Option(None, help="Default walltime for this target"),
-    default_node: Optional[str] = typer.Option(None, help="Default node value for this target"),
-    default_queue: Optional[str] = typer.Option(None, help="Default queue for this target"),
+    default_cpus: Optional[int] = typer.Option(None, "--cpus", help="Default CPUs for this target"),
+    default_memory: Optional[str] = typer.Option(None, "--memory", help="Default memory for this target"),
+    default_time: Optional[str] = typer.Option(None, "--time", help="Default walltime for this target"),
+    default_node: Optional[str] = typer.Option(None, "--node", help="Default node value for this target"),
+    default_queue: Optional[str] = typer.Option(None, "--queue", help="Default queue for this target"),
     default_parallel_environment: Optional[str] = typer.Option(
-        None, help="Default parallel environment for this target"
+        None, "--parallel-environment", help="Default parallel environment for this target"
     ),
     scheduler: Optional[str] = typer.Option(
         None, help="sge|univa|pbs|slurm|lsf|none; defaults to project scheduler"
