@@ -355,7 +355,6 @@ def _deterministic_analysis_run_id(
     command: str,
     scheduler: str,
     resources: dict[str, Any],
-    interactive: bool,
 ) -> str:
     payload = {
         "target": target_name,
@@ -363,7 +362,6 @@ def _deterministic_analysis_run_id(
         "command": command,
         "scheduler": scheduler,
         "resources": resources,
-        "interactive": interactive,
     }
     material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -976,7 +974,7 @@ def _append_sweep_job_record(
     state_override: Optional[str] = None,
 ) -> None:
     scheduler_value = scheduler_override or target.scheduler
-    state_value = state_override or ("RUNNING_OR_QUEUED" if run.get("job_id") != "interactive" else "INTERACTIVE")
+    state_value = state_override or "RUNNING_OR_QUEUED"
     append_job_record(
         project_root,
         {
@@ -1817,7 +1815,6 @@ def analysis_list(
 @analysis_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
     ctx: typer.Context,
-    interactive: Annotated[bool, typer.Option(help="Run in interactive SSH session (skip scheduler)")] = False,
     profile: Optional[str] = typer.Option(
         None,
         "--profile",
@@ -1903,7 +1900,6 @@ def run(
             "parallel_environment": resolved_parallel_environment,
             "job_name": resolved_job_name,
         },
-        interactive=interactive,
     )
     run_id = f"run-{run_id}"
     remote_run_dir = f"{remote_analysis_root}/{run_id}"
@@ -1951,15 +1947,8 @@ def run(
         ]
     )
 
-    if interactive:
-        subprocess.run(
-            ["ssh", "-t", target.host, "bash", "-lc", f"cd {shlex.quote(resolved_working_dir)} && {command}"],
-            check=True,
-        )
-        job_id = "interactive"
-    else:
-        adapter = get_adapter(target.scheduler)
-        job_id = adapter.submit(target.host, remote_submit_script).job_id
+    adapter = get_adapter(target.scheduler)
+    job_id = adapter.submit(target.host, remote_submit_script).job_id
 
     now = datetime.now().isoformat(timespec="seconds")
     last_job = LastJob(
@@ -1987,7 +1976,7 @@ def run(
             "job_id": job_id,
             "run_id": run_id,
             "job_name": resolved_job_name,
-            "state": ("INTERACTIVE" if job_id == "interactive" else ("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED")),
+            "state": ("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
             "stdout": resolved_stdout,
             "stderr": resolved_stderr,
             "working_dir": resolved_working_dir,
@@ -2028,32 +2017,29 @@ def _show_last_status(follow: bool = False) -> None:
 
     target_cfg = cfg.targets[target]
 
-    if job_id == "interactive":
-        typer.echo("Last run was interactive; no scheduler job id to query")
-    else:
-        state = "UNKNOWN"
-        jobs_dir = project_root / ".project_control" / "jobs"
-        if jobs_dir.exists():
-            for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
-                try:
-                    payload = json.loads(job_file.read_text())
-                except json.JSONDecodeError:
-                    continue
-                if str(payload.get("job_id", "")) == str(job_id) and str(payload.get("target", "")) == str(target):
-                    state = _resolve_and_persist_job_state(
-                        cfg=cfg,
-                        job_file=job_file,
-                        payload=payload,
-                        job_id=job_id,
-                        target_name=target,
-                        scheduler=str(last["scheduler"]),
-                    )
-                    break
-        if state == "UNKNOWN":
-            adapter = get_adapter(last["scheduler"])
-            result = adapter.status(target_cfg.host, job_id)
-            state = result.state
-        typer.echo(f"job_id={job_id} target={target} state={state}")
+    state = "UNKNOWN"
+    jobs_dir = project_root / ".project_control" / "jobs"
+    if jobs_dir.exists():
+        for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
+            try:
+                payload = json.loads(job_file.read_text())
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("job_id", "")) == str(job_id) and str(payload.get("target", "")) == str(target):
+                state = _resolve_and_persist_job_state(
+                    cfg=cfg,
+                    job_file=job_file,
+                    payload=payload,
+                    job_id=job_id,
+                    target_name=target,
+                    scheduler=str(last["scheduler"]),
+                )
+                break
+    if state == "UNKNOWN":
+        adapter = get_adapter(last["scheduler"])
+        result = adapter.status(target_cfg.host, job_id)
+        state = result.state
+    typer.echo(f"job_id={job_id} target={target} state={state}")
 
     if follow:
         typer.echo(f"Following log: {last['remote_log_file']}")
@@ -2100,12 +2086,6 @@ def _resolve_and_persist_job_state(
     scheduler: str,
 ) -> str:
     record_state = str(payload.get("state", "")).strip()
-
-    if job_id == "interactive":
-        if record_state != "INTERACTIVE":
-            payload["state"] = "INTERACTIVE"
-            job_file.write_text(json.dumps(payload, indent=2))
-        return "INTERACTIVE"
 
     if target_name not in cfg.targets:
         if record_state != "TARGET_MISSING":
