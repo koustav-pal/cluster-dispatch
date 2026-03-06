@@ -141,6 +141,20 @@ pc analysis run \
   python train.py --epochs 20
 ```
 
+### 4b. Sweep jobs
+
+```bash
+pc analysis sweep --config sweep.yml \
+  python train.py --lr {lr} --batch-size {batch_size}
+```
+
+Run one block only:
+
+```bash
+pc analysis sweep --config sweep.yml --job job1 \
+  python train.py --lr {lr} --batch-size {batch_size}
+```
+
 ### 5. Monitor and pull
 
 ```bash
@@ -244,6 +258,12 @@ Lists subdirectories inside active analysis.
 
 ### `pc analysis run <command...>`
 Syncs active analysis to remote, renders template, submits job.
+
+### `pc analysis sweep --config <yaml> [--job <name>] <command...>`
+Submits cartesian sweep jobs from YAML `params` blocks.
+- command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
+- submits one job per parameter combination
+- supports same runtime resource override flags as `pc analysis run`
 
 ### `pc status`
 Context-aware status (last job in active analysis context, otherwise global).
