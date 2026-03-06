@@ -148,12 +148,16 @@ pc status
 pc status --job-id 123456
 pc status --job-name run001
 pc status --target cluster-a
+pc history
+pc history --analysis analyses/run_001 --limit 20
 pc logs
 pc logs --job-id 123456 --tail 100
 pc logs --job-name run001 --head 50
 pc logs --follow
 pc cancel --job-id 123456
 pc cancel --job-name run001 --target cluster-a
+pc collect --job-id 123456
+pc collect --job-name run001
 pc status list --analysis analyses/run_001
 pc status global
 pc analysis pull
@@ -244,6 +248,8 @@ Context-aware status (last job in active analysis context, otherwise global).
 - `pc status --job-id <id>`: query exact scheduler job id from remembered launches
 - `pc status --job-name <name>`: query exact job name from remembered launches
 - `pc status --target <name>` can be combined with `--job-id`/`--job-name`
+- record-first: if a job record is already terminal (not running), `pc status` reports that stored state without re-querying live queue
+- if queue lookup returns `NOT_FOUND`, `pc status` checks scheduler accounting and persists recovered terminal state into job history
 
 ### `pc logs`
 Shows remote log for selected job.
@@ -256,6 +262,17 @@ Cancels jobs using stored launch records.
 - required: `--job-id` or `--job-name`
 - optional filters: `--target`, `--analysis`
 - scheduler-specific cancel command is used for each matched record
+
+### `pc collect`
+Collects tagged outputs for a recorded job.
+- required: `--job-id` or `--job-name`
+- optional filters: `--target`, `--analysis`
+- uses selected record's `analysis_tags` and `remote_run_dir`
+
+### `pc history`
+Shows remembered launch records without querying scheduler status.
+- optional filters: `--target`, `--analysis`, `--job-id`, `--job-name`
+- optional `--limit` (default 50)
 
 Subcommands:
 - `pc status list [--analysis ...] [--limit ...]`

@@ -23,6 +23,9 @@ class SchedulerAdapter(Protocol):
     def status(self, host: str, job_id: str) -> StatusResult:
         ...
 
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        ...
+
 
 class SGEAdapter:
     def submit(self, host: str, submit_script: str) -> SubmitResult:
@@ -46,6 +49,32 @@ class SGEAdapter:
         if proc.returncode == 0:
             return StatusResult(state="RUNNING_OR_QUEUED", raw=proc.stdout)
         return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
+
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"qacct -j {job_id}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
+        exit_status = None
+        failed = None
+        for line in proc.stdout.splitlines():
+            clean = line.strip()
+            if clean.startswith("exit_status"):
+                parts = clean.split()
+                if len(parts) >= 2:
+                    exit_status = parts[-1]
+            if clean.startswith("failed"):
+                parts = clean.split()
+                if len(parts) >= 2:
+                    failed = parts[-1]
+        if failed and failed != "0":
+            return StatusResult(state="FAILED", raw=proc.stdout)
+        if exit_status is not None:
+            return StatusResult(state="COMPLETED" if exit_status == "0" else "FAILED", raw=proc.stdout)
+        return StatusResult(state="ACCOUNTED", raw=proc.stdout)
 
 
 class UnivaAdapter(SGEAdapter):
@@ -80,6 +109,33 @@ class PBSAdapter:
                 break
         return StatusResult(state=state, raw=proc.stdout)
 
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"qstat -xf {job_id}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
+
+        state = None
+        exit_status = None
+        for line in proc.stdout.splitlines():
+            clean = line.strip()
+            if "job_state =" in clean:
+                state = clean.split("=", 1)[1].strip()
+            if "Exit_status =" in clean:
+                exit_status = clean.split("=", 1)[1].strip()
+        if state:
+            if state == "F":
+                return StatusResult(state="FAILED", raw=proc.stdout)
+            if state == "C":
+                if exit_status is not None:
+                    return StatusResult(state="COMPLETED" if exit_status == "0" else "FAILED", raw=proc.stdout)
+                return StatusResult(state="COMPLETED", raw=proc.stdout)
+            return StatusResult(state=state, raw=proc.stdout)
+        return StatusResult(state="ACCOUNTED", raw=proc.stdout)
+
 
 class SlurmAdapter:
     def submit(self, host: str, submit_script: str) -> SubmitResult:
@@ -106,6 +162,20 @@ class SlurmAdapter:
         state = proc.stdout.strip()
         if not state:
             return StatusResult(state="NOT_FOUND", raw=proc.stdout)
+        return StatusResult(state=state, raw=proc.stdout)
+
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"sacct -j {job_id} -X -n -o State | head -n 1"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
+        state = proc.stdout.strip().split()[0] if proc.stdout.strip() else ""
+        if not state:
+            return StatusResult(state="NOT_FOUND", raw=proc.stdout)
+        state = state.split("+", 1)[0]
         return StatusResult(state=state, raw=proc.stdout)
 
 
@@ -136,6 +206,23 @@ class LSFAdapter:
         state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else "UNKNOWN"
         return StatusResult(state=state, raw=proc.stdout)
 
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"bjobs -a -noheader -o STAT {job_id}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
+        state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
+        if not state:
+            return StatusResult(state="NOT_FOUND", raw=proc.stdout)
+        if state == "DONE":
+            return StatusResult(state="COMPLETED", raw=proc.stdout)
+        if state == "EXIT":
+            return StatusResult(state="FAILED", raw=proc.stdout)
+        return StatusResult(state=state, raw=proc.stdout)
+
 
 class LocalAdapter:
     def submit(self, host: str, submit_script: str) -> SubmitResult:
@@ -155,6 +242,9 @@ class LocalAdapter:
             check=True,
         )
         return StatusResult(state=proc.stdout.strip(), raw=proc.stdout)
+
+    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+        return StatusResult(state="NOT_FOUND", raw="")
 
 
 def get_adapter(scheduler: str) -> SchedulerAdapter:

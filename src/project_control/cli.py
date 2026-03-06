@@ -637,6 +637,7 @@ def run(
             "scheduler": target.scheduler,
             "job_id": job_id,
             "job_name": resolved_job_name,
+            "state": ("INTERACTIVE" if job_id == "interactive" else ("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED")),
             "stdout": resolved_stdout,
             "stderr": resolved_stderr,
             "working_dir": resolved_working_dir,
@@ -679,9 +680,29 @@ def _show_last_status(follow: bool = False) -> None:
     if job_id == "interactive":
         typer.echo("Last run was interactive; no scheduler job id to query")
     else:
-        adapter = get_adapter(last["scheduler"])
-        result = adapter.status(target_cfg.host, job_id)
-        typer.echo(f"job_id={job_id} target={target} state={result.state}")
+        state = "UNKNOWN"
+        jobs_dir = project_root / ".project_control" / "jobs"
+        if jobs_dir.exists():
+            for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
+                try:
+                    payload = json.loads(job_file.read_text())
+                except json.JSONDecodeError:
+                    continue
+                if str(payload.get("job_id", "")) == str(job_id) and str(payload.get("target", "")) == str(target):
+                    state = _resolve_and_persist_job_state(
+                        cfg=cfg,
+                        job_file=job_file,
+                        payload=payload,
+                        job_id=job_id,
+                        target_name=target,
+                        scheduler=str(last["scheduler"]),
+                    )
+                    break
+        if state == "UNKNOWN":
+            adapter = get_adapter(last["scheduler"])
+            result = adapter.status(target_cfg.host, job_id)
+            state = result.state
+        typer.echo(f"job_id={job_id} target={target} state={state}")
 
     if follow:
         typer.echo(f"Following log: {last['remote_log_file']}")
@@ -705,6 +726,66 @@ def _show_last_status(follow: bool = False) -> None:
         if proc.stdout.strip():
             typer.echo("--- log tail ---")
             typer.echo(proc.stdout.rstrip())
+
+
+def _is_running_state(state: str) -> bool:
+    normalized = state.strip().upper()
+    return normalized in {
+        "RUNNING",
+        "RUNNING_OR_QUEUED",
+        "QUEUED",
+        "PENDING",
+        "R",
+        "Q",
+    }
+
+
+def _resolve_and_persist_job_state(
+    cfg: ProjectConfig,
+    job_file: Path,
+    payload: dict[str, str],
+    job_id: str,
+    target_name: str,
+    scheduler: str,
+) -> str:
+    record_state = str(payload.get("state", "")).strip()
+
+    if job_id == "interactive":
+        if record_state != "INTERACTIVE":
+            payload["state"] = "INTERACTIVE"
+            job_file.write_text(json.dumps(payload, indent=2))
+        return "INTERACTIVE"
+
+    if target_name not in cfg.targets:
+        if record_state != "TARGET_MISSING":
+            payload["state"] = "TARGET_MISSING"
+            job_file.write_text(json.dumps(payload, indent=2))
+        return "TARGET_MISSING"
+
+    # Record-first behavior: only poll live queue when state is marked as running.
+    if record_state and not _is_running_state(record_state):
+        return record_state
+
+    adapter = get_adapter(scheduler)
+    status_result = adapter.status(cfg.targets[target_name].host, job_id)
+    state = status_result.state
+    if state == "NOT_FOUND":
+        stored_final_state = str(payload.get("final_state", "")).strip()
+        if stored_final_state:
+            state = stored_final_state
+        else:
+            accounting_result = adapter.accounting_status(cfg.targets[target_name].host, job_id)
+            if accounting_result.state != "NOT_FOUND":
+                state = accounting_result.state
+                payload["final_state"] = accounting_result.state
+                payload["final_state_source"] = "accounting"
+                payload["final_state_at"] = datetime.now().isoformat(timespec="seconds")
+                payload["final_state_raw"] = accounting_result.raw
+
+    if state and state != record_state:
+        payload["state"] = state
+        job_file.write_text(json.dumps(payload, indent=2))
+    return state
 
 
 def _load_job_records(project_root: Path) -> list[dict[str, str]]:
@@ -940,6 +1021,128 @@ def logs(
     typer.echo(proc.stdout.rstrip())
 
 
+@app.command("history")
+def history(
+    limit: int = typer.Option(50, "--limit", min=1, help="Maximum number of records to display"),
+    target: Optional[str] = typer.Option(None, "--target", help="Filter by exact target name"),
+    analysis: Optional[str] = typer.Option(None, "--analysis", help="Filter by exact analysis path"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Filter by exact job name"),
+) -> None:
+    """Show remembered launch records without querying scheduler status."""
+    project_root = _project_root()
+    records = _load_job_records(project_root)
+    if not records:
+        typer.echo("No job history found")
+        return
+
+    def _matches(rec: dict[str, str]) -> bool:
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        return True
+
+    matched = [rec for rec in records if _matches(rec)]
+    if not matched:
+        typer.echo("No history records found for the provided filters")
+        return
+
+    typer.echo("Job history:")
+    for rec in matched[:limit]:
+        typer.echo(
+            f"{str(rec.get('submitted_at', ''))}  job_id={str(rec.get('job_id', ''))} "
+            f"job_name={str(rec.get('job_name', ''))} target={str(rec.get('target', ''))} "
+            f"scheduler={str(rec.get('scheduler', ''))} analysis={str(rec.get('analysis', ''))}"
+        )
+
+
+@app.command("collect")
+def collect(
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Collect for exact job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Collect for exact job name"),
+    target: Optional[str] = typer.Option(None, "--target", help="Restrict match to target"),
+    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict match to analysis path"),
+) -> None:
+    """Collect tagged outputs for a recorded job."""
+    if not job_id and not job_name:
+        raise typer.BadParameter("Provide at least one selector: --job-id or --job-name")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    records = _load_job_records(project_root)
+    if not records:
+        raise typer.BadParameter("No job records found. Nothing to collect.")
+
+    def _matches(rec: dict[str, str]) -> bool:
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        return True
+
+    matched = [rec for rec in records if _matches(rec)]
+    if not matched:
+        raise typer.BadParameter("No matching job records found for the provided filters")
+    if len(matched) > 1:
+        typer.echo(f"Multiple matches found ({len(matched)}). Collecting from most recent match.")
+    selected = matched[0]
+
+    selected_target = str(selected.get("target", ""))
+    if selected_target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{selected_target}' from selected record is not configured")
+    selected_analysis = str(selected.get("analysis", "")).strip("/")
+    if not selected_analysis:
+        raise typer.BadParameter("Selected record has no analysis path")
+    remote_run_dir = str(selected.get("remote_run_dir", "")).strip()
+    if not remote_run_dir:
+        raise typer.BadParameter("Selected record has no remote_run_dir")
+
+    analysis_dir = (project_root / selected_analysis).resolve()
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    tags = selected.get("analysis_tags")
+    if not isinstance(tags, list) or not tags:
+        raise typer.BadParameter("Selected record has no tagged paths to collect")
+
+    target_cfg = cfg.targets[selected_target]
+    pulled: list[str] = []
+    skipped: list[str] = []
+    for tag_dir in tags:
+        clean_tag = str(tag_dir).strip("/")
+        if not clean_tag:
+            continue
+        tagged_remote = f"{remote_run_dir}/./{clean_tag}"
+        proc = _run_cmd(
+            ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"],
+            check=False,
+        )
+        if proc.returncode == 0:
+            pulled.append(clean_tag)
+        else:
+            skipped.append(clean_tag)
+
+    typer.echo(
+        f"Collect source: job_id={str(selected.get('job_id', ''))} job_name={str(selected.get('job_name', ''))} "
+        f"target={selected_target} analysis={selected_analysis}"
+    )
+    if pulled:
+        typer.echo("Collected tagged paths:")
+        for item in pulled:
+            typer.echo(f"- {analysis_dir / item}")
+    if skipped:
+        typer.echo("Skipped tagged paths:")
+        for item in skipped:
+            typer.echo(f"- {item}")
+
+
 def _collect_status_rows(
     project_root: Path,
     cfg: ProjectConfig,
@@ -977,16 +1180,14 @@ def _collect_status_rows(
             continue
         scheduler = str(payload.get("scheduler", ""))
         submitted_at = str(payload.get("submitted_at", ""))
-        state = "UNKNOWN"
-
-        if job_id == "interactive":
-            state = "INTERACTIVE"
-        elif target_name in cfg.targets:
-            adapter = get_adapter(scheduler)
-            status_result = adapter.status(cfg.targets[target_name].host, job_id)
-            state = status_result.state
-        else:
-            state = "TARGET_MISSING"
+        state = _resolve_and_persist_job_state(
+            cfg=cfg,
+            job_file=job_file,
+            payload=payload,
+            job_id=job_id,
+            target_name=target_name,
+            scheduler=scheduler,
+        )
 
         rows.append(
             {
