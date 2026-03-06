@@ -37,6 +37,7 @@ class LastJob:
     scheduler: str
     remote_run_dir: str
     remote_log_file: str
+    run_id: str = ""
 
 
 @dataclass

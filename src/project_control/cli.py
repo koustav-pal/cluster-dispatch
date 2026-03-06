@@ -44,7 +44,7 @@ profile_app = typer.Typer(help="Manage resource profiles")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
-app.add_typer(sweep_app, name="sweep")
+analysis_app.add_typer(sweep_app, name="sweep")
 app.add_typer(profile_app, name="profile")
 app.add_typer(status_app, name="status")
 
@@ -160,6 +160,26 @@ def _deterministic_run_id(block_name: str, params: dict[str, Any], command_templ
         "block_name": block_name,
         "params": params,
         "command_template": command_template,
+    }
+    material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _deterministic_analysis_run_id(
+    target_name: str,
+    analysis_rel: str,
+    command: str,
+    scheduler: str,
+    resources: dict[str, Any],
+    interactive: bool,
+) -> str:
+    payload = {
+        "target": target_name,
+        "analysis": analysis_rel,
+        "command": command,
+        "scheduler": scheduler,
+        "resources": resources,
+        "interactive": interactive,
     }
     material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -1005,7 +1025,9 @@ def sweep_run(
     if mode_lc not in {"single", "array", "local"}:
         raise typer.BadParameter("--mode must be one of: single, array, local")
     if not ctx.args:
-        raise typer.BadParameter("Provide a command template, e.g. pc sweep run --config sweep.yml python train.py --lr {lr}")
+        raise typer.BadParameter(
+            "Provide a command template, e.g. pc analysis sweep run --config sweep.yml python train.py --lr {lr}"
+        )
     if not config_file.exists() or not config_file.is_file():
         raise typer.BadParameter(f"Sweep config file not found: {config_file}")
 
@@ -1497,8 +1519,6 @@ def run(
     resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
     resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
     resolved_job_name = job_name or f"pc-{secrets.token_hex(4)}"
-    resolved_stdout = resolved_job_name
-    resolved_stderr = resolved_job_name
     resolved_working_dir = target.remote_root
     resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
     resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
@@ -1523,13 +1543,32 @@ def run(
     if not analysis_rel:
         raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
-    remote_run_dir = remote_analysis_root
-    remote_submit_script = f"{remote_analysis_root}/pc_submit.sh"
-    remote_log_file = f"{remote_analysis_root}/run.log"
+    run_id = _deterministic_analysis_run_id(
+        target_name=target_name,
+        analysis_rel=analysis_rel,
+        command=command,
+        scheduler=target.scheduler,
+        resources={
+            "cpus": resolved_cpus,
+            "memory": resolved_memory,
+            "time": resolved_time,
+            "node": resolved_node,
+            "queue": resolved_queue,
+            "parallel_environment": resolved_parallel_environment,
+            "job_name": resolved_job_name,
+        },
+        interactive=interactive,
+    )
+    run_id = f"run-{run_id}"
+    remote_run_dir = f"{remote_analysis_root}/{run_id}"
+    remote_submit_script = f"{remote_run_dir}/pc_submit.sh"
+    remote_log_file = f"{remote_run_dir}/run.log"
+    resolved_stdout = f"{remote_run_dir}/stdout"
+    resolved_stderr = f"{remote_run_dir}/stderr"
 
     project_ignore = project_root / ".pcignore"
 
-    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_analysis_root])
+    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
 
     rsync_cmd = ["rsync", "-az", "--delete"]
     if project_ignore.exists():
@@ -1581,8 +1620,9 @@ def run(
         job_id=job_id,
         target=target_name,
         scheduler=target.scheduler,
-        remote_run_dir=remote_analysis_root,
+        remote_run_dir=remote_run_dir,
         remote_log_file=remote_log_file,
+        run_id=run_id,
     )
 
     state = load_state(project_root)
@@ -1599,6 +1639,7 @@ def run(
             "target": target_name,
             "scheduler": target.scheduler,
             "job_id": job_id,
+            "run_id": run_id,
             "job_name": resolved_job_name,
             "state": ("INTERACTIVE" if job_id == "interactive" else ("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED")),
             "stdout": resolved_stdout,
@@ -1611,236 +1652,17 @@ def run(
             "parallel_environment": resolved_parallel_environment,
             "node": resolved_node,
             "command": command,
-            "remote_run_dir": remote_analysis_root,
+            "remote_run_dir": remote_run_dir,
             "remote_log_file": remote_log_file,
         },
     )
 
     typer.echo(f"Submitted job_id={job_id} target={target_name}")
+    typer.echo(f"Run id: {run_id}")
     typer.echo(f"Job name: {resolved_job_name}")
     typer.echo(f"Node: {resolved_node}")
-    typer.echo(f"Remote run dir: {remote_analysis_root}")
+    typer.echo(f"Remote run dir: {remote_run_dir}")
     typer.echo(f"Remote log: {remote_log_file}")
-
-
-@analysis_app.command("sweep", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def sweep(
-    ctx: typer.Context,
-    config_file: Path = typer.Option(..., "--config", help="YAML sweep config file"),
-    sweep_job: Optional[str] = typer.Option(None, "--job", help="Run only one params.<job> block from config"),
-    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
-    cpus: Optional[int] = typer.Option(None, help="CPU cores for scheduler template (defaults to target setting)"),
-    memory: Optional[str] = typer.Option(
-        None, help="Memory for scheduler template, e.g. 8G (defaults to target setting)"
-    ),
-    job_time: Optional[str] = typer.Option(
-        None, "--time", help="Walltime for scheduler template, e.g. 02:00:00 (defaults to target setting)"
-    ),
-    job_name: Optional[str] = typer.Option(
-        None, help="Base scheduler job name prefix. If omitted, a random prefix is generated."
-    ),
-    queue: Optional[str] = typer.Option(
-        None, help="Queue for scheduler template (defaults to target setting; required if template uses {queue})"
-    ),
-    node: Optional[str] = typer.Option(None, help="Node for scheduler template (defaults to target setting)"),
-    parallel_environment: Optional[str] = typer.Option(
-        None,
-        help=(
-            "Parallel environment for scheduler template "
-            "(defaults to target setting; required if template uses {parallel_environment})"
-        ),
-    ),
-) -> None:
-    """Submit sweep jobs from a YAML parameter grid."""
-    if not ctx.args:
-        raise typer.BadParameter(
-            "Provide a command template with placeholders, e.g. "
-            "pc analysis sweep --config sweep.yml python train.py --lr {lr} --batch-size {batch_size}"
-        )
-    if not config_file.exists() or not config_file.is_file():
-        raise typer.BadParameter(f"Sweep config file not found: {config_file}")
-
-    raw = yaml.safe_load(config_file.read_text()) or {}
-    if not isinstance(raw, dict):
-        raise typer.BadParameter("Sweep config must be a YAML mapping with top-level key: params")
-    params_section = raw.get("params")
-    if not isinstance(params_section, dict) or not params_section:
-        raise typer.BadParameter("Sweep config must define non-empty params mapping")
-    if sweep_job:
-        if sweep_job not in params_section:
-            raise typer.BadParameter(f"Job '{sweep_job}' not found under params in sweep config")
-        job_blocks = {sweep_job: params_section[sweep_job]}
-    else:
-        job_blocks = params_section
-
-    command_template = " ".join(shlex.quote(arg) for arg in ctx.args)
-    command_placeholders = _extract_placeholders(command_template)
-
-    project_root = _project_root()
-    cfg = load_config(project_root)
-    analysis_dir = _require_active_analysis(cfg, project_root)
-    target_name, target = _active_target(cfg)
-    if not target.remote_root:
-        raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
-        )
-
-    profile_values = _resolve_resource_profile(profile)
-    resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
-    resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
-    resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
-    resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
-    resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
-    resolved_parallel_environment = (
-        parallel_environment
-        if parallel_environment is not None
-        else str(profile_values.get("parallel_environment", target.default_parallel_environment))
-    )
-
-    requires_queue = "{queue}" in target.template_header
-    requires_pe = "{parallel_environment}" in target.template_header
-    if requires_queue and not resolved_queue:
-        raise typer.BadParameter(
-            "--queue is required (or set target default_queue) because template includes {queue}."
-        )
-    if requires_pe and not resolved_parallel_environment:
-        raise typer.BadParameter(
-            "--parallel-environment is required (or set target default_parallel_environment) because template includes {parallel_environment}."
-        )
-
-    analysis_rel = (cfg.active_analysis or "").strip("/")
-    if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
-    remote_run_dir = remote_analysis_root
-    project_ignore = project_root / ".pcignore"
-
-    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_analysis_root])
-
-    rsync_cmd = ["rsync", "-az", "--delete"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
-    _run_cmd(rsync_cmd)
-
-    submitted: list[tuple[str, str, str]] = []
-    base_name = _slug_component(job_name) if job_name else f"pc-{secrets.token_hex(4)}"
-
-    for block_name, block_params in job_blocks.items():
-        if not isinstance(block_params, dict) or not block_params:
-            raise typer.BadParameter(f"params.{block_name} must be a non-empty mapping of variables to value lists")
-
-        keys = list(block_params.keys())
-        missing_ph = [k for k in keys if k not in command_placeholders]
-        if missing_ph:
-            raise typer.BadParameter(
-                f"Command template missing placeholders for params.{block_name}: {', '.join(missing_ph)}"
-            )
-
-        value_lists: list[list[object]] = []
-        for key in keys:
-            values = block_params[key]
-            if isinstance(values, (list, tuple)):
-                if not values:
-                    raise typer.BadParameter(f"params.{block_name}.{key} must not be empty")
-                value_lists.append(list(values))
-            else:
-                value_lists.append([values])
-
-        for idx, combo in enumerate(itertools.product(*value_lists), start=1):
-            combo_map = {key: combo[pos] for pos, key in enumerate(keys)}
-            combo_map["sweep_job"] = block_name
-            combo_map["sweep_index"] = idx
-            try:
-                command = command_template.format(**combo_map)
-            except KeyError as exc:
-                raise typer.BadParameter(f"Missing placeholder value for '{exc.args[0]}' in sweep command template") from exc
-
-            sweep_name = _slug_component(block_name)
-            resolved_job_name = f"{base_name}-{sweep_name}-{idx:03d}"
-            resolved_stdout = resolved_job_name
-            resolved_stderr = resolved_job_name
-            resolved_working_dir = target.remote_root
-            remote_submit_script = f"{remote_analysis_root}/pc_submit_{resolved_job_name}.sh"
-            remote_log_file = f"{remote_analysis_root}/run_{resolved_job_name}.log"
-
-            submit_script = _build_submit_script(
-                header=_render_scheduler_header(
-                    target.template_header,
-                    cpus=resolved_cpus,
-                    memory=resolved_memory,
-                    walltime=resolved_time,
-                    job_name=resolved_job_name,
-                    stdout=resolved_stdout,
-                    stderr=resolved_stderr,
-                    working_dir=resolved_working_dir,
-                    queue=resolved_queue or "",
-                    node=resolved_node,
-                    parallel_environment=resolved_parallel_environment or "",
-                ),
-                command=command,
-                working_dir=resolved_working_dir,
-                remote_log_file=remote_log_file,
-            )
-
-            _run_cmd(
-                [
-                    "ssh",
-                    target.host,
-                    "bash",
-                    "-lc",
-                    f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-                ]
-            )
-
-            adapter = get_adapter(target.scheduler)
-            submitted_job_id = adapter.submit(target.host, remote_submit_script).job_id
-            now = datetime.now().isoformat(timespec="seconds")
-            last_job = LastJob(
-                job_id=submitted_job_id,
-                target=target_name,
-                scheduler=target.scheduler,
-                remote_run_dir=remote_run_dir,
-                remote_log_file=remote_log_file,
-            )
-            state = load_state(project_root)
-            state["last_job"] = last_job.__dict__
-            state["last_updated"] = now
-            save_state(project_root, state)
-
-            append_job_record(
-                project_root,
-                {
-                    "submitted_at": now,
-                    "analysis": cfg.active_analysis,
-                    "analysis_tags": cfg.analysis_tags.get(cfg.active_analysis or "", []),
-                    "target": target_name,
-                    "scheduler": target.scheduler,
-                    "job_id": submitted_job_id,
-                    "job_name": resolved_job_name,
-                    "state": "RUNNING_OR_QUEUED",
-                    "stdout": resolved_stdout,
-                    "stderr": resolved_stderr,
-                    "working_dir": resolved_working_dir,
-                    "cpus": resolved_cpus,
-                    "memory": resolved_memory,
-                    "time": resolved_time,
-                    "queue": resolved_queue,
-                    "parallel_environment": resolved_parallel_environment,
-                    "node": resolved_node,
-                    "command": command,
-                    "remote_run_dir": remote_analysis_root,
-                    "remote_log_file": remote_log_file,
-                    "sweep_job": block_name,
-                    "sweep_index": idx,
-                    "sweep_params": {k: combo_map[k] for k in keys},
-                },
-            )
-            submitted.append((submitted_job_id, resolved_job_name, block_name))
-
-    typer.echo(f"Submitted {len(submitted)} sweep jobs on target={target_name}")
-    for jid, jname, jblock in submitted:
-        typer.echo(f"- job_id={jid} job_name={jname} sweep_job={jblock}")
 
 
 def _show_last_status(follow: bool = False) -> None:
