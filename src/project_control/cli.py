@@ -2207,6 +2207,26 @@ def _resolve_log_job(
     return records[0]
 
 
+def _show_local_log(log_file: Path, follow: bool, head: Optional[int], tail: Optional[int]) -> None:
+    if not log_file.exists() or not log_file.is_file():
+        raise typer.BadParameter(f"Local log file not found: {log_file}")
+
+    line_count = tail if tail is not None else 50
+    if follow:
+        subprocess.run(["tail", "-n", str(line_count), "-f", str(log_file)], check=True)
+        return
+
+    lines = log_file.read_text(errors="replace").splitlines()
+    if head is not None:
+        selected = lines[:head]
+    else:
+        selected = lines[-line_count:]
+    if not selected:
+        typer.echo(f"No log output found at {log_file}")
+        return
+    typer.echo("\n".join(selected))
+
+
 def _cancel_command_for_scheduler(scheduler: str, job_id: str) -> str:
     scheduler_lc = scheduler.lower()
     quoted_job_id = shlex.quote(job_id)
@@ -2329,7 +2349,7 @@ def logs(
         None, "--analysis", help="Filter by exact analysis path", autocompletion=_complete_record_analyses
     ),
 ) -> None:
-    """Show remote logs for the selected job (defaults to last job in state)."""
+    """Show logs for the selected job (remote by default; local for local sweep mode)."""
     if head is not None and tail is not None:
         raise typer.BadParameter("Use only one of --head or --tail")
     if follow and head is not None:
@@ -2348,12 +2368,26 @@ def logs(
         job_name=job_name,
         analysis=analysis,
     )
+    submission_mode = str(selected.get("submission_mode", "")).strip().lower()
     selected_target = str(selected.get("target", ""))
-    if selected_target not in cfg.targets:
-        raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
     remote_log_file = str(selected.get("remote_log_file", "")).strip()
     if not remote_log_file:
         raise typer.BadParameter("Selected job does not have a remote log file")
+
+    if submission_mode == "local":
+        local_log_path = Path(remote_log_file).expanduser()
+        if not local_log_path.is_absolute():
+            local_log_path = (project_root / local_log_path).resolve()
+        if follow:
+            typer.echo(
+                f"Following local log for job_id={selected.get('job_id', '')} "
+                f"job_name={selected.get('job_name', '')}: {local_log_path}"
+            )
+        _show_local_log(local_log_path, follow=follow, head=head, tail=tail)
+        return
+
+    if selected_target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
 
     line_count = tail if tail is not None else 50
     if head is not None:
