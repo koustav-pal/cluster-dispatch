@@ -121,15 +121,34 @@ def _extract_placeholders(template: str) -> set[str]:
     return names
 
 
-def _resolve_resource_profile(profile: Optional[str]) -> dict[str, str | int]:
+def _all_resource_profiles(cfg: ProjectConfig) -> dict[str, dict[str, str | int]]:
+    merged: dict[str, dict[str, str | int]] = {
+        name: dict(values) for name, values in DEFAULT_RESOURCE_PROFILES.items()
+    }
+    for name, values in cfg.resource_profiles.items():
+        merged[name.strip().lower()] = dict(values)
+    return merged
+
+
+def _resolve_resource_profile(profile: Optional[str], cfg: ProjectConfig) -> dict[str, str | int]:
     if not profile:
         return {}
     key = profile.strip().lower()
-    if key not in DEFAULT_RESOURCE_PROFILES:
+    profiles = _all_resource_profiles(cfg)
+    if key not in profiles:
         raise typer.BadParameter(
-            f"Unknown profile '{profile}'. Available profiles: {', '.join(sorted(DEFAULT_RESOURCE_PROFILES.keys()))}"
+            f"Unknown profile '{profile}'. Available profiles: {', '.join(sorted(profiles.keys()))}"
         )
-    return dict(DEFAULT_RESOURCE_PROFILES[key])
+    return dict(profiles[key])
+
+
+def _validate_profile_name(name: str) -> str:
+    normalized = name.strip().lower()
+    if not normalized:
+        raise typer.BadParameter("Profile name cannot be empty")
+    if not re.fullmatch(r"[a-z0-9_.-]+", normalized):
+        raise typer.BadParameter("Profile name may contain only: a-z, 0-9, _, ., -")
+    return normalized
 
 
 def _safe_project_root() -> Optional[Path]:
@@ -153,6 +172,29 @@ def _complete_target_names(incomplete: str) -> list[str]:
     except Exception:
         return []
     return _prefix_filter(sorted(cfg.targets.keys()), incomplete)
+
+
+def _complete_profile_names(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return _prefix_filter(sorted(DEFAULT_RESOURCE_PROFILES.keys()), incomplete)
+    try:
+        cfg = load_config(project_root)
+        names = sorted(_all_resource_profiles(cfg).keys())
+        return _prefix_filter(names, incomplete)
+    except Exception:
+        return _prefix_filter(sorted(DEFAULT_RESOURCE_PROFILES.keys()), incomplete)
+
+
+def _complete_user_profile_names(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        cfg = load_config(project_root)
+    except Exception:
+        return []
+    return _prefix_filter(sorted(cfg.resource_profiles.keys()), incomplete)
 
 
 def _complete_analysis_dirs(incomplete: str) -> list[str]:
@@ -784,12 +826,109 @@ def doctor(
 
 @profile_app.command("list")
 def profile_list() -> None:
-    """List built-in resource profiles."""
-    for name, values in sorted(DEFAULT_RESOURCE_PROFILES.items()):
+    """List resource profiles (built-in and user-defined)."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    merged = _all_resource_profiles(cfg)
+    for name in sorted(merged.keys()):
+        values = merged[name]
+        source = "user" if name in cfg.resource_profiles else "built-in"
         typer.echo(
-            f"{name}: cpus={values['cpus']} memory={values['memory']} time={values['time']} "
+            f"{name} ({source}): cpus={values['cpus']} memory={values['memory']} time={values['time']} "
             f"node={values['node']} queue={values['queue']} parallel_environment={values['parallel_environment']}"
         )
+
+
+@profile_app.command("show")
+def profile_show(
+    name: str = typer.Argument(..., help="Profile name", autocompletion=_complete_profile_names),
+) -> None:
+    """Show one resource profile."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    key = _validate_profile_name(name)
+    merged = _all_resource_profiles(cfg)
+    if key not in merged:
+        raise typer.BadParameter(f"Profile '{name}' not found")
+    values = merged[key]
+    source = "user" if key in cfg.resource_profiles else "built-in"
+    typer.echo(f"{key} ({source})")
+    typer.echo(f"cpus={values.get('cpus')}")
+    typer.echo(f"memory={values.get('memory')}")
+    typer.echo(f"time={values.get('time')}")
+    typer.echo(f"node={values.get('node')}")
+    typer.echo(f"queue={values.get('queue')}")
+    typer.echo(f"parallel_environment={values.get('parallel_environment')}")
+
+
+@profile_app.command("set")
+def profile_set(
+    name: str = typer.Argument(..., help="Profile name", autocompletion=_complete_profile_names),
+    cpus: Optional[int] = typer.Option(None, "--cpus", min=1, help="CPU cores"),
+    memory: Optional[str] = typer.Option(None, "--memory", help="Memory (e.g. 8G)"),
+    job_time: Optional[str] = typer.Option(None, "--time", help="Walltime (e.g. 02:00:00)"),
+    node: Optional[str] = typer.Option(None, "--node", help="Node value"),
+    queue: Optional[str] = typer.Option(None, "--queue", help="Queue value"),
+    parallel_environment: Optional[str] = typer.Option(
+        None, "--parallel-environment", help="Parallel environment value"
+    ),
+) -> None:
+    """Create or update a user-defined resource profile."""
+    key = _validate_profile_name(name)
+    if all(v is None for v in [cpus, memory, job_time, node, queue, parallel_environment]):
+        raise typer.BadParameter("Provide at least one resource option to set")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    current = dict(_all_resource_profiles(cfg).get(key, {}))
+    if cpus is not None:
+        current["cpus"] = cpus
+    if memory is not None:
+        current["memory"] = memory
+    if job_time is not None:
+        current["time"] = job_time
+    if node is not None:
+        current["node"] = node
+    if queue is not None:
+        current["queue"] = queue
+    if parallel_environment is not None:
+        current["parallel_environment"] = parallel_environment
+
+    required_keys = {"cpus", "memory", "time", "node", "queue", "parallel_environment"}
+    missing = [k for k in sorted(required_keys) if k not in current]
+    if missing:
+        raise typer.BadParameter(
+            f"Profile '{key}' is missing values for: {', '.join(missing)}. "
+            "Set all required keys when creating a brand-new profile."
+        )
+
+    cfg.resource_profiles[key] = {
+        "cpus": int(current["cpus"]),
+        "memory": str(current["memory"]),
+        "time": str(current["time"]),
+        "node": str(current["node"]),
+        "queue": str(current["queue"]),
+        "parallel_environment": str(current["parallel_environment"]),
+    }
+    save_config(project_root, cfg)
+    typer.echo(f"Saved profile '{key}'")
+
+
+@profile_app.command("delete")
+def profile_delete(
+    name: str = typer.Argument(..., help="User profile name", autocompletion=_complete_user_profile_names),
+) -> None:
+    """Delete a user-defined profile."""
+    key = _validate_profile_name(name)
+    if key in DEFAULT_RESOURCE_PROFILES:
+        raise typer.BadParameter(f"Cannot delete built-in profile '{key}'")
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if key not in cfg.resource_profiles:
+        raise typer.BadParameter(f"User profile '{key}' not found")
+    del cfg.resource_profiles[key]
+    save_config(project_root, cfg)
+    typer.echo(f"Deleted profile '{key}'")
 
 
 def _build_sweep_manifest(
@@ -1170,7 +1309,12 @@ def sweep_run(
     target: Optional[str] = typer.Option(
         None, "--target", help="Target name (defaults to active target)", autocompletion=_complete_target_names
     ),
-    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Resource profile name (built-in or user-defined)",
+        autocompletion=_complete_profile_names,
+    ),
     cpus: Optional[int] = typer.Option(None, help="CPU cores (defaults to target setting)"),
     memory: Optional[str] = typer.Option(None, help="Memory (defaults to target setting)"),
     job_time: Optional[str] = typer.Option(None, "--time", help="Walltime (defaults to target setting)"),
@@ -1218,7 +1362,7 @@ def sweep_run(
     if mode_lc == "array" and target_cfg.scheduler.lower() == "none":
         raise typer.BadParameter("Array mode is not supported for scheduler 'none'")
 
-    profile_values = _resolve_resource_profile(profile)
+    profile_values = _resolve_resource_profile(profile, cfg)
     resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target_cfg.default_cpus))
     resolved_memory = memory if memory is not None else str(profile_values.get("memory", target_cfg.default_memory))
     resolved_time = job_time if job_time is not None else str(profile_values.get("time", target_cfg.default_time))
@@ -1674,7 +1818,12 @@ def analysis_list(
 def run(
     ctx: typer.Context,
     interactive: Annotated[bool, typer.Option(help="Run in interactive SSH session (skip scheduler)")] = False,
-    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Resource profile name (built-in or user-defined)",
+        autocompletion=_complete_profile_names,
+    ),
     cpus: Optional[int] = typer.Option(None, help="CPU cores for scheduler template (defaults to target setting)"),
     memory: Optional[str] = typer.Option(
         None, help="Memory for scheduler template, e.g. 8G (defaults to target setting)"
@@ -1711,7 +1860,7 @@ def run(
         raise typer.BadParameter(
             f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
         )
-    profile_values = _resolve_resource_profile(profile)
+    profile_values = _resolve_resource_profile(profile, cfg)
     resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
     resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
     resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))

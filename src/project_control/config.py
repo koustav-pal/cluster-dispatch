@@ -47,6 +47,7 @@ class ProjectConfig:
     targets: dict[str, TargetConfig] = field(default_factory=dict)
     active_analysis: str | None = None
     analysis_tags: dict[str, list[str]] = field(default_factory=dict)
+    resource_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _parse_targets(raw: dict[str, Any]) -> dict[str, TargetConfig]:
@@ -105,6 +106,7 @@ def load_config(project_root: Path) -> ProjectConfig:
         targets=_parse_targets(raw.get("targets", {})),
         active_analysis=raw.get("active_analysis"),
         analysis_tags=raw.get("analysis_tags", {}),
+        resource_profiles=raw.get("resource_profiles", {}) or {},
     )
 
 

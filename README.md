@@ -270,7 +270,7 @@ Lists subdirectories inside active analysis.
 
 ### `pc analysis run <command...>`
 Syncs active analysis to remote, renders template, submits job.
-- supports `--profile small|long|highmem`
+- supports `--profile <name>` for built-in or user-defined profiles
 - assigns a deterministic `run_id` from command + target + analysis + resolved resources (stored in state + job records)
 - stores `pc_submit.sh`, `run.log`, and scheduler stdout/stderr under `<remote_analysis_root>/<run_id>/`
 
@@ -283,10 +283,19 @@ Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
 - `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
 - `local`: execute each run locally (no scheduler submission)
 - supports same runtime resource override flags as `pc analysis run`
-- supports `--profile small|long|highmem`
+- supports `--profile <name>` for built-in or user-defined profiles
 
 ### `pc profile list`
-Lists built-in resource profiles: `small`, `long`, `highmem`.
+Lists resource profiles. Built-ins: `small`, `long`, `highmem`.
+
+### `pc profile show <name>`
+Shows one profile by name.
+
+### `pc profile set <name> [--cpus ... --memory ... --time ... --node ... --queue ... --parallel-environment ...]`
+Creates or updates a user-defined profile.
+
+### `pc profile delete <name>`
+Deletes a user-defined profile.
 
 ### `pc doctor`
 Runs preflight checks for local setup and targets.
