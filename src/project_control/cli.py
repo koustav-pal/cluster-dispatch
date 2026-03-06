@@ -653,17 +653,19 @@ def _build_sweep_manifest(
     mode: str,
     target_name: str,
     target: TargetConfig,
+    analysis_rel: str,
     config_file: Path,
     command_template: str,
     runs: list[dict[str, Any]],
 ) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
-    remote_sweep_dir = f"{target.remote_root.rstrip('/')}/sweeps/{sweep_id}"
+    remote_sweep_dir = f"{target.remote_root.rstrip('/')}/{analysis_rel.strip('/')}/sweeps/{sweep_id}"
     return {
         "sweep_id": sweep_id,
         "created_at": now,
         "updated_at": now,
         "mode": mode,
+        "analysis": analysis_rel,
         "target": target_name,
         "host": target.host,
         "scheduler": target.scheduler,
@@ -723,6 +725,19 @@ def _append_sweep_job_record(
             "submission_mode": submission_mode,
         },
     )
+
+
+def _require_sweep_in_active_analysis(manifest: dict[str, Any], active_analysis: str) -> None:
+    manifest_analysis = str(manifest.get("analysis", "")).strip("/")
+    if not manifest_analysis:
+        raise typer.BadParameter(
+            "Sweep manifest is missing analysis context. Re-run this sweep from an active analysis with `pc analysis use <path>`."
+        )
+    if manifest_analysis != active_analysis.strip("/"):
+        raise typer.BadParameter(
+            f"Sweep belongs to analysis '{manifest_analysis}', but active analysis is '{active_analysis}'. "
+            "Switch context with `pc analysis use <path>`."
+        )
 
 
 def _submit_sweep_single(
@@ -1042,6 +1057,10 @@ def sweep_run(
 
     project_root = _project_root()
     cfg = load_config(project_root)
+    _require_active_analysis(cfg, project_root)
+    analysis_rel = (cfg.active_analysis or "").strip("/")
+    if not analysis_rel:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     if target:
         if target not in cfg.targets:
             raise typer.BadParameter(f"Target '{target}' not found")
@@ -1082,6 +1101,7 @@ def sweep_run(
         mode=mode_lc,
         target_name=target_name,
         target=target_cfg,
+        analysis_rel=analysis_rel,
         config_file=config_file.resolve(),
         command_template=command_template,
         runs=runs,
@@ -1140,33 +1160,51 @@ def sweep_run(
 def sweep_list() -> None:
     """List sweep manifests."""
     project_root = _project_root()
+    cfg = load_config(project_root)
+    _require_active_analysis(cfg, project_root)
+    active_analysis = (cfg.active_analysis or "").strip("/")
+    if not active_analysis:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     sweeps_dir = _sweeps_dir(project_root)
     manifests = sorted(sweeps_dir.glob("*.json"), reverse=True)
     if not manifests:
         typer.echo("No sweeps found")
         return
+    shown = 0
     for path in manifests:
         try:
             manifest = json.loads(path.read_text())
         except json.JSONDecodeError:
             continue
+        if str(manifest.get("analysis", "")).strip("/") != active_analysis:
+            continue
         runs = manifest.get("runs", [])
         total = len(runs) if isinstance(runs, list) else 0
         submitted = len([r for r in runs if isinstance(r, dict) and r.get("job_id")])
         typer.echo(
-            f"{manifest.get('sweep_id', path.stem)}  mode={manifest.get('mode', '')} "
+            f"{manifest.get('sweep_id', path.stem)}  analysis={manifest.get('analysis', '')} mode={manifest.get('mode', '')} "
             f"target={manifest.get('target', '')} runs={submitted}/{total} updated_at={manifest.get('updated_at', '')}"
         )
+        shown += 1
+    if shown == 0:
+        typer.echo(f"No sweeps found for active analysis '{active_analysis}'")
 
 
 @sweep_app.command("show")
 def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
     """Show one sweep manifest."""
     project_root = _project_root()
+    cfg = load_config(project_root)
+    _require_active_analysis(cfg, project_root)
+    active_analysis = (cfg.active_analysis or "").strip("/")
+    if not active_analysis:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
+    _require_sweep_in_active_analysis(manifest, active_analysis)
     runs = manifest.get("runs", [])
     typer.echo(
-        f"sweep_id={manifest.get('sweep_id')} mode={manifest.get('mode')} target={manifest.get('target')} "
+        f"sweep_id={manifest.get('sweep_id')} analysis={manifest.get('analysis')} "
+        f"mode={manifest.get('mode')} target={manifest.get('target')} "
         f"scheduler={manifest.get('scheduler')} runs={len(runs) if isinstance(runs, list) else 0}"
     )
     if not isinstance(runs, list):
@@ -1185,7 +1223,12 @@ def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
     """Resume pending runs from a sweep manifest."""
     project_root = _project_root()
     cfg = load_config(project_root)
+    _require_active_analysis(cfg, project_root)
+    active_analysis = (cfg.active_analysis or "").strip("/")
+    if not active_analysis:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
+    _require_sweep_in_active_analysis(manifest, active_analysis)
     target_name = str(manifest.get("target", ""))
     if target_name not in cfg.targets:
         raise typer.BadParameter(f"Target '{target_name}' from sweep manifest is not configured")
@@ -1256,7 +1299,12 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
     """Cancel submitted jobs in a sweep manifest."""
     project_root = _project_root()
     cfg = load_config(project_root)
+    _require_active_analysis(cfg, project_root)
+    active_analysis = (cfg.active_analysis or "").strip("/")
+    if not active_analysis:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
+    _require_sweep_in_active_analysis(manifest, active_analysis)
     target_name = str(manifest.get("target", ""))
     if target_name not in cfg.targets:
         raise typer.BadParameter(f"Target '{target_name}' from sweep manifest is not configured")
