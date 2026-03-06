@@ -175,6 +175,9 @@ pc stats --job-id 123456
 pc stats --job-name run001
 pc collect --job-id 123456
 pc collect --job-name run001
+pc doctor
+pc doctor --target cluster-a
+pc doctor --no-remote
 pc sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
 pc sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
 pc profile list
@@ -287,6 +290,14 @@ Top-level sweep orchestration with persisted manifests.
 
 ### `pc profile list`
 Lists built-in resource profiles: `small`, `long`, `highmem`.
+
+### `pc doctor`
+Runs preflight checks for local setup and targets.
+- checks config, template validity, local binaries, active analysis path
+- checks targets (scheduler, remote root, template)
+- with remote checks enabled (default): SSH connectivity, remote root presence, scheduler command availability
+- filters: `--target <name>`
+- disable remote probes: `--no-remote`
 
 ### `pc sweep list`
 Lists existing sweep manifests.

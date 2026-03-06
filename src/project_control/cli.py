@@ -8,6 +8,7 @@ import re
 import itertools
 import hashlib
 import base64
+import shutil
 from string import Formatter
 from datetime import datetime
 from pathlib import Path
@@ -476,6 +477,145 @@ def target_list() -> None:
     for name, t in cfg.targets.items():
         marker = "*" if name == cfg.default_target else " "
         typer.echo(f"{marker} {name}: host={t.host} scheduler={t.scheduler}")
+
+
+@app.command("doctor")
+def doctor(
+    target: Optional[str] = typer.Option(None, "--target", help="Run checks only for one target"),
+    remote: bool = typer.Option(True, "--remote/--no-remote", help="Include remote SSH/scheduler checks"),
+) -> None:
+    """Run project preflight checks."""
+    project_root = _project_root()
+    results: list[tuple[str, str, str]] = []
+
+    def _add(status: str, name: str, detail: str) -> None:
+        results.append((status, name, detail))
+        typer.echo(f"[{status}] {name}: {detail}")
+
+    # Local checks.
+    try:
+        cfg = load_config(project_root)
+        _add("PASS", "config", f"Loaded {config_path(project_root)}")
+    except Exception as exc:
+        _add("FAIL", "config", str(exc))
+        raise typer.Exit(code=1) from exc
+
+    ensure_state_dirs(project_root)
+    _add("PASS", "state_dirs", f"Found/created {project_root / CONFIG_DIR}")
+
+    if cfg.default_target in cfg.targets:
+        _add("PASS", "default_target", f"{cfg.default_target}")
+    else:
+        _add("FAIL", "default_target", f"Default target '{cfg.default_target}' not configured")
+
+    template_path = _template_path(project_root)
+    if template_path.exists():
+        try:
+            _validate_template_variables(template_path.read_text())
+            _add("PASS", "template", f"Template placeholders valid: {template_path}")
+        except Exception as exc:
+            _add("FAIL", "template", f"{template_path}: {exc}")
+    else:
+        _add("WARN", "template", f"Template file not found at {template_path}")
+
+    for binary in ("ssh", "rsync"):
+        if shutil.which(binary):
+            _add("PASS", "local_binary", f"{binary} found")
+        else:
+            _add("FAIL", "local_binary", f"{binary} not found in PATH")
+
+    if cfg.active_analysis:
+        active_path = (project_root / cfg.active_analysis).resolve()
+        if active_path.exists() and active_path.is_dir():
+            _add("PASS", "active_analysis", str(active_path))
+        else:
+            _add("WARN", "active_analysis", f"Configured active analysis missing: {active_path}")
+    else:
+        _add("WARN", "active_analysis", "No active analysis set")
+
+    # Target checks.
+    selected_targets: dict[str, TargetConfig]
+    if target:
+        if target not in cfg.targets:
+            _add("FAIL", "target", f"Target '{target}' not found")
+            raise typer.Exit(code=1)
+        selected_targets = {target: cfg.targets[target]}
+    else:
+        selected_targets = dict(cfg.targets)
+
+    scheduler_cmds: dict[str, list[str]] = {
+        "sge": ["qsub", "qstat", "qacct"],
+        "univa": ["qsub", "qstat", "qacct"],
+        "pbs": ["qsub", "qstat"],
+        "slurm": ["sbatch", "squeue", "sacct"],
+        "lsf": ["bsub", "bjobs", "bkill"],
+        "none": ["bash"],
+    }
+
+    for name, tcfg in selected_targets.items():
+        if tcfg.scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
+            _add("FAIL", f"target:{name}:scheduler", f"Unsupported scheduler '{tcfg.scheduler}'")
+        else:
+            _add("PASS", f"target:{name}:scheduler", tcfg.scheduler)
+
+        if not tcfg.remote_root:
+            _add("FAIL", f"target:{name}:remote_root", "Missing remote_root")
+        elif not Path(tcfg.remote_root).is_absolute():
+            _add("FAIL", f"target:{name}:remote_root", f"Not absolute: {tcfg.remote_root}")
+        else:
+            _add("PASS", f"target:{name}:remote_root", tcfg.remote_root)
+
+        try:
+            _validate_template_variables(tcfg.template_header)
+            _add("PASS", f"target:{name}:template", "Template placeholders valid")
+        except Exception as exc:
+            _add("FAIL", f"target:{name}:template", str(exc))
+
+        if not remote:
+            continue
+
+        ssh_probe = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "pc-ok"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if ssh_probe.returncode == 0 and "pc-ok" in ssh_probe.stdout:
+            _add("PASS", f"target:{name}:ssh", f"Connected to {tcfg.host}")
+        else:
+            _add("FAIL", f"target:{name}:ssh", ssh_probe.stderr.strip() or ssh_probe.stdout.strip() or "SSH failed")
+            continue
+
+        root_probe = subprocess.run(
+            ["ssh", tcfg.host, "bash", "-lc", f"if [ -d {shlex.quote(tcfg.remote_root)} ]; then echo OK; else echo MISSING; fi"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if root_probe.returncode == 0 and root_probe.stdout.strip() == "OK":
+            _add("PASS", f"target:{name}:remote_root_exists", tcfg.remote_root)
+        else:
+            _add("WARN", f"target:{name}:remote_root_exists", f"Remote root missing/inaccessible: {tcfg.remote_root}")
+
+        required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
+        if required_cmds:
+            cmd_probe = subprocess.run(
+                ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if cmd_probe.returncode == 0:
+                _add("PASS", f"target:{name}:scheduler_cmds", ", ".join(required_cmds))
+            else:
+                _add("WARN", f"target:{name}:scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
+
+    fail_count = len([r for r in results if r[0] == "FAIL"])
+    warn_count = len([r for r in results if r[0] == "WARN"])
+    pass_count = len([r for r in results if r[0] == "PASS"])
+    typer.echo(f"Summary: PASS={pass_count} WARN={warn_count} FAIL={fail_count}")
+    if fail_count:
+        raise typer.Exit(code=1)
 
 
 @profile_app.command("list")
