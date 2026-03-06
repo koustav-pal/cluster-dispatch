@@ -156,6 +156,8 @@ pc logs --job-name run001 --head 50
 pc logs --follow
 pc cancel --job-id 123456
 pc cancel --job-name run001 --target cluster-a
+pc stats --job-id 123456
+pc stats --job-name run001
 pc collect --job-id 123456
 pc collect --job-name run001
 pc status list --analysis analyses/run_001
@@ -262,6 +264,13 @@ Cancels jobs using stored launch records.
 - required: `--job-id` or `--job-name`
 - optional filters: `--target`, `--analysis`
 - scheduler-specific cancel command is used for each matched record
+
+### `pc stats`
+Collects resource usage for a recorded job.
+- required: `--job-id` or `--job-name`
+- optional filters: `--target`, `--analysis`
+- uses scheduler-specific accounting/stat commands on selected target
+- normalizes walltime/cpu-time and memory fields into human-readable units where possible
 
 ### `pc collect`
 Collects tagged outputs for a recorded job.

@@ -4,6 +4,7 @@ import shlex
 import secrets
 import subprocess
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional
@@ -1141,6 +1142,352 @@ def collect(
         typer.echo("Skipped tagged paths:")
         for item in skipped:
             typer.echo(f"- {item}")
+
+
+def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, str], str]:
+    scheduler_lc = scheduler.lower()
+    quoted_job_id = shlex.quote(job_id)
+
+    if scheduler_lc in {"sge", "univa"}:
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"qacct -j {quoted_job_id}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise typer.BadParameter(proc.stderr.strip() or "Failed to query SGE/Univa accounting")
+        stats: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            clean = line.strip()
+            if not clean or clean.startswith("="):
+                continue
+            parts = clean.split()
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            value = parts[-1]
+            if key == "exit_status":
+                stats["exit_status"] = value
+            elif key == "failed":
+                stats["failed"] = value
+            elif key == "cpu":
+                stats["cpu_time"] = value
+            elif key == "ru_wallclock":
+                stats["wallclock"] = value
+            elif key == "maxvmem":
+                stats["max_vmem"] = value
+            elif key == "mem":
+                stats["mem"] = value
+            elif key == "io":
+                stats["io"] = value
+        if stats.get("failed", "0") != "0" or stats.get("exit_status", "0") != "0":
+            stats["state"] = "FAILED"
+        else:
+            stats["state"] = "COMPLETED"
+        return stats, proc.stdout
+
+    if scheduler_lc == "pbs":
+        proc = subprocess.run(
+            ["ssh", host, "bash", "-lc", f"qstat -xf {quoted_job_id}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise typer.BadParameter(proc.stderr.strip() or "Failed to query PBS accounting")
+        stats = {}
+        for line in proc.stdout.splitlines():
+            clean = line.strip()
+            if "=" not in clean:
+                continue
+            key, value = [p.strip() for p in clean.split("=", 1)]
+            if key == "job_state":
+                stats["state"] = value
+            elif key == "Exit_status":
+                stats["exit_status"] = value
+            elif key.startswith("resources_used."):
+                stats[key.replace("resources_used.", "")] = value
+        return stats, proc.stdout
+
+    if scheduler_lc == "slurm":
+        proc = subprocess.run(
+            [
+                "ssh",
+                host,
+                "bash",
+                "-lc",
+                f"sacct -j {quoted_job_id} -X -P -n -o JobIDRaw,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,MaxVMSize,AveRSS,ReqMem",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise typer.BadParameter(proc.stderr.strip() or "Failed to query Slurm accounting")
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise typer.BadParameter("No Slurm accounting record returned for this job")
+        selected_line = lines[0]
+        cols = selected_line.split("|")
+        stats = {}
+        headers = [
+            "job_id_raw",
+            "state",
+            "exit_code",
+            "elapsed",
+            "total_cpu",
+            "alloc_cpus",
+            "max_rss",
+            "max_vmem",
+            "avg_rss",
+            "req_mem",
+        ]
+        for idx, key in enumerate(headers):
+            if idx < len(cols):
+                stats[key] = cols[idx]
+        return stats, proc.stdout
+
+    if scheduler_lc == "lsf":
+        proc = subprocess.run(
+            [
+                "ssh",
+                host,
+                "bash",
+                "-lc",
+                f"bjobs -a -noheader -o 'STAT EXIT_CODE CPU_USED RUN_TIME MAX_MEM MEM SWAP' {quoted_job_id}",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise typer.BadParameter(proc.stderr.strip() or "Failed to query LSF accounting")
+        line = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
+        if not line:
+            raise typer.BadParameter("No LSF accounting record returned for this job")
+        parts = line.split()
+        stats = {}
+        keys = ["state", "exit_code", "cpu_used", "run_time", "max_mem", "mem", "swap"]
+        for idx, key in enumerate(keys):
+            if idx < len(parts):
+                stats[key] = parts[idx]
+        return stats, proc.stdout
+
+    if scheduler_lc == "none":
+        proc = subprocess.run(
+            [
+                "ssh",
+                host,
+                "bash",
+                "-lc",
+                f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz=",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        line = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
+        if not line:
+            return {"state": "EXITED"}, proc.stdout
+        parts = line.split()
+        stats = {"state": "RUNNING"}
+        keys = ["pid", "elapsed", "cpu_percent", "mem_percent", "rss_kb", "vsz_kb"]
+        for idx, key in enumerate(keys):
+            if idx < len(parts):
+                stats[key] = parts[idx]
+        return stats, proc.stdout
+
+    raise typer.BadParameter(f"Unsupported scheduler for stats: {scheduler}")
+
+
+def _render_kv_table(title: str, rows: list[tuple[str, str]]) -> None:
+    if not rows:
+        typer.echo(f"{title}\n(no data)")
+        return
+    key_width = max(len("Metric"), max(len(k) for k, _ in rows))
+    value_width = max(len("Value"), max(len(v) for _, v in rows))
+    border = f"+-{'-' * key_width}-+-{'-' * value_width}-+"
+
+    typer.echo(title)
+    typer.echo(border)
+    typer.echo(f"| {'Metric'.ljust(key_width)} | {'Value'.ljust(value_width)} |")
+    typer.echo(border)
+    for key, value in rows:
+        typer.echo(f"| {key.ljust(key_width)} | {value.ljust(value_width)} |")
+    typer.echo(border)
+
+
+def _humanize_seconds(total_seconds: int) -> str:
+    days, rem = divmod(max(0, total_seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02}:{minutes:02}:{seconds:02}"
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def _parse_duration_to_seconds(raw: str) -> Optional[int]:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+
+    # Slurm elapsed format: D-HH:MM:SS
+    day_part = 0
+    core = value
+    if "-" in value:
+        parts = value.split("-", 1)
+        if parts[0].isdigit():
+            day_part = int(parts[0])
+            core = parts[1]
+
+    hh = mm = ss = None
+    chunks = core.split(":")
+    if len(chunks) == 3 and all(c.isdigit() for c in chunks):
+        hh, mm, ss = [int(c) for c in chunks]
+    elif len(chunks) == 2 and all(c.isdigit() for c in chunks):
+        hh = 0
+        mm, ss = [int(c) for c in chunks]
+    if hh is None:
+        return None
+    return day_part * 86400 + hh * 3600 + mm * 60 + ss
+
+
+def _humanize_bytes(num_bytes: float) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    value = float(num_bytes)
+    unit_idx = 0
+    while value >= 1024 and unit_idx < len(units) - 1:
+        value /= 1024.0
+        unit_idx += 1
+    return f"{value:.2f} {units[unit_idx]}"
+
+
+def _parse_memory_to_bytes(raw: str) -> Optional[float]:
+    value = raw.strip()
+    if not value:
+        return None
+    value_l = value.lower()
+
+    # Slurm ReqMem can be like 4000Mn/4000Mc; strip trailing scope marker.
+    if len(value_l) >= 2 and value_l[-1] in {"n", "c"} and value_l[-2].isalpha():
+        value_l = value_l[:-1]
+
+    match = re.match(r"^([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)?$", value_l)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+
+    unit_map = {
+        "b": 1,
+        "byte": 1,
+        "bytes": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+        "p": 1024**5,
+        "pb": 1024**5,
+        "pib": 1024**5,
+    }
+    if unit not in unit_map:
+        return None
+    return amount * unit_map[unit]
+
+
+def _normalize_stats_for_display(stats: dict[str, str]) -> dict[str, str]:
+    normalized = {k: str(v) for k, v in stats.items()}
+    time_keys = {"elapsed", "total_cpu", "cpu_time", "wallclock", "run_time", "cput", "walltime"}
+    mem_keys = {"max_vmem", "mem", "max_rss", "avg_rss", "req_mem", "vmem", "max_mem", "swap"}
+
+    for key in list(normalized.keys()):
+        value = normalized[key]
+
+        if key in time_keys:
+            seconds = _parse_duration_to_seconds(value)
+            if seconds is not None:
+                normalized[key] = _humanize_seconds(seconds)
+
+        if key in {"rss_kb", "vsz_kb"}:
+            if value.isdigit():
+                normalized[key] = _humanize_bytes(float(value) * 1024.0)
+
+        if key in mem_keys:
+            as_bytes = _parse_memory_to_bytes(value)
+            if as_bytes is not None:
+                normalized[key] = _humanize_bytes(as_bytes)
+
+    return normalized
+
+
+@app.command("stats")
+def stats(
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Get stats for exact job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Get stats for exact job name"),
+    target: Optional[str] = typer.Option(None, "--target", help="Restrict match to target"),
+    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict match to analysis path"),
+) -> None:
+    """Collect resource usage stats for a recorded job."""
+    if not job_id and not job_name:
+        raise typer.BadParameter("Provide at least one selector: --job-id or --job-name")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    records = _load_job_records(project_root)
+    if not records:
+        raise typer.BadParameter("No job records found.")
+
+    def _matches(rec: dict[str, str]) -> bool:
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        return True
+
+    matched = [rec for rec in records if _matches(rec)]
+    if not matched:
+        raise typer.BadParameter("No matching job records found for the provided filters")
+    if len(matched) > 1:
+        typer.echo(f"Multiple matches found ({len(matched)}). Using most recent match.")
+    selected = matched[0]
+
+    selected_target = str(selected.get("target", ""))
+    if selected_target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{selected_target}' from selected record is not configured")
+    selected_job_id = str(selected.get("job_id", "")).strip()
+    if not selected_job_id:
+        raise typer.BadParameter("Selected record has no job_id")
+    selected_scheduler = str(selected.get("scheduler", "")).strip()
+    if not selected_scheduler:
+        selected_scheduler = cfg.targets[selected_target].scheduler
+
+    host = cfg.targets[selected_target].host
+    usage_stats, _ = _fetch_job_stats(host=host, scheduler=selected_scheduler, job_id=selected_job_id)
+    display_stats = _normalize_stats_for_display(usage_stats)
+    rows = [
+        ("job_id", selected_job_id),
+        ("job_name", str(selected.get("job_name", ""))),
+        ("target", selected_target),
+        ("scheduler", selected_scheduler),
+    ]
+    for key in sorted(display_stats):
+        rows.append((key, str(display_stats[key])))
+    _render_kv_table("Job Stats", rows)
 
 
 def _collect_status_rows(
