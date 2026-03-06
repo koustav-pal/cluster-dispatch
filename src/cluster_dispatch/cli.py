@@ -17,7 +17,7 @@ from typing import Annotated, Optional, Any
 import typer
 import yaml
 
-from project_control.config import (
+from cluster_dispatch.config import (
     CONFIG_DIR,
     CONFIG_NAME,
     LEGACY_CONFIG_NAME,
@@ -34,9 +34,9 @@ from project_control.config import (
     save_config,
     save_state,
 )
-from project_control.schedulers import get_adapter
+from cluster_dispatch.schedulers import get_adapter
 
-app = typer.Typer(help="Project control CLI for remote SSH compute targets")
+app = typer.Typer(help="Cluster Dispatch CLI for remote SSH compute targets")
 target_app = typer.Typer(help="Manage compute targets")
 analysis_app = typer.Typer(help="Manage active analysis directory")
 sweep_app = typer.Typer(help="Manage sweep orchestration")
@@ -87,7 +87,7 @@ def _project_root() -> Path:
 
 def _require_active_analysis(cfg: ProjectConfig, project_root: Path) -> Path:
     if not cfg.active_analysis:
-        raise typer.BadParameter("No active analysis set. Run: pc analysis use <path>")
+        raise typer.BadParameter("No active analysis set. Run: cdp analysis use <path>")
     path = (project_root / cfg.active_analysis).resolve()
     if not path.exists() or not path.is_dir():
         raise typer.BadParameter(f"Active analysis path missing: {path}")
@@ -98,7 +98,7 @@ def _active_target(cfg: ProjectConfig) -> tuple[str, TargetConfig]:
     name = cfg.default_target
     if name not in cfg.targets:
         raise typer.BadParameter(
-            f"Default target '{name}' not configured. Add with: pc target add {name} ..."
+            f"Default target '{name}' not configured. Add with: cdp target add {name} ..."
         )
     return name, cfg.targets[name]
 
@@ -436,9 +436,9 @@ def _build_submit_script(
     lines.extend(
         [
             f"cd {shlex.quote(working_dir)}",
-            "echo \"[project-control] started $(date -Iseconds)\"",
+            "echo \"[cluster-dispatch] started $(date -Iseconds)\"",
             f"{command} >> {shlex.quote(remote_log_file)} 2>&1",
-            "echo \"[project-control] finished $(date -Iseconds)\"",
+            "echo \"[cluster-dispatch] finished $(date -Iseconds)\"",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -779,12 +779,12 @@ def doctor(
             continue
 
         ssh_probe = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "pc-ok"],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
             text=True,
             capture_output=True,
             check=False,
         )
-        if ssh_probe.returncode == 0 and "pc-ok" in ssh_probe.stdout:
+        if ssh_probe.returncode == 0 and "cdp-ok" in ssh_probe.stdout:
             _add("PASS", f"target:{name}:ssh", f"Connected to {tcfg.host}")
         else:
             _add("FAIL", f"target:{name}:ssh", ssh_probe.stderr.strip() or ssh_probe.stdout.strip() or "SSH failed")
@@ -1012,12 +1012,12 @@ def _require_sweep_in_active_analysis(manifest: dict[str, Any], active_analysis:
     manifest_analysis = str(manifest.get("analysis", "")).strip("/")
     if not manifest_analysis:
         raise typer.BadParameter(
-            "Sweep manifest is missing analysis context. Re-run this sweep from an active analysis with `pc analysis use <path>`."
+            "Sweep manifest is missing analysis context. Re-run this sweep from an active analysis with `cdp analysis use <path>`."
         )
     if manifest_analysis != active_analysis.strip("/"):
         raise typer.BadParameter(
             f"Sweep belongs to analysis '{manifest_analysis}', but active analysis is '{active_analysis}'. "
-            "Switch context with `pc analysis use <path>`."
+            "Switch context with `cdp analysis use <path>`."
         )
 
 
@@ -1157,7 +1157,7 @@ def _submit_sweep_array(
         "JOB_NAME=\"$(printf '%s' \"$LINE\" | cut -f3)\"\n"
         "CMD_B64=\"$(printf '%s' \"$LINE\" | cut -f4)\"\n"
         "CMD=\"$(printf '%s' \"$CMD_B64\" | base64 --decode)\"\n"
-        "echo \"[project-control] run_id=${RUN_ID} job_name=${JOB_NAME} task_id=${TASK_ID}\" \n"
+        "echo \"[cluster-dispatch] run_id=${RUN_ID} job_name=${JOB_NAME} task_id=${TASK_ID}\" \n"
         "eval \"$CMD\"\n"
     )
     wrapper_local.chmod(0o755)
@@ -1329,7 +1329,7 @@ def sweep_run(
         raise typer.BadParameter("--mode must be one of: single, array, local")
     if not ctx.args:
         raise typer.BadParameter(
-            "Provide a command template, e.g. pc analysis sweep run --config sweep.yml python train.py --lr {lr}"
+            "Provide a command template, e.g. cdp analysis sweep run --config sweep.yml python train.py --lr {lr}"
         )
     if not config_file.exists() or not config_file.is_file():
         raise typer.BadParameter(f"Sweep config file not found: {config_file}")
@@ -1348,7 +1348,7 @@ def sweep_run(
     _require_active_analysis(cfg, project_root)
     analysis_rel = (cfg.active_analysis or "").strip("/")
     if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     if target:
         if target not in cfg.targets:
             raise typer.BadParameter(f"Target '{target}' not found")
@@ -1452,7 +1452,7 @@ def sweep_list() -> None:
     _require_active_analysis(cfg, project_root)
     active_analysis = (cfg.active_analysis or "").strip("/")
     if not active_analysis:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     sweeps_dir = _sweeps_dir(project_root)
     manifests = sorted(sweeps_dir.glob("*.json"), reverse=True)
     if not manifests:
@@ -1486,7 +1486,7 @@ def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id", autocompleti
     _require_active_analysis(cfg, project_root)
     active_analysis = (cfg.active_analysis or "").strip("/")
     if not active_analysis:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
     _require_sweep_in_active_analysis(manifest, active_analysis)
     runs = manifest.get("runs", [])
@@ -1514,7 +1514,7 @@ def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
     _require_active_analysis(cfg, project_root)
     active_analysis = (cfg.active_analysis or "").strip("/")
     if not active_analysis:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
     _require_sweep_in_active_analysis(manifest, active_analysis)
     target_name = str(manifest.get("target", ""))
@@ -1590,7 +1590,7 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
     _require_active_analysis(cfg, project_root)
     active_analysis = (cfg.active_analysis or "").strip("/")
     if not active_analysis:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     manifest = _load_sweep_manifest(project_root, sweep_id)
     _require_sweep_in_active_analysis(manifest, active_analysis)
     target_name = str(manifest.get("target", ""))
@@ -1696,11 +1696,11 @@ def analysis_tag(
         target_name, target = _active_target(cfg)
         if not target.remote_root:
             raise typer.BadParameter(
-                f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+                f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
             )
         analysis_rel = (cfg.active_analysis or "").strip("/")
         if not analysis_rel:
-            raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+            raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
         remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
         remote_tag_path = f"{remote_analysis_root}/{tag_value}"
         remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
@@ -1773,10 +1773,10 @@ def analysis_list(
     target_name, target = _active_target(cfg)
     if not target.remote_root:
         raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
         )
     if not active_analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{active_analysis_rel}"
     remote_list_root = (
         remote_analysis_root
@@ -1845,7 +1845,7 @@ def run(
 ) -> None:
     """Sync active analysis, submit command, and store job metadata."""
     if not ctx.args:
-        raise typer.BadParameter("Provide a command to execute, e.g. pc analysis run python main.py")
+        raise typer.BadParameter("Provide a command to execute, e.g. cdp analysis run python main.py")
 
     command = " ".join(shlex.quote(arg) for arg in ctx.args)
 
@@ -1855,13 +1855,13 @@ def run(
     target_name, target = _active_target(cfg)
     if not target.remote_root:
         raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
         )
     profile_values = _resolve_resource_profile(profile, cfg)
     resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
     resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
     resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
-    resolved_job_name = job_name or f"pc-{secrets.token_hex(4)}"
+    resolved_job_name = job_name or f"cdp-{secrets.token_hex(4)}"
     resolved_working_dir = target.remote_root
     resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
     resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
@@ -1884,7 +1884,7 @@ def run(
 
     analysis_rel = (cfg.active_analysis or "").strip("/")
     if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
     run_id = _deterministic_analysis_run_id(
         target_name=target_name,
@@ -2006,7 +2006,7 @@ def _show_last_status(follow: bool = False) -> None:
     state = load_state(project_root)
     last = state.get("last_job")
     if not last:
-        raise typer.BadParameter("No active job in state. Run `pc analysis run ...` first.")
+        raise typer.BadParameter("No active job in state. Run `cdp analysis run ...` first.")
 
     job_id = last["job_id"]
     target = last["target"]
@@ -2183,7 +2183,7 @@ def _resolve_log_job(
         }
 
     if not records:
-        raise typer.BadParameter("No job records found. Run `pc analysis run ...` first.")
+        raise typer.BadParameter("No job records found. Run `cdp analysis run ...` first.")
     return records[0]
 
 
@@ -3062,7 +3062,7 @@ def status_callback(
     ),
     limit: int = typer.Option(50, help="Maximum number of jobs to display for target/global views"),
 ) -> None:
-    """Show context-aware status, or use subcommands like `pc status list`."""
+    """Show context-aware status, or use subcommands like `cdp status list`."""
     if ctx.invoked_subcommand is None:
         if target or job_id or job_name:
             if follow:
@@ -3151,18 +3151,18 @@ def pull(
     target_name, target_cfg = _active_target(cfg)
     if not target_cfg.remote_root:
         raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
+            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
         )
 
     analysis_rel = (cfg.active_analysis or "").strip("/")
     if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: pc analysis use <path>")
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
 
     analysis_tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
     if not analysis_tags:
         raise typer.BadParameter(
-            "No tags found for active analysis. Tag paths with `pc analysis tag <path>` before pulling."
+            "No tags found for active analysis. Tag paths with `cdp analysis tag <path>` before pulling."
         )
     pulled: list[str] = []
     skipped: list[str] = []

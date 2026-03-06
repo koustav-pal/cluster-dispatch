@@ -1,6 +1,6 @@
-# project-control
+# cluster-dispatch
 
-`project-control` is a Python CLI for running analysis jobs on remote SSH compute targets (SGE, Univa, PBS Pro, Slurm, LSF, or no scheduler), while keeping your local analysis directory as the source of truth.
+`cluster-dispatch` is a Python CLI for running analysis jobs on remote SSH compute targets (SGE, Univa, PBS Pro, Slurm, LSF, or no scheduler), while keeping your local analysis directory as the source of truth.
 
 It is designed for workflows where you:
 - keep multiple analyses under one project,
@@ -12,7 +12,7 @@ It is designed for workflows where you:
 
 HPC workflows often become hard to manage when commands, job scripts, paths, and output pulls are done ad hoc across many servers.
 
-`project-control` gives you a repeatable interface:
+`cluster-dispatch` gives you a repeatable interface:
 - one project-level config,
 - explicit target definitions,
 - analysis-level tagging for pull,
@@ -20,22 +20,22 @@ HPC workflows often become hard to manage when commands, job scripts, paths, and
 
 ## Core concepts
 
-- `Project root`: directory where `pc init` is run.
+- `Project root`: directory where `cdp init` is run.
 - `Target`: named remote execution profile (host + scheduler + remote root + default resources + template).
-- `Active analysis`: local directory selected by `pc analysis use`.
-- `Tagged paths`: paths inside active analysis selected by `pc analysis tag`; `pc analysis pull` only pulls these.
+- `Active analysis`: local directory selected by `cdp analysis use`.
+- `Tagged paths`: paths inside active analysis selected by `cdp analysis tag`; `cdp analysis pull` only pulls these.
 - `Remote analysis root`: `<remote_root>/<active_analysis_path>`
 
 No timestamped run directories are used. Remote structure mirrors local analysis path.
 
 ## Current status behavior
 
-`pc status` is context-aware:
+`cdp status` is context-aware:
 - inside active analysis directory: shows latest job status,
 - outside active analysis directory: shows global status across targets.
 
 You can always force target-specific status:
-- `pc status --target <target_name>`
+- `cdp status --target <target_name>`
 
 ## Requirements
 
@@ -60,7 +60,7 @@ pip install -e .
 ### Verify
 
 ```bash
-pc --help
+cdp --help
 ```
 
 ## Quick start
@@ -91,7 +91,7 @@ Optional placeholders:
 ### 2. Initialize the project
 
 ```bash
-pc init \
+cdp init \
   --host cluster-a \
   --scheduler sge \
   --remote-root /scratch/me/projects \
@@ -110,14 +110,14 @@ If `--target` is omitted, it defaults to your current directory name.
 ### 3. Set analysis and tags
 
 ```bash
-pc analysis use analyses/run_001
-pc analysis tag results
-pc analysis tag reports/figures
-pc analysis tag --remote remote_only_outputs
-pc analysis list
-pc analysis list --all
-pc analysis list --remote
-pc analysis list --remote --all
+cdp analysis use analyses/run_001
+cdp analysis tag results
+cdp analysis tag reports/figures
+cdp analysis tag --remote remote_only_outputs
+cdp analysis list
+cdp analysis list --all
+cdp analysis list --remote
+cdp analysis list --remote --all
 ```
 
 ### 4. Run job
@@ -125,13 +125,13 @@ pc analysis list --remote --all
 Using target defaults only:
 
 ```bash
-pc analysis run python train.py --epochs 20
+cdp analysis run python train.py --epochs 20
 ```
 
 Override resources at runtime:
 
 ```bash
-pc analysis run \
+cdp analysis run \
   --profile small \
   --cpus 8 \
   --memory 32G \
@@ -145,49 +145,49 @@ pc analysis run \
 ### 4b. Sweep jobs
 
 ```bash
-pc analysis sweep run --config sweep.yml \
+cdp analysis sweep run --config sweep.yml \
   python train.py --lr {lr} --batch-size {batch_size}
 ```
 
 Run one block only:
 
 ```bash
-pc analysis sweep run --config sweep.yml --job job1 \
+cdp analysis sweep run --config sweep.yml --job job1 \
   python train.py --lr {lr} --batch-size {batch_size}
 ```
 
 ### 5. Monitor and pull
 
 ```bash
-pc status
-pc status --job-id 123456
-pc status --job-name run001
-pc status --target cluster-a
-pc history
-pc history --analysis analyses/run_001 --limit 20
-pc logs
-pc logs --job-id 123456 --tail 100
-pc logs --job-name run001 --head 50
-pc logs --follow
-pc cancel --job-id 123456
-pc cancel --job-name run001 --target cluster-a
-pc stats --job-id 123456
-pc stats --job-name run001
-pc collect --job-id 123456
-pc collect --job-name run001
-pc doctor
-pc doctor --target cluster-a
-pc doctor --no-remote
-pc analysis sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
-pc analysis sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
-pc profile list
-pc analysis sweep list
-pc analysis sweep show sweep-20260101010101-abc123
-pc analysis sweep resume sweep-20260101010101-abc123
-pc analysis sweep cancel sweep-20260101010101-abc123
-pc status list --analysis analyses/run_001
-pc status global
-pc analysis pull
+cdp status
+cdp status --job-id 123456
+cdp status --job-name run001
+cdp status --target cluster-a
+cdp history
+cdp history --analysis analyses/run_001 --limit 20
+cdp logs
+cdp logs --job-id 123456 --tail 100
+cdp logs --job-name run001 --head 50
+cdp logs --follow
+cdp cancel --job-id 123456
+cdp cancel --job-name run001 --target cluster-a
+cdp stats --job-id 123456
+cdp stats --job-name run001
+cdp collect --job-id 123456
+cdp collect --job-name run001
+cdp doctor
+cdp doctor --target cluster-a
+cdp doctor --no-remote
+cdp analysis sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
+cdp analysis sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
+cdp profile list
+cdp analysis sweep list
+cdp analysis sweep show sweep-20260101010101-abc123
+cdp analysis sweep resume sweep-20260101010101-abc123
+cdp analysis sweep cancel sweep-20260101010101-abc123
+cdp status list --analysis analyses/run_001
+cdp status global
+cdp analysis pull
 ```
 
 ## Multi-target workflow
@@ -195,7 +195,7 @@ pc analysis pull
 Add another target:
 
 ```bash
-pc target add cluster-b \
+cdp target add cluster-b \
   --host cluster-b \
   --scheduler pbs \
   --remote-root /scratch/me/projects
@@ -204,13 +204,13 @@ pc target add cluster-b \
 Switch active target:
 
 ```bash
-pc target set cluster-b
+cdp target set cluster-b
 ```
 
 List targets:
 
 ```bash
-pc target list
+cdp target list
 ```
 
 ## Resource resolution order
@@ -224,8 +224,8 @@ If template contains `{queue}` or `{parallel_environment}`, those values must re
 
 ## Command reference
 
-### `pc init`
-Initializes project-control in current directory.
+### `cdp init`
+Initializes cluster-dispatch in current directory.
 
 Key options:
 - `--host` (required)
@@ -241,7 +241,7 @@ Key options:
   - `--queue`
   - `--parallel-environment`
 
-### `pc target add <name>`
+### `cdp target add <name>`
 Adds/updates a target by name.
 
 Key options:
@@ -251,30 +251,30 @@ Key options:
 - `--template-file`
 - default resource options (same as init)
 
-### `pc target set <name>`
+### `cdp target set <name>`
 Sets active default target.
 
-### `pc analysis use <path>`
+### `cdp analysis use <path>`
 Sets active analysis directory (must be under project root).
 
-### `pc analysis tag <path>`
+### `cdp analysis tag <path>`
 Tags a path inside active analysis for pull.
 - default: validates path exists locally under active analysis
 - `--remote`: validates path exists on remote analysis directory (for remote-only paths)
 
-### `pc analysis list [--remote]`
+### `cdp analysis list [--remote]`
 Lists subdirectories inside active analysis.
 - default: local active analysis directory
 - `--remote`: corresponding remote analysis directory on active target
 - `--all`: include files too (not only directories)
 
-### `pc analysis run <command...>`
+### `cdp analysis run <command...>`
 Syncs active analysis to remote, renders template, submits job.
 - supports `--profile <name>` for built-in or user-defined profiles
 - assigns a deterministic `run_id` from command + target + analysis + resolved resources (stored in state + job records)
 - stores `pc_submit.sh`, `run.log`, and scheduler stdout/stderr under `<remote_analysis_root>/<run_id>/`
 
-### `pc analysis sweep run --config <yaml> [--job <name>] [--mode single|array|local] <command...>`
+### `cdp analysis sweep run --config <yaml> [--job <name>] [--mode single|array|local] <command...>`
 Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
 - command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
 - deterministic `run_id` per run from block name + params + command template
@@ -282,22 +282,22 @@ Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
 - `single`: submit each run independently
 - `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
 - `local`: execute each run locally (no scheduler submission)
-- supports same runtime resource override flags as `pc analysis run`
+- supports same runtime resource override flags as `cdp analysis run`
 - supports `--profile <name>` for built-in or user-defined profiles
 
-### `pc profile list`
+### `cdp profile list`
 Lists resource profiles. Built-ins: `small`, `long`, `highmem`.
 
-### `pc profile show <name>`
+### `cdp profile show <name>`
 Shows one profile by name.
 
-### `pc profile set <name> [--cpus ... --memory ... --time ... --node ... --queue ... --parallel-environment ...]`
+### `cdp profile set <name> [--cpus ... --memory ... --time ... --node ... --queue ... --parallel-environment ...]`
 Creates or updates a user-defined profile.
 
-### `pc profile delete <name>`
+### `cdp profile delete <name>`
 Deletes a user-defined profile.
 
-### `pc doctor`
+### `cdp doctor`
 Runs preflight checks for local setup and targets.
 - checks config, template validity, local binaries, active analysis path
 - checks targets (scheduler, remote root, template)
@@ -305,64 +305,64 @@ Runs preflight checks for local setup and targets.
 - filters: `--target <name>`
 - disable remote probes: `--no-remote`
 
-### `pc analysis sweep list`
+### `cdp analysis sweep list`
 Lists existing sweep manifests.
 
-### `pc analysis sweep show <sweep_id>`
+### `cdp analysis sweep show <sweep_id>`
 Shows one sweep manifest and run states.
 
-### `pc analysis sweep resume <sweep_id>`
+### `cdp analysis sweep resume <sweep_id>`
 Submits pending runs from a sweep manifest.
 
-### `pc analysis sweep cancel <sweep_id>`
+### `cdp analysis sweep cancel <sweep_id>`
 Cancels submitted runs from a sweep manifest.
 
-### `pc status`
+### `cdp status`
 Context-aware status (last job in active analysis context, otherwise global).
-- `pc status --job-id <id>`: query exact scheduler job id from remembered launches
-- `pc status --job-name <name>`: query exact job name from remembered launches
-- `pc status --target <name>` can be combined with `--job-id`/`--job-name`
-- record-first: if a job record is already terminal (not running), `pc status` reports that stored state without re-querying live queue
-- if queue lookup returns `NOT_FOUND`, `pc status` checks scheduler accounting and persists recovered terminal state into job history
+- `cdp status --job-id <id>`: query exact scheduler job id from remembered launches
+- `cdp status --job-name <name>`: query exact job name from remembered launches
+- `cdp status --target <name>` can be combined with `--job-id`/`--job-name`
+- record-first: if a job record is already terminal (not running), `cdp status` reports that stored state without re-querying live queue
+- if queue lookup returns `NOT_FOUND`, `cdp status` checks scheduler accounting and persists recovered terminal state into job history
 
-### `pc logs`
+### `cdp logs`
 Shows remote log for selected job.
 - default: uses last job in state
 - filters: `--job-id`, `--job-name`, `--target`, `--analysis`
 - views: `--head N`, `--tail N` (default tail 50), `--follow`
 
-### `pc cancel`
+### `cdp cancel`
 Cancels jobs using stored launch records.
 - required: `--job-id` or `--job-name`
 - optional filters: `--target`, `--analysis`
 - scheduler-specific cancel command is used for each matched record
 
-### `pc stats`
+### `cdp stats`
 Collects resource usage for a recorded job.
 - required: `--job-id` or `--job-name`
 - optional filters: `--target`, `--analysis`
 - uses scheduler-specific accounting/stat commands on selected target
 - normalizes walltime/cpu-time and memory fields into human-readable units where possible
 
-### `pc collect`
+### `cdp collect`
 Collects tagged outputs for a recorded job.
 - required: `--job-id` or `--job-name`
 - optional filters: `--target`, `--analysis`
 - uses selected record's `analysis_tags` and `remote_run_dir`
 
-### `pc history`
+### `cdp history`
 Shows remembered launch records without querying scheduler status.
 - optional filters: `--target`, `--analysis`, `--job-id`, `--job-name`
 - optional `--limit` (default 50)
 
 Subcommands:
-- `pc status list [--analysis ...] [--limit ...]`
-- `pc status global [--limit ...]`
+- `cdp status list [--analysis ...] [--limit ...]`
+- `cdp status global [--limit ...]`
 
 Option:
-- `pc status --target <name>` for target-scoped status from any context.
+- `cdp status --target <name>` for target-scoped status from any context.
 
-### `pc analysis pull [--remote]`
+### `cdp analysis pull [--remote]`
 Pulls only tagged paths for active analysis from remote run directory.
 - default: pulls tagged paths that already exist locally
 - `--remote`: also pulls tagged paths that are remote-only (not present locally)
@@ -397,7 +397,7 @@ All metadata is under project root `.project_control/`:
 Run:
 
 ```bash
-pc analysis use <path>
+cdp analysis use <path>
 ```
 
 ### `Template missing required placeholders`
@@ -406,7 +406,7 @@ Ensure your template includes:
 
 ### `--queue is required ...`
 Your template references `{queue}` but neither:
-- `pc analysis run --queue ...`, nor
+- `cdp analysis run --queue ...`, nor
 - target `default_queue`
 is set.
 
@@ -414,20 +414,20 @@ is set.
 Run:
 
 ```bash
-pc target list
+cdp target list
 ```
 
 and set one:
 
 ```bash
-pc target set <name>
+cdp target set <name>
 ```
 
-### `pc analysis pull` says no tags found
+### `cdp analysis pull` says no tags found
 Tag paths first:
 
 ```bash
-pc analysis tag <path-inside-active-analysis>
+cdp analysis tag <path-inside-active-analysis>
 ```
 
 ## Security notes
