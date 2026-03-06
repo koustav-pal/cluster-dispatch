@@ -132,6 +132,148 @@ def _resolve_resource_profile(profile: Optional[str]) -> dict[str, str | int]:
     return dict(DEFAULT_RESOURCE_PROFILES[key])
 
 
+def _safe_project_root() -> Optional[Path]:
+    try:
+        return _project_root()
+    except Exception:
+        return None
+
+
+def _prefix_filter(values: list[str], incomplete: str) -> list[str]:
+    needle = incomplete or ""
+    return [value for value in values if value.startswith(needle)]
+
+
+def _complete_target_names(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        cfg = load_config(project_root)
+    except Exception:
+        return []
+    return _prefix_filter(sorted(cfg.targets.keys()), incomplete)
+
+
+def _complete_analysis_dirs(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+
+    values: list[str] = []
+    for path in project_root.rglob("*"):
+        if not path.is_dir():
+            continue
+        if path.name in {".git", "__pycache__"}:
+            continue
+        rel = path.relative_to(project_root).as_posix()
+        if rel.startswith(f"{CONFIG_DIR}/"):
+            continue
+        values.append(rel)
+    return _prefix_filter(sorted(set(values)), incomplete)
+
+
+def _complete_active_analysis_paths(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        cfg = load_config(project_root)
+        analysis_dir = _require_active_analysis(cfg, project_root)
+    except Exception:
+        return []
+
+    values: list[str] = []
+    for path in analysis_dir.rglob("*"):
+        rel = path.relative_to(analysis_dir).as_posix()
+        if rel:
+            values.append(rel)
+    return _prefix_filter(sorted(set(values)), incomplete)
+
+
+def _complete_sweep_ids(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    sweeps_dir = project_root / CONFIG_DIR / SWEEPS_DIR_NAME
+    if not sweeps_dir.exists():
+        return []
+
+    active_analysis = ""
+    try:
+        cfg = load_config(project_root)
+        active_analysis = (cfg.active_analysis or "").strip("/")
+    except Exception:
+        active_analysis = ""
+
+    values: list[str] = []
+    for path in sorted(sweeps_dir.glob("*.json")):
+        sweep_id = path.stem
+        if active_analysis:
+            try:
+                payload = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("analysis", "")).strip("/") != active_analysis:
+                continue
+        values.append(sweep_id)
+    return _prefix_filter(values, incomplete)
+
+
+def _complete_job_ids(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        records = _load_job_records(project_root)
+    except Exception:
+        return []
+    seen: set[str] = set()
+    values: list[str] = []
+    for rec in records:
+        job_id = str(rec.get("job_id", "")).strip()
+        if job_id and job_id not in seen:
+            seen.add(job_id)
+            values.append(job_id)
+    return _prefix_filter(values, incomplete)
+
+
+def _complete_job_names(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        records = _load_job_records(project_root)
+    except Exception:
+        return []
+    seen: set[str] = set()
+    values: list[str] = []
+    for rec in records:
+        job_name = str(rec.get("job_name", "")).strip()
+        if job_name and job_name not in seen:
+            seen.add(job_name)
+            values.append(job_name)
+    return _prefix_filter(values, incomplete)
+
+
+def _complete_record_analyses(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        records = _load_job_records(project_root)
+    except Exception:
+        return []
+    seen: set[str] = set()
+    values: list[str] = []
+    for rec in records:
+        analysis = str(rec.get("analysis", "")).strip()
+        if analysis and analysis not in seen:
+            seen.add(analysis)
+            values.append(analysis)
+    return _prefix_filter(values, incomplete)
+
+
 def _sweeps_dir(project_root: Path) -> Path:
     path = project_root / CONFIG_DIR / SWEEPS_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
@@ -391,7 +533,7 @@ def init(
 
 @target_app.command("add")
 def target_add(
-    name: str = typer.Argument(..., help="Target name"),
+    name: str = typer.Argument(..., help="Target name", autocompletion=_complete_target_names),
     host: Optional[str] = typer.Option(None, help="SSH host alias"),
     remote_root: Optional[str] = typer.Option(
         None, help="Remote absolute root directory for this project on the target"
@@ -475,7 +617,7 @@ def target_add(
 
 
 @target_app.command("set")
-def target_set(name: Annotated[str, typer.Argument(help="Target name")]) -> None:
+def target_set(name: Annotated[str, typer.Argument(help="Target name", autocompletion=_complete_target_names)]) -> None:
     """Set default active target."""
     project_root = _project_root()
     cfg = load_config(project_root)
@@ -501,7 +643,9 @@ def target_list() -> None:
 
 @app.command("doctor")
 def doctor(
-    target: Optional[str] = typer.Option(None, "--target", help="Run checks only for one target"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Run checks only for one target", autocompletion=_complete_target_names
+    ),
     remote: bool = typer.Option(True, "--remote/--no-remote", help="Include remote SSH/scheduler checks"),
 ) -> None:
     """Run project preflight checks."""
@@ -1023,7 +1167,9 @@ def sweep_run(
     mode: str = typer.Option("single", "--mode", help="Execution mode: single|array|local"),
     sweep_job: Optional[str] = typer.Option(None, "--job", help="Run only one params.<job> block from config"),
     sweep_id: Optional[str] = typer.Option(None, "--sweep-id", help="Optional sweep id (default: auto-generated)"),
-    target: Optional[str] = typer.Option(None, "--target", help="Target name (defaults to active target)"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Target name (defaults to active target)", autocompletion=_complete_target_names
+    ),
     profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
     cpus: Optional[int] = typer.Option(None, help="CPU cores (defaults to target setting)"),
     memory: Optional[str] = typer.Option(None, help="Memory (defaults to target setting)"),
@@ -1191,7 +1337,7 @@ def sweep_list() -> None:
 
 
 @sweep_app.command("show")
-def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id", autocompletion=_complete_sweep_ids)) -> None:
     """Show one sweep manifest."""
     project_root = _project_root()
     cfg = load_config(project_root)
@@ -1219,7 +1365,7 @@ def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
 
 
 @sweep_app.command("resume")
-def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id", autocompletion=_complete_sweep_ids)) -> None:
     """Resume pending runs from a sweep manifest."""
     project_root = _project_root()
     cfg = load_config(project_root)
@@ -1295,7 +1441,7 @@ def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
 
 
 @sweep_app.command("cancel")
-def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocompletion=_complete_sweep_ids)) -> None:
     """Cancel submitted jobs in a sweep manifest."""
     project_root = _project_root()
     cfg = load_config(project_root)
@@ -1357,7 +1503,7 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
 
 @analysis_app.command("use")
 def analysis_use(
-    path: Annotated[Path, typer.Argument(help="Analysis directory under project root")],
+    path: Annotated[Path, typer.Argument(help="Analysis directory under project root", autocompletion=_complete_analysis_dirs)],
 ) -> None:
     """Set active analysis directory."""
     project_root = _project_root()
@@ -1379,7 +1525,9 @@ def analysis_use(
 
 @analysis_app.command("tag")
 def analysis_tag(
-    path: Annotated[Path, typer.Argument(help="Path inside active analysis to tag for pull")],
+    path: Annotated[
+        Path, typer.Argument(help="Path inside active analysis to tag for pull", autocompletion=_complete_active_analysis_paths)
+    ],
     remote: bool = typer.Option(
         False, "--remote", help="Tag path by validating against remote analysis directory"
     ),
@@ -1440,6 +1588,7 @@ def analysis_list(
     path: str = typer.Argument(
         ".",
         help="Nested path inside active analysis directory.",
+        autocompletion=_complete_active_analysis_paths,
     ),
     remote: bool = typer.Option(False, "--remote", help="List directories from remote analysis directory"),
     all_entries: bool = typer.Option(False, "--all", help="Include files (not just directories)"),
@@ -1925,10 +2074,16 @@ def _cancel_command_for_scheduler(scheduler: str, job_id: str) -> str:
 
 @app.command("cancel")
 def cancel(
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Cancel by exact job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Cancel by exact job name"),
-    target: Optional[str] = typer.Option(None, "--target", help="Restrict cancel to a specific target"),
-    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict cancel to a specific analysis path"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Cancel by exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Cancel by exact job name", autocompletion=_complete_job_names
+    ),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Restrict cancel to a specific target", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Restrict cancel to a specific analysis path", autocompletion=_complete_record_analyses
+    ),
 ) -> None:
     """Cancel jobs by job-id or job-name using recorded launch metadata."""
     if not job_id and not job_name:
@@ -2014,10 +2169,16 @@ def logs(
     follow: Annotated[bool, typer.Option(help="Follow log output (tail -f)")] = False,
     head: Optional[int] = typer.Option(None, "--head", min=1, help="Show first N lines"),
     tail: Optional[int] = typer.Option(None, "--tail", min=1, help="Show last N lines (default: 50)"),
-    target: Optional[str] = typer.Option(None, "--target", help="Filter by target name"),
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Filter by exact job name"),
-    analysis: Optional[str] = typer.Option(None, "--analysis", help="Filter by exact analysis path"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by target name", autocompletion=_complete_target_names
+    ),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Filter by exact job name", autocompletion=_complete_job_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by exact analysis path", autocompletion=_complete_record_analyses
+    ),
 ) -> None:
     """Show remote logs for the selected job (defaults to last job in state)."""
     if head is not None and tail is not None:
@@ -2077,10 +2238,16 @@ def logs(
 @app.command("history")
 def history(
     limit: int = typer.Option(50, "--limit", min=1, help="Maximum number of records to display"),
-    target: Optional[str] = typer.Option(None, "--target", help="Filter by exact target name"),
-    analysis: Optional[str] = typer.Option(None, "--analysis", help="Filter by exact analysis path"),
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Filter by exact job name"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by exact target name", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by exact analysis path", autocompletion=_complete_record_analyses
+    ),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Filter by exact job name", autocompletion=_complete_job_names
+    ),
 ) -> None:
     """Show remembered launch records without querying scheduler status."""
     project_root = _project_root()
@@ -2116,10 +2283,16 @@ def history(
 
 @app.command("collect")
 def collect(
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Collect for exact job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Collect for exact job name"),
-    target: Optional[str] = typer.Option(None, "--target", help="Restrict match to target"),
-    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict match to analysis path"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Collect for exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Collect for exact job name", autocompletion=_complete_job_names
+    ),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Restrict match to target", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Restrict match to analysis path", autocompletion=_complete_record_analyses
+    ),
 ) -> None:
     """Collect tagged outputs for a recorded job."""
     if not job_id and not job_name:
@@ -2485,10 +2658,16 @@ def _normalize_stats_for_display(stats: dict[str, str]) -> dict[str, str]:
 
 @app.command("stats")
 def stats(
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Get stats for exact job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Get stats for exact job name"),
-    target: Optional[str] = typer.Option(None, "--target", help="Restrict match to target"),
-    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict match to analysis path"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Get stats for exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Get stats for exact job name", autocompletion=_complete_job_names
+    ),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Restrict match to target", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Restrict match to analysis path", autocompletion=_complete_record_analyses
+    ),
 ) -> None:
     """Collect resource usage stats for a recorded job."""
     if not job_id and not job_name:
@@ -2710,10 +2889,14 @@ def status_callback(
     ctx: typer.Context,
     follow: Annotated[bool, typer.Option(help="Follow active job log output")] = False,
     target: Optional[str] = typer.Option(
-        None, "--target", help="Show scheduler status filtered to a target name"
+        None, "--target", help="Show scheduler status filtered to a target name", autocompletion=_complete_target_names
     ),
-    job_id: Optional[str] = typer.Option(None, "--job-id", help="Show status for a specific scheduler job id"),
-    job_name: Optional[str] = typer.Option(None, "--job-name", help="Show status for jobs with an exact job name"),
+    job_id: Optional[str] = typer.Option(
+        None, "--job-id", help="Show status for a specific scheduler job id", autocompletion=_complete_job_ids
+    ),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Show status for jobs with an exact job name", autocompletion=_complete_job_names
+    ),
     limit: int = typer.Option(50, help="Maximum number of jobs to display for target/global views"),
 ) -> None:
     """Show context-aware status, or use subcommands like `pc status list`."""
@@ -2750,6 +2933,7 @@ def status_list(
     analysis: Optional[str] = typer.Option(
         None,
         help="Analysis path to filter by (defaults to active analysis, e.g. analyses/analysis_a)",
+        autocompletion=_complete_record_analyses,
     ),
     limit: int = typer.Option(20, help="Maximum number of jobs to display"),
 ) -> None:
