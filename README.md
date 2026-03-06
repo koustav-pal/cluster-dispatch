@@ -99,8 +99,8 @@ cdp init \
 ```
 
 What this does:
-- creates `.project_control/config.yml`
-- creates local state dirs under `.project_control/`
+- creates `.cluster_dispatch/config.yml`
+- creates local state dirs under `.cluster_dispatch/`
 - ensures remote project root exists:
   `ssh <host> mkdir -p <remote_root>`
 - creates default target in config
@@ -278,7 +278,7 @@ Syncs active analysis to remote, renders template, submits job.
 Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
 - command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
 - deterministic `run_id` per run from block name + params + command template
-- manifests stored in `.project_control/sweeps/<sweep_id>.json`
+- manifests stored in `.cluster_dispatch/sweeps/<sweep_id>.json`
 - `single`: submit each run independently
 - `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
 - `local`: execute each run locally (no scheduler submission)
@@ -369,15 +369,15 @@ Pulls only tagged paths for active analysis from remote run directory.
 
 ## Files and state
 
-All metadata is under project root `.project_control/`:
+All metadata is under project root `.cluster_dispatch/`:
 
-- `.project_control/config.yml`:
+- `.cluster_dispatch/config.yml`:
   targets, active analysis, analysis tags
-- `.project_control/state.json`:
+- `.cluster_dispatch/state.json`:
   last submitted job
-- `.project_control/jobs/*.json`:
+- `.cluster_dispatch/jobs/*.json`:
   per-run job records (all launches are preserved)
-- `.project_control/templates/scheduler_header.tmpl`:
+- `.cluster_dispatch/templates/scheduler_header.tmpl`:
   active scheduler template
 
 ## Example template (PBS Pro)
@@ -440,7 +440,7 @@ cdp analysis tag <path-inside-active-analysis>
 
 - required-file preflight checks before run
 - richer status filtering (`--job-id`, `--state`)
-- retention policies for `.project_control/jobs`
+- retention policies for `.cluster_dispatch/jobs`
 - optional dry-run mode for sync and submit
 
 ## Contributing

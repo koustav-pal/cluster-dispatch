@@ -20,7 +20,7 @@ import yaml
 from cluster_dispatch.config import (
     CONFIG_DIR,
     CONFIG_NAME,
-    LEGACY_CONFIG_NAME,
+    JOBS_DIR,
     LastJob,
     ProjectConfig,
     TargetConfig,
@@ -28,7 +28,6 @@ from cluster_dispatch.config import (
     config_path,
     ensure_state_dirs,
     find_project_root,
-    legacy_config_path,
     load_config,
     load_state,
     save_config,
@@ -522,7 +521,7 @@ def init(
         ),
     ),
 ) -> None:
-    """Initialize .project_control/config.yml and local state directories."""
+    """Initialize .cluster_dispatch/config.yml and local state directories."""
     scheduler = scheduler.lower()
     if scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
         raise typer.BadParameter("scheduler must be one of: sge, univa, pbs, slurm, lsf, none")
@@ -534,14 +533,9 @@ def init(
     if not resolved_default_target:
         resolved_default_target = "default"
     cfg_path = config_path(project_root)
-    legacy_path = legacy_config_path(project_root)
 
     if cfg_path.exists():
         raise typer.BadParameter(f"{CONFIG_DIR}/{CONFIG_NAME} already exists in this directory")
-    if legacy_path.exists():
-        raise typer.BadParameter(
-            f"Legacy config {LEGACY_CONFIG_NAME} exists. Move it to {CONFIG_DIR}/{CONFIG_NAME} first."
-        )
     if not template_file.exists() or not template_file.is_file():
         raise typer.BadParameter(f"Template file not found: {template_file}")
 
@@ -1323,7 +1317,7 @@ def sweep_run(
         None, "--parallel-environment", help="Parallel environment (defaults to target setting if template needs it)"
     ),
 ) -> None:
-    """Run a sweep and persist manifest in .project_control/sweeps."""
+    """Run a sweep and persist manifest in .cluster_dispatch/sweeps."""
     mode_lc = mode.lower()
     if mode_lc not in {"single", "array", "local"}:
         raise typer.BadParameter("--mode must be one of: single, array, local")
@@ -2018,7 +2012,7 @@ def _show_last_status(follow: bool = False) -> None:
     target_cfg = cfg.targets[target]
 
     state = "UNKNOWN"
-    jobs_dir = project_root / ".project_control" / "jobs"
+    jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
     if jobs_dir.exists():
         for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
             try:
@@ -2120,7 +2114,7 @@ def _resolve_and_persist_job_state(
 
 
 def _load_job_records(project_root: Path) -> list[dict[str, str]]:
-    jobs_dir = project_root / ".project_control" / "jobs"
+    jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
     if not jobs_dir.exists():
         return []
 
@@ -2893,7 +2887,7 @@ def _collect_status_rows(
     job_name_filter: Optional[str],
     limit: int,
 ) -> list[dict[str, str]]:
-    jobs_dir = project_root / ".project_control" / "jobs"
+    jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
     if not jobs_dir.exists():
         return []
 

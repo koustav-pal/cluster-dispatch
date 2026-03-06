@@ -8,9 +8,8 @@ from typing import Any
 
 import yaml
 
-CONFIG_DIR = ".project_control"
+CONFIG_DIR = ".cluster_dispatch"
 CONFIG_NAME = "config.yml"
-LEGACY_CONFIG_NAME = "project_control.yml"
 STATE_DIR = CONFIG_DIR
 JOBS_DIR = "jobs"
 STATE_FILE = "state.json"
@@ -76,28 +75,20 @@ def config_path(project_root: Path) -> Path:
     return control_dir(project_root) / CONFIG_NAME
 
 
-def legacy_config_path(project_root: Path) -> Path:
-    return project_root / LEGACY_CONFIG_NAME
-
-
 def find_project_root(start: Path | None = None) -> Path:
     here = (start or Path.cwd()).resolve()
     for candidate in [here, *here.parents]:
-        if config_path(candidate).exists() or legacy_config_path(candidate).exists():
+        if config_path(candidate).exists():
             return candidate
     raise FileNotFoundError(
-        f"Could not find {CONFIG_DIR}/{CONFIG_NAME} (or legacy {LEGACY_CONFIG_NAME}) from {here}"
+        f"Could not find {CONFIG_DIR}/{CONFIG_NAME} from {here}"
     )
 
 
 def load_config(project_root: Path) -> ProjectConfig:
     cfg_path = config_path(project_root)
     if not cfg_path.exists():
-        legacy_path = legacy_config_path(project_root)
-        if legacy_path.exists():
-            cfg_path = legacy_path
-        else:
-            raise FileNotFoundError(f"Could not find config at {cfg_path}")
+        raise FileNotFoundError(f"Could not find config at {cfg_path}")
 
     raw = yaml.safe_load(cfg_path.read_text())
     return ProjectConfig(
