@@ -39,10 +39,12 @@ app = typer.Typer(help="Project control CLI for remote SSH compute targets")
 target_app = typer.Typer(help="Manage compute targets")
 analysis_app = typer.Typer(help="Manage active analysis directory")
 sweep_app = typer.Typer(help="Manage sweep orchestration")
+profile_app = typer.Typer(help="Manage resource profiles")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
 app.add_typer(sweep_app, name="sweep")
+app.add_typer(profile_app, name="profile")
 app.add_typer(status_app, name="status")
 
 
@@ -50,6 +52,32 @@ TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
 SWEEPS_DIR_NAME = "sweeps"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
+DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
+    "small": {
+        "cpus": 1,
+        "memory": "8G",
+        "time": "01:00:00",
+        "node": "1",
+        "queue": "",
+        "parallel_environment": "",
+    },
+    "long": {
+        "cpus": 2,
+        "memory": "16G",
+        "time": "24:00:00",
+        "node": "1",
+        "queue": "",
+        "parallel_environment": "",
+    },
+    "highmem": {
+        "cpus": 4,
+        "memory": "128G",
+        "time": "08:00:00",
+        "node": "1",
+        "queue": "",
+        "parallel_environment": "",
+    },
+}
 
 
 def _project_root() -> Path:
@@ -90,6 +118,17 @@ def _extract_placeholders(template: str) -> set[str]:
         if field_name:
             names.add(field_name)
     return names
+
+
+def _resolve_resource_profile(profile: Optional[str]) -> dict[str, str | int]:
+    if not profile:
+        return {}
+    key = profile.strip().lower()
+    if key not in DEFAULT_RESOURCE_PROFILES:
+        raise typer.BadParameter(
+            f"Unknown profile '{profile}'. Available profiles: {', '.join(sorted(DEFAULT_RESOURCE_PROFILES.keys()))}"
+        )
+    return dict(DEFAULT_RESOURCE_PROFILES[key])
 
 
 def _sweeps_dir(project_root: Path) -> Path:
@@ -437,6 +476,16 @@ def target_list() -> None:
     for name, t in cfg.targets.items():
         marker = "*" if name == cfg.default_target else " "
         typer.echo(f"{marker} {name}: host={t.host} scheduler={t.scheduler}")
+
+
+@profile_app.command("list")
+def profile_list() -> None:
+    """List built-in resource profiles."""
+    for name, values in sorted(DEFAULT_RESOURCE_PROFILES.items()):
+        typer.echo(
+            f"{name}: cpus={values['cpus']} memory={values['memory']} time={values['time']} "
+            f"node={values['node']} queue={values['queue']} parallel_environment={values['parallel_environment']}"
+        )
 
 
 def _build_sweep_manifest(
@@ -800,6 +849,7 @@ def sweep_run(
     sweep_job: Optional[str] = typer.Option(None, "--job", help="Run only one params.<job> block from config"),
     sweep_id: Optional[str] = typer.Option(None, "--sweep-id", help="Optional sweep id (default: auto-generated)"),
     target: Optional[str] = typer.Option(None, "--target", help="Target name (defaults to active target)"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
     cpus: Optional[int] = typer.Option(None, help="CPU cores (defaults to target setting)"),
     memory: Optional[str] = typer.Option(None, help="Memory (defaults to target setting)"),
     job_time: Optional[str] = typer.Option(None, "--time", help="Walltime (defaults to target setting)"),
@@ -841,12 +891,17 @@ def sweep_run(
     if mode_lc == "array" and target_cfg.scheduler.lower() == "none":
         raise typer.BadParameter("Array mode is not supported for scheduler 'none'")
 
-    resolved_cpus = cpus if cpus is not None else target_cfg.default_cpus
-    resolved_memory = memory if memory is not None else target_cfg.default_memory
-    resolved_time = job_time if job_time is not None else target_cfg.default_time
-    resolved_node = node or target_cfg.default_node or "1"
-    resolved_queue = queue if queue is not None else target_cfg.default_queue
-    resolved_pe = parallel_environment if parallel_environment is not None else target_cfg.default_parallel_environment
+    profile_values = _resolve_resource_profile(profile)
+    resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target_cfg.default_cpus))
+    resolved_memory = memory if memory is not None else str(profile_values.get("memory", target_cfg.default_memory))
+    resolved_time = job_time if job_time is not None else str(profile_values.get("time", target_cfg.default_time))
+    resolved_node = node or str(profile_values.get("node", target_cfg.default_node or "1"))
+    resolved_queue = queue if queue is not None else str(profile_values.get("queue", target_cfg.default_queue))
+    resolved_pe = (
+        parallel_environment
+        if parallel_environment is not None
+        else str(profile_values.get("parallel_environment", target_cfg.default_parallel_environment))
+    )
 
     if "{queue}" in target_cfg.template_header and not resolved_queue:
         raise typer.BadParameter("--queue is required (or target default_queue) because template includes {queue}.")
@@ -1260,6 +1315,7 @@ def analysis_list(
 def run(
     ctx: typer.Context,
     interactive: Annotated[bool, typer.Option(help="Run in interactive SSH session (skip scheduler)")] = False,
+    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
     cpus: Optional[int] = typer.Option(None, help="CPU cores for scheduler template (defaults to target setting)"),
     memory: Optional[str] = typer.Option(
         None, help="Memory for scheduler template, e.g. 8G (defaults to target setting)"
@@ -1296,17 +1352,20 @@ def run(
         raise typer.BadParameter(
             f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
         )
-    resolved_cpus = cpus if cpus is not None else target.default_cpus
-    resolved_memory = memory if memory is not None else target.default_memory
-    resolved_time = job_time if job_time is not None else target.default_time
+    profile_values = _resolve_resource_profile(profile)
+    resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
+    resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
+    resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
     resolved_job_name = job_name or f"pc-{secrets.token_hex(4)}"
     resolved_stdout = resolved_job_name
     resolved_stderr = resolved_job_name
     resolved_working_dir = target.remote_root
-    resolved_node = node or target.default_node or "1"
-    resolved_queue = queue if queue is not None else target.default_queue
+    resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
+    resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
     resolved_parallel_environment = (
-        parallel_environment if parallel_environment is not None else target.default_parallel_environment
+        parallel_environment
+        if parallel_environment is not None
+        else str(profile_values.get("parallel_environment", target.default_parallel_environment))
     )
 
     requires_queue = "{queue}" in target.template_header
@@ -1429,6 +1488,7 @@ def sweep(
     ctx: typer.Context,
     config_file: Path = typer.Option(..., "--config", help="YAML sweep config file"),
     sweep_job: Optional[str] = typer.Option(None, "--job", help="Run only one params.<job> block from config"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Resource profile: small|long|highmem"),
     cpus: Optional[int] = typer.Option(None, help="CPU cores for scheduler template (defaults to target setting)"),
     memory: Optional[str] = typer.Option(
         None, help="Memory for scheduler template, e.g. 8G (defaults to target setting)"
@@ -1485,13 +1545,16 @@ def sweep(
             f"Target '{target_name}' has no remote_root configured. Update it with `pc target add {target_name} --remote-root ...`."
         )
 
-    resolved_cpus = cpus if cpus is not None else target.default_cpus
-    resolved_memory = memory if memory is not None else target.default_memory
-    resolved_time = job_time if job_time is not None else target.default_time
-    resolved_node = node or target.default_node or "1"
-    resolved_queue = queue if queue is not None else target.default_queue
+    profile_values = _resolve_resource_profile(profile)
+    resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
+    resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
+    resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
+    resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
+    resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
     resolved_parallel_environment = (
-        parallel_environment if parallel_environment is not None else target.default_parallel_environment
+        parallel_environment
+        if parallel_environment is not None
+        else str(profile_values.get("parallel_environment", target.default_parallel_environment))
     )
 
     requires_queue = "{queue}" in target.template_header

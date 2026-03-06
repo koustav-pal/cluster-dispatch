@@ -132,6 +132,7 @@ Override resources at runtime:
 
 ```bash
 pc analysis run \
+  --profile small \
   --cpus 8 \
   --memory 32G \
   --time 04:00:00 \
@@ -176,6 +177,7 @@ pc collect --job-id 123456
 pc collect --job-name run001
 pc sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
 pc sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
+pc profile list
 pc sweep list
 pc sweep show sweep-20260101010101-abc123
 pc sweep resume sweep-20260101010101-abc123
@@ -212,7 +214,8 @@ pc target list
 
 For each run resource (`cpus`, `memory`, `time`, `node`, `queue`, `parallel_environment`):
 1. runtime flag (if provided),
-2. target default from config.
+2. selected profile values (if `--profile` is set),
+3. target default from config.
 
 If template contains `{queue}` or `{parallel_environment}`, those values must resolve non-empty (runtime or default), otherwise run fails fast.
 
@@ -264,12 +267,14 @@ Lists subdirectories inside active analysis.
 
 ### `pc analysis run <command...>`
 Syncs active analysis to remote, renders template, submits job.
+- supports `--profile small|long|highmem`
 
 ### `pc analysis sweep --config <yaml> [--job <name>] <command...>`
 Submits cartesian sweep jobs from YAML `params` blocks.
 - command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
 - submits one job per parameter combination
 - supports same runtime resource override flags as `pc analysis run`
+- supports `--profile small|long|highmem`
 
 ### `pc sweep run --config <yaml> [--mode single|array|local] <command...>`
 Top-level sweep orchestration with persisted manifests.
@@ -278,6 +283,10 @@ Top-level sweep orchestration with persisted manifests.
 - `single`: submit each run independently
 - `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
 - `local`: execute each run locally (no scheduler submission)
+- supports `--profile small|long|highmem`
+
+### `pc profile list`
+Lists built-in resource profiles: `small`, `long`, `highmem`.
 
 ### `pc sweep list`
 Lists existing sweep manifests.
