@@ -145,7 +145,15 @@ pc analysis run \
 
 ```bash
 pc status
+pc status --job-id 123456
+pc status --job-name run001
 pc status --target cluster-a
+pc logs
+pc logs --job-id 123456 --tail 100
+pc logs --job-name run001 --head 50
+pc logs --follow
+pc cancel --job-id 123456
+pc cancel --job-name run001 --target cluster-a
 pc status list --analysis analyses/run_001
 pc status global
 pc analysis pull
@@ -233,6 +241,21 @@ Syncs active analysis to remote, renders template, submits job.
 
 ### `pc status`
 Context-aware status (last job in active analysis context, otherwise global).
+- `pc status --job-id <id>`: query exact scheduler job id from remembered launches
+- `pc status --job-name <name>`: query exact job name from remembered launches
+- `pc status --target <name>` can be combined with `--job-id`/`--job-name`
+
+### `pc logs`
+Shows remote log for selected job.
+- default: uses last job in state
+- filters: `--job-id`, `--job-name`, `--target`, `--analysis`
+- views: `--head N`, `--tail N` (default tail 50), `--follow`
+
+### `pc cancel`
+Cancels jobs using stored launch records.
+- required: `--job-id` or `--job-name`
+- optional filters: `--target`, `--analysis`
+- scheduler-specific cancel command is used for each matched record
 
 Subcommands:
 - `pc status list [--analysis ...] [--limit ...]`
@@ -255,7 +278,7 @@ All metadata is under project root `.project_control/`:
 - `.project_control/state.json`:
   last submitted job
 - `.project_control/jobs/*.json`:
-  per-run job records
+  per-run job records (all launches are preserved)
 - `.project_control/templates/scheduler_header.tmpl`:
   active scheduler template
 

@@ -707,11 +707,246 @@ def _show_last_status(follow: bool = False) -> None:
             typer.echo(proc.stdout.rstrip())
 
 
+def _load_job_records(project_root: Path) -> list[dict[str, str]]:
+    jobs_dir = project_root / ".project_control" / "jobs"
+    if not jobs_dir.exists():
+        return []
+
+    records: list[dict[str, str]] = []
+    for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
+        try:
+            payload = json.loads(job_file.read_text())
+        except json.JSONDecodeError:
+            continue
+        payload["_record_file"] = str(job_file)
+        records.append(payload)
+    return records
+
+
+def _resolve_log_job(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target: Optional[str],
+    job_id: Optional[str],
+    job_name: Optional[str],
+    analysis: Optional[str],
+) -> dict[str, str]:
+    records = _load_job_records(project_root)
+
+    def _matches(rec: dict[str, str]) -> bool:
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        return True
+
+    has_filters = any([target, job_id, job_name, analysis])
+    if has_filters:
+        matched = [rec for rec in records if _matches(rec)]
+        if not matched:
+            raise typer.BadParameter("No matching job records found for the provided filters")
+        if len(matched) > 1:
+            typer.echo(f"Multiple matches found ({len(matched)}). Showing most recent match.")
+        return matched[0]
+
+    state = load_state(project_root)
+    last = state.get("last_job")
+    if last:
+        for rec in records:
+            if str(rec.get("job_id", "")) == str(last.get("job_id", "")) and str(rec.get("target", "")) == str(
+                last.get("target", "")
+            ):
+                return rec
+        return {
+            "job_id": str(last.get("job_id", "")),
+            "job_name": "",
+            "target": str(last.get("target", "")),
+            "scheduler": str(last.get("scheduler", "")),
+            "remote_log_file": str(last.get("remote_log_file", "")),
+            "analysis": "",
+        }
+
+    if not records:
+        raise typer.BadParameter("No job records found. Run `pc analysis run ...` first.")
+    return records[0]
+
+
+def _cancel_command_for_scheduler(scheduler: str, job_id: str) -> str:
+    scheduler_lc = scheduler.lower()
+    quoted_job_id = shlex.quote(job_id)
+    if scheduler_lc in {"sge", "univa", "pbs"}:
+        return f"qdel {quoted_job_id}"
+    if scheduler_lc == "slurm":
+        return f"scancel {quoted_job_id}"
+    if scheduler_lc == "lsf":
+        return f"bkill {quoted_job_id}"
+    if scheduler_lc == "none":
+        return f"kill {quoted_job_id}"
+    raise typer.BadParameter(f"Unsupported scheduler for cancel: {scheduler}")
+
+
+@app.command("cancel")
+def cancel(
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Cancel by exact job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Cancel by exact job name"),
+    target: Optional[str] = typer.Option(None, "--target", help="Restrict cancel to a specific target"),
+    analysis: Optional[str] = typer.Option(None, "--analysis", help="Restrict cancel to a specific analysis path"),
+) -> None:
+    """Cancel jobs by job-id or job-name using recorded launch metadata."""
+    if not job_id and not job_name:
+        raise typer.BadParameter("Provide at least one selector: --job-id or --job-name")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if target and target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target}' not found")
+
+    records = _load_job_records(project_root)
+    if not records:
+        raise typer.BadParameter("No job records found. Nothing to cancel.")
+
+    def _matches(rec: dict[str, str]) -> bool:
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        return True
+
+    matches = [rec for rec in records if _matches(rec)]
+    if not matches:
+        raise typer.BadParameter("No matching job records found for the provided filters")
+
+    # Keep most-recent-first order but avoid repeated cancellation for duplicated records.
+    seen: set[tuple[str, str, str]] = set()
+    unique_matches: list[dict[str, str]] = []
+    for rec in matches:
+        key = (
+            str(rec.get("target", "")),
+            str(rec.get("scheduler", "")),
+            str(rec.get("job_id", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_matches.append(rec)
+
+    cancelled: list[str] = []
+    failed: list[str] = []
+    for rec in unique_matches:
+        rec_target = str(rec.get("target", ""))
+        rec_scheduler = str(rec.get("scheduler", ""))
+        rec_job_id = str(rec.get("job_id", ""))
+        rec_job_name = str(rec.get("job_name", ""))
+        if not rec_target or not rec_job_id:
+            failed.append(f"job_id={rec_job_id or '<missing>'} target={rec_target or '<missing>'} reason=missing_metadata")
+            continue
+        if rec_target not in cfg.targets:
+            failed.append(f"job_id={rec_job_id} target={rec_target} reason=target_not_configured")
+            continue
+
+        cancel_cmd = _cancel_command_for_scheduler(rec_scheduler, rec_job_id)
+        proc = subprocess.run(
+            ["ssh", cfg.targets[rec_target].host, cancel_cmd],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        label = f"job_id={rec_job_id} job_name={rec_job_name} target={rec_target}"
+        if proc.returncode == 0:
+            cancelled.append(label)
+        else:
+            err = (proc.stderr or proc.stdout or "unknown_error").strip().replace("\n", " ")
+            failed.append(f"{label} reason={err}")
+
+    if cancelled:
+        typer.echo("Cancelled jobs:")
+        for line in cancelled:
+            typer.echo(f"- {line}")
+    if failed:
+        typer.echo("Failed to cancel:")
+        for line in failed:
+            typer.echo(f"- {line}")
+
+@app.command("logs")
+def logs(
+    follow: Annotated[bool, typer.Option(help="Follow log output (tail -f)")] = False,
+    head: Optional[int] = typer.Option(None, "--head", min=1, help="Show first N lines"),
+    tail: Optional[int] = typer.Option(None, "--tail", min=1, help="Show last N lines (default: 50)"),
+    target: Optional[str] = typer.Option(None, "--target", help="Filter by target name"),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Filter by exact job name"),
+    analysis: Optional[str] = typer.Option(None, "--analysis", help="Filter by exact analysis path"),
+) -> None:
+    """Show remote logs for the selected job (defaults to last job in state)."""
+    if head is not None and tail is not None:
+        raise typer.BadParameter("Use only one of --head or --tail")
+    if follow and head is not None:
+        raise typer.BadParameter("--follow cannot be combined with --head")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if target and target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target}' not found")
+
+    selected = _resolve_log_job(
+        project_root=project_root,
+        cfg=cfg,
+        target=target,
+        job_id=job_id,
+        job_name=job_name,
+        analysis=analysis,
+    )
+    selected_target = str(selected.get("target", ""))
+    if selected_target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
+    remote_log_file = str(selected.get("remote_log_file", "")).strip()
+    if not remote_log_file:
+        raise typer.BadParameter("Selected job does not have a remote log file")
+
+    line_count = tail if tail is not None else 50
+    if head is not None:
+        remote_cmd = f"if [ -f {shlex.quote(remote_log_file)} ]; then head -n {head} {shlex.quote(remote_log_file)}; fi"
+    elif follow:
+        remote_cmd = f"tail -n {line_count} -f {shlex.quote(remote_log_file)}"
+    else:
+        remote_cmd = (
+            f"if [ -f {shlex.quote(remote_log_file)} ]; then tail -n {line_count} {shlex.quote(remote_log_file)}; fi"
+        )
+
+    host = cfg.targets[selected_target].host
+    if follow:
+        typer.echo(
+            f"Following log for job_id={selected.get('job_id', '')} "
+            f"job_name={selected.get('job_name', '')} target={selected_target}: {remote_log_file}"
+        )
+        subprocess.run(["ssh", "-t", host, remote_cmd], check=True)
+        return
+
+    proc = subprocess.run(["ssh", host, remote_cmd], text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise typer.BadParameter(proc.stderr.strip() or "Failed to fetch remote log")
+
+    if not proc.stdout.strip():
+        typer.echo(f"No log output found at {remote_log_file}")
+        return
+    typer.echo(proc.stdout.rstrip())
+
+
 def _collect_status_rows(
     project_root: Path,
     cfg: ProjectConfig,
     analysis_filter: Optional[str],
     target_filter: Optional[str],
+    job_id_filter: Optional[str],
+    job_name_filter: Optional[str],
     limit: int,
 ) -> list[dict[str, str]]:
     jobs_dir = project_root / ".project_control" / "jobs"
@@ -735,6 +970,11 @@ def _collect_status_rows(
             continue
 
         job_id = str(payload.get("job_id", ""))
+        if job_id_filter and job_id != job_id_filter:
+            continue
+        job_name = str(payload.get("job_name", ""))
+        if job_name_filter and job_name != job_name_filter:
+            continue
         scheduler = str(payload.get("scheduler", ""))
         submitted_at = str(payload.get("submitted_at", ""))
         state = "UNKNOWN"
@@ -751,6 +991,7 @@ def _collect_status_rows(
         rows.append(
             {
                 "job_id": job_id,
+                "job_name": job_name,
                 "analysis": analysis_name,
                 "target": target_name,
                 "scheduler": scheduler,
@@ -767,7 +1008,15 @@ def _collect_status_rows(
 def _show_global_status(limit: int = 50) -> None:
     project_root = _project_root()
     cfg = load_config(project_root)
-    rows = _collect_status_rows(project_root, cfg, analysis_filter=None, target_filter=None, limit=limit)
+    rows = _collect_status_rows(
+        project_root,
+        cfg,
+        analysis_filter=None,
+        target_filter=None,
+        job_id_filter=None,
+        job_name_filter=None,
+        limit=limit,
+    )
 
     if not rows:
         typer.echo("No jobs recorded yet")
@@ -787,7 +1036,15 @@ def _show_target_status(target: str, limit: int = 50) -> None:
     if target not in cfg.targets:
         raise typer.BadParameter(f"Target '{target}' not found")
 
-    rows = _collect_status_rows(project_root, cfg, analysis_filter=None, target_filter=target, limit=limit)
+    rows = _collect_status_rows(
+        project_root,
+        cfg,
+        analysis_filter=None,
+        target_filter=target,
+        job_id_filter=None,
+        job_name_filter=None,
+        limit=limit,
+    )
     if not rows:
         typer.echo(f"No jobs found for target '{target}'")
         return
@@ -795,8 +1052,56 @@ def _show_target_status(target: str, limit: int = 50) -> None:
     typer.echo(f"Status for target: {target}")
     for row in rows:
         typer.echo(
-            f"{row['job_id']}  analysis={row['analysis']} scheduler={row['scheduler']} "
+            f"{row['job_id']}  job_name={row['job_name']} analysis={row['analysis']} scheduler={row['scheduler']} "
             f"state={row['state']} submitted_at={row['submitted_at']}"
+        )
+
+
+def _show_filtered_status(
+    target: Optional[str],
+    job_id: Optional[str],
+    job_name: Optional[str],
+    limit: int,
+) -> None:
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if target and target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target}' not found")
+
+    rows = _collect_status_rows(
+        project_root,
+        cfg,
+        analysis_filter=None,
+        target_filter=target,
+        job_id_filter=job_id,
+        job_name_filter=job_name,
+        limit=limit,
+    )
+    if not rows:
+        filters = []
+        if target:
+            filters.append(f"target={target}")
+        if job_id:
+            filters.append(f"job_id={job_id}")
+        if job_name:
+            filters.append(f"job_name={job_name}")
+        filter_text = " ".join(filters) if filters else "requested filters"
+        typer.echo(f"No jobs found for {filter_text}")
+        return
+
+    filters = []
+    if target:
+        filters.append(f"target={target}")
+    if job_id:
+        filters.append(f"job_id={job_id}")
+    if job_name:
+        filters.append(f"job_name={job_name}")
+    filter_text = " ".join(filters) if filters else "all jobs"
+    typer.echo(f"Status for {filter_text}:")
+    for row in rows:
+        typer.echo(
+            f"{row['job_id']}  job_name={row['job_name']} analysis={row['analysis']} "
+            f"target={row['target']} scheduler={row['scheduler']} state={row['state']} submitted_at={row['submitted_at']}"
         )
 
 
@@ -807,14 +1112,16 @@ def status_callback(
     target: Optional[str] = typer.Option(
         None, "--target", help="Show scheduler status filtered to a target name"
     ),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Show status for a specific scheduler job id"),
+    job_name: Optional[str] = typer.Option(None, "--job-name", help="Show status for jobs with an exact job name"),
     limit: int = typer.Option(50, help="Maximum number of jobs to display for target/global views"),
 ) -> None:
     """Show context-aware status, or use subcommands like `pc status list`."""
     if ctx.invoked_subcommand is None:
-        if target:
+        if target or job_id or job_name:
             if follow:
-                raise typer.BadParameter("--follow cannot be used with --target")
-            _show_target_status(target=target, limit=limit)
+                raise typer.BadParameter("--follow cannot be used with --target, --job-id, or --job-name")
+            _show_filtered_status(target=target, job_id=job_id, job_name=job_name, limit=limit)
             return
 
         project_root = _project_root()
@@ -854,7 +1161,13 @@ def status_list(
         raise typer.BadParameter("No analysis provided and no active analysis set")
 
     rows = _collect_status_rows(
-        project_root, cfg, analysis_filter=target_analysis, target_filter=None, limit=limit
+        project_root,
+        cfg,
+        analysis_filter=target_analysis,
+        target_filter=None,
+        job_id_filter=None,
+        job_name_filter=None,
+        limit=limit,
     )
 
     if not rows:
@@ -864,7 +1177,7 @@ def status_list(
     typer.echo(f"Jobs for analysis: {target_analysis}")
     for row in rows:
         typer.echo(
-            f"{row['job_id']}  target={row['target']} scheduler={row['scheduler']} "
+            f"{row['job_id']}  job_name={row['job_name']} target={row['target']} scheduler={row['scheduler']} "
             f"state={row['state']} submitted_at={row['submitted_at']}"
         )
 
