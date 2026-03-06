@@ -174,6 +174,12 @@ pc stats --job-id 123456
 pc stats --job-name run001
 pc collect --job-id 123456
 pc collect --job-name run001
+pc sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
+pc sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
+pc sweep list
+pc sweep show sweep-20260101010101-abc123
+pc sweep resume sweep-20260101010101-abc123
+pc sweep cancel sweep-20260101010101-abc123
 pc status list --analysis analyses/run_001
 pc status global
 pc analysis pull
@@ -264,6 +270,26 @@ Submits cartesian sweep jobs from YAML `params` blocks.
 - command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
 - submits one job per parameter combination
 - supports same runtime resource override flags as `pc analysis run`
+
+### `pc sweep run --config <yaml> [--mode single|array|local] <command...>`
+Top-level sweep orchestration with persisted manifests.
+- manifests stored in `.project_control/sweeps/<sweep_id>.json`
+- deterministic `run_id` per run from block name + params + command template
+- `single`: submit each run independently
+- `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
+- `local`: execute each run locally (no scheduler submission)
+
+### `pc sweep list`
+Lists existing sweep manifests.
+
+### `pc sweep show <sweep_id>`
+Shows one sweep manifest and run states.
+
+### `pc sweep resume <sweep_id>`
+Submits pending runs from a sweep manifest.
+
+### `pc sweep cancel <sweep_id>`
+Cancels submitted runs from a sweep manifest.
 
 ### `pc status`
 Context-aware status (last job in active analysis context, otherwise global).

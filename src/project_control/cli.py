@@ -6,10 +6,12 @@ import subprocess
 import json
 import re
 import itertools
+import hashlib
+import base64
 from string import Formatter
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Any
 
 import typer
 import yaml
@@ -36,14 +38,17 @@ from project_control.schedulers import get_adapter
 app = typer.Typer(help="Project control CLI for remote SSH compute targets")
 target_app = typer.Typer(help="Manage compute targets")
 analysis_app = typer.Typer(help="Manage active analysis directory")
+sweep_app = typer.Typer(help="Manage sweep orchestration")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
+app.add_typer(sweep_app, name="sweep")
 app.add_typer(status_app, name="status")
 
 
 TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
+SWEEPS_DIR_NAME = "sweeps"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 
 
@@ -85,6 +90,96 @@ def _extract_placeholders(template: str) -> set[str]:
         if field_name:
             names.add(field_name)
     return names
+
+
+def _sweeps_dir(project_root: Path) -> Path:
+    path = project_root / CONFIG_DIR / SWEEPS_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
+    return _sweeps_dir(project_root) / f"{sweep_id}.json"
+
+
+def _load_sweep_manifest(project_root: Path, sweep_id: str) -> dict[str, Any]:
+    path = _sweep_manifest_path(project_root, sweep_id)
+    if not path.exists():
+        raise typer.BadParameter(f"Sweep '{sweep_id}' not found")
+    return json.loads(path.read_text())
+
+
+def _save_sweep_manifest(project_root: Path, manifest: dict[str, Any]) -> None:
+    path = _sweep_manifest_path(project_root, str(manifest["sweep_id"]))
+    manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    path.write_text(json.dumps(manifest, indent=2))
+
+
+def _deterministic_run_id(block_name: str, params: dict[str, Any], command_template: str) -> str:
+    payload = {
+        "block_name": block_name,
+        "params": params,
+        "command_template": command_template,
+    }
+    material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _expand_sweep_runs(config_payload: dict[str, Any], command_template: str, block_filter: Optional[str]) -> list[dict[str, Any]]:
+    params_section = config_payload.get("params")
+    if not isinstance(params_section, dict) or not params_section:
+        raise typer.BadParameter("Sweep config must define non-empty params mapping")
+
+    selected_blocks = {block_filter: params_section.get(block_filter)} if block_filter else params_section
+    if block_filter and selected_blocks[block_filter] is None:
+        raise typer.BadParameter(f"Job '{block_filter}' not found under params in sweep config")
+
+    command_placeholders = _extract_placeholders(command_template)
+    runs: list[dict[str, Any]] = []
+    for block_name, block_params in selected_blocks.items():
+        if not isinstance(block_params, dict) or not block_params:
+            raise typer.BadParameter(f"params.{block_name} must be a non-empty mapping")
+
+        keys = list(block_params.keys())
+        missing = [k for k in keys if k not in command_placeholders]
+        if missing:
+            raise typer.BadParameter(
+                f"Command template missing placeholders for params.{block_name}: {', '.join(missing)}"
+            )
+
+        value_lists: list[list[Any]] = []
+        for key in keys:
+            values = block_params[key]
+            if isinstance(values, (list, tuple)):
+                if not values:
+                    raise typer.BadParameter(f"params.{block_name}.{key} must not be empty")
+                value_lists.append(list(values))
+            else:
+                value_lists.append([values])
+
+        for idx, combo in enumerate(itertools.product(*value_lists), start=1):
+            param_map = {keys[pos]: combo[pos] for pos in range(len(keys))}
+            render_context = dict(param_map)
+            render_context["sweep_job"] = block_name
+            render_context["sweep_index"] = idx
+            try:
+                rendered_command = command_template.format(**render_context)
+            except KeyError as exc:
+                raise typer.BadParameter(f"Missing placeholder value for '{exc.args[0]}' in sweep command template") from exc
+
+            runs.append(
+                {
+                    "run_id": _deterministic_run_id(block_name, param_map, command_template),
+                    "sweep_job": block_name,
+                    "sweep_index": idx,
+                    "sweep_params": param_map,
+                    "command": rendered_command,
+                    "status": "PENDING",
+                    "job_id": None,
+                    "submitted_at": None,
+                }
+            )
+    return runs
 
 
 def _build_submit_script(
@@ -342,6 +437,657 @@ def target_list() -> None:
     for name, t in cfg.targets.items():
         marker = "*" if name == cfg.default_target else " "
         typer.echo(f"{marker} {name}: host={t.host} scheduler={t.scheduler}")
+
+
+def _build_sweep_manifest(
+    sweep_id: str,
+    mode: str,
+    target_name: str,
+    target: TargetConfig,
+    config_file: Path,
+    command_template: str,
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    now = datetime.now().isoformat(timespec="seconds")
+    remote_sweep_dir = f"{target.remote_root.rstrip('/')}/sweeps/{sweep_id}"
+    return {
+        "sweep_id": sweep_id,
+        "created_at": now,
+        "updated_at": now,
+        "mode": mode,
+        "target": target_name,
+        "host": target.host,
+        "scheduler": target.scheduler,
+        "config_file": str(config_file),
+        "command_template": command_template,
+        "remote_sweep_dir": remote_sweep_dir,
+        "array_job_id": None,
+        "resources": {},
+        "runs": runs,
+    }
+
+
+def _append_sweep_job_record(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target: TargetConfig,
+    sweep_id: str,
+    submission_mode: str,
+    run: dict[str, Any],
+    remote_sweep_dir: str,
+    remote_log_file: str,
+    submitted_at: str,
+    scheduler_override: Optional[str] = None,
+    state_override: Optional[str] = None,
+) -> None:
+    scheduler_value = scheduler_override or target.scheduler
+    state_value = state_override or ("RUNNING_OR_QUEUED" if run.get("job_id") != "interactive" else "INTERACTIVE")
+    append_job_record(
+        project_root,
+        {
+            "submitted_at": submitted_at,
+            "analysis": cfg.active_analysis,
+            "analysis_tags": cfg.analysis_tags.get(cfg.active_analysis or "", []),
+            "target": target_name,
+            "scheduler": scheduler_value,
+            "job_id": run.get("job_id", ""),
+            "job_name": run.get("job_name", ""),
+            "state": state_value,
+            "stdout": run.get("job_name", ""),
+            "stderr": run.get("job_name", ""),
+            "working_dir": target.remote_root,
+            "cpus": run.get("resources", {}).get("cpus"),
+            "memory": run.get("resources", {}).get("memory"),
+            "time": run.get("resources", {}).get("time"),
+            "queue": run.get("resources", {}).get("queue"),
+            "parallel_environment": run.get("resources", {}).get("parallel_environment"),
+            "node": run.get("resources", {}).get("node"),
+            "command": run.get("command", ""),
+            "remote_run_dir": remote_sweep_dir,
+            "remote_log_file": remote_log_file,
+            "sweep_id": sweep_id,
+            "run_id": run.get("run_id", ""),
+            "sweep_job": run.get("sweep_job", ""),
+            "sweep_index": run.get("sweep_index"),
+            "sweep_params": run.get("sweep_params", {}),
+            "submission_mode": submission_mode,
+        },
+    )
+
+
+def _submit_sweep_single(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target: TargetConfig,
+    manifest: dict[str, Any],
+    run_indexes: list[int],
+    resources: dict[str, Any],
+    base_job_name: str,
+) -> int:
+    remote_sweep_dir = str(manifest["remote_sweep_dir"])
+    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+    adapter = get_adapter(target.scheduler)
+    submitted_count = 0
+
+    for idx in run_indexes:
+        run = manifest["runs"][idx]
+        run_slug = _slug_component(str(run["sweep_job"]))
+        run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
+        remote_submit_script = f"{remote_sweep_dir}/pc_submit_{run['run_id']}.sh"
+        remote_log_file = f"{remote_sweep_dir}/run_{run['run_id']}.log"
+        submit_script = _build_submit_script(
+            header=_render_scheduler_header(
+                target.template_header,
+                cpus=int(resources["cpus"]),
+                memory=str(resources["memory"]),
+                walltime=str(resources["time"]),
+                job_name=run_name,
+                stdout=run_name,
+                stderr=run_name,
+                working_dir=target.remote_root,
+                queue=str(resources["queue"]),
+                node=str(resources["node"]),
+                parallel_environment=str(resources["parallel_environment"]),
+            ),
+            command=str(run["command"]),
+            working_dir=target.remote_root,
+            remote_log_file=remote_log_file,
+        )
+        _run_cmd(
+            [
+                "ssh",
+                target.host,
+                "bash",
+                "-lc",
+                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
+            ]
+        )
+        submit_result = adapter.submit(target.host, remote_submit_script)
+        submitted_at = datetime.now().isoformat(timespec="seconds")
+        run["job_id"] = submit_result.job_id
+        run["job_name"] = run_name
+        run["status"] = "SUBMITTED"
+        run["submitted_at"] = submitted_at
+        run["submission_mode"] = "single"
+        run["resources"] = resources
+
+        _append_sweep_job_record(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target,
+            sweep_id=str(manifest["sweep_id"]),
+            submission_mode="single",
+            run=run,
+            remote_sweep_dir=remote_sweep_dir,
+            remote_log_file=remote_log_file,
+            submitted_at=submitted_at,
+        )
+        submitted_count += 1
+    return submitted_count
+
+
+def _submit_sweep_array(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target: TargetConfig,
+    manifest: dict[str, Any],
+    run_indexes: list[int],
+    resources: dict[str, Any],
+    base_job_name: str,
+) -> int:
+    scheduler_lc = target.scheduler.lower()
+    if scheduler_lc == "none":
+        raise typer.BadParameter("Array submission mode is not supported for scheduler 'none'")
+
+    if scheduler_lc == "slurm":
+        array_directive_prefix = "#SBATCH --array="
+        task_var_expr = "${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}"
+    elif scheduler_lc in {"sge", "univa"}:
+        array_directive_prefix = "#$ -t "
+        task_var_expr = "${SGE_TASK_ID:?SGE_TASK_ID not set}"
+    elif scheduler_lc == "pbs":
+        array_directive_prefix = "#PBS -J "
+        task_var_expr = "${PBS_ARRAY_INDEX:-${PBS_ARRAYID:?PBS_ARRAY_INDEX/PBS_ARRAYID not set}}"
+    elif scheduler_lc == "lsf":
+        array_directive_prefix = "#BSUB -J "
+        task_var_expr = "${LSB_JOBINDEX:?LSB_JOBINDEX not set}"
+    else:
+        raise typer.BadParameter(f"Array submission mode not supported for scheduler '{target.scheduler}'")
+
+    if not run_indexes:
+        return 0
+
+    remote_sweep_dir = str(manifest["remote_sweep_dir"])
+    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+
+    local_sweeps = _sweeps_dir(project_root)
+    sweep_id = str(manifest["sweep_id"])
+    tsv_local = local_sweeps / f"{sweep_id}.array.tsv"
+    wrapper_local = local_sweeps / f"{sweep_id}.array_wrapper.sh"
+
+    tsv_lines: list[str] = []
+    for task_id, run_idx in enumerate(run_indexes, start=1):
+        run = manifest["runs"][run_idx]
+        run_slug = _slug_component(str(run["sweep_job"]))
+        run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
+        command_b64 = base64.b64encode(str(run["command"]).encode("utf-8")).decode("ascii")
+        tsv_lines.append(f"{task_id}\t{run['run_id']}\t{run_name}\t{command_b64}")
+    tsv_local.write_text("\n".join(tsv_lines) + "\n")
+
+    wrapper_local.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "MAP_FILE=\"$1\"\n"
+        f"TASK_ID=\"{task_var_expr}\"\n"
+        "LINE=\"$(awk -F $'\\t' -v id=\"$TASK_ID\" '$1==id {print; exit}' \"$MAP_FILE\")\"\n"
+        "if [ -z \"$LINE\" ]; then\n"
+        "  echo \"No mapping found for task ${TASK_ID}\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "RUN_ID=\"$(printf '%s' \"$LINE\" | cut -f2)\"\n"
+        "JOB_NAME=\"$(printf '%s' \"$LINE\" | cut -f3)\"\n"
+        "CMD_B64=\"$(printf '%s' \"$LINE\" | cut -f4)\"\n"
+        "CMD=\"$(printf '%s' \"$CMD_B64\" | base64 --decode)\"\n"
+        "echo \"[project-control] run_id=${RUN_ID} job_name=${JOB_NAME} task_id=${TASK_ID}\" \n"
+        "eval \"$CMD\"\n"
+    )
+    wrapper_local.chmod(0o755)
+
+    tsv_remote = f"{remote_sweep_dir}/{tsv_local.name}"
+    wrapper_remote = f"{remote_sweep_dir}/{wrapper_local.name}"
+    _run_cmd(["rsync", "-az", str(tsv_local), f"{target.host}:{tsv_remote}"])
+    _run_cmd(["rsync", "-az", str(wrapper_local), f"{target.host}:{wrapper_remote}"])
+
+    array_size = len(run_indexes)
+    array_header = _render_scheduler_header(
+        target.template_header,
+        cpus=int(resources["cpus"]),
+        memory=str(resources["memory"]),
+        walltime=str(resources["time"]),
+        job_name=f"{base_job_name}-array",
+        stdout=f"{base_job_name}-array",
+        stderr=f"{base_job_name}-array",
+        working_dir=target.remote_root,
+        queue=str(resources["queue"]),
+        node=str(resources["node"]),
+        parallel_environment=str(resources["parallel_environment"]),
+    )
+    if scheduler_lc == "lsf":
+        array_header = array_header.rstrip() + f"\n{array_directive_prefix}\"{base_job_name}-array[1-{array_size}]\"\n"
+    else:
+        array_header = array_header.rstrip() + f"\n{array_directive_prefix}1-{array_size}\n"
+
+    remote_array_submit = f"{remote_sweep_dir}/pc_submit_array_{sweep_id}.sh"
+    remote_log_file = f"{remote_sweep_dir}/run_array_{sweep_id}.log"
+    array_script = _build_submit_script(
+        header=array_header,
+        command=f"bash {shlex.quote(wrapper_remote)} {shlex.quote(tsv_remote)}",
+        working_dir=target.remote_root,
+        remote_log_file=remote_log_file,
+    )
+    _run_cmd(
+        [
+            "ssh",
+            target.host,
+            "bash",
+            "-lc",
+            f"cat > {shlex.quote(remote_array_submit)} <<'PC_EOF'\n{array_script}PC_EOF\nchmod +x {shlex.quote(remote_array_submit)}",
+        ]
+    )
+
+    adapter = get_adapter(target.scheduler)
+    submit_result = adapter.submit(target.host, remote_array_submit)
+    base_job_id = submit_result.job_id
+    manifest["array_job_id"] = base_job_id
+
+    for task_id, run_idx in enumerate(run_indexes, start=1):
+        run = manifest["runs"][run_idx]
+        run_slug = _slug_component(str(run["sweep_job"]))
+        run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
+        submitted_at = datetime.now().isoformat(timespec="seconds")
+        run["job_id"] = f"{base_job_id}_{task_id}"
+        run["array_job_id"] = base_job_id
+        run["array_task_id"] = task_id
+        run["job_name"] = run_name
+        run["status"] = "SUBMITTED"
+        run["submitted_at"] = submitted_at
+        run["submission_mode"] = "array"
+        run["resources"] = resources
+
+        _append_sweep_job_record(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target,
+            sweep_id=sweep_id,
+            submission_mode="array",
+            run=run,
+            remote_sweep_dir=remote_sweep_dir,
+            remote_log_file=remote_log_file,
+            submitted_at=submitted_at,
+        )
+    return len(run_indexes)
+
+
+def _submit_sweep_local(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target: TargetConfig,
+    manifest: dict[str, Any],
+    run_indexes: list[int],
+    resources: dict[str, Any],
+    base_job_name: str,
+) -> int:
+    local_sweep_dir = _sweeps_dir(project_root) / str(manifest["sweep_id"])
+    local_sweep_dir.mkdir(parents=True, exist_ok=True)
+    submitted_count = 0
+
+    for idx in run_indexes:
+        run = manifest["runs"][idx]
+        run_slug = _slug_component(str(run["sweep_job"]))
+        run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
+        local_log_file = local_sweep_dir / f"run_{run['run_id']}.log"
+        submitted_at = datetime.now().isoformat(timespec="seconds")
+
+        proc = subprocess.run(
+            str(run["command"]),
+            shell=True,
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        log_blob = (proc.stdout or "") + (proc.stderr or "")
+        local_log_file.write_text(log_blob)
+
+        run["job_id"] = f"local-{run['run_id']}"
+        run["job_name"] = run_name
+        run["status"] = "COMPLETED" if proc.returncode == 0 else "FAILED"
+        run["submitted_at"] = submitted_at
+        run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        run["submission_mode"] = "local"
+        run["resources"] = resources
+        run["exit_code"] = proc.returncode
+
+        _append_sweep_job_record(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target,
+            sweep_id=str(manifest["sweep_id"]),
+            submission_mode="local",
+            run=run,
+            remote_sweep_dir=str(local_sweep_dir),
+            remote_log_file=str(local_log_file),
+            submitted_at=submitted_at,
+            scheduler_override="none",
+            state_override=run["status"],
+        )
+        submitted_count += 1
+    return submitted_count
+
+
+@sweep_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def sweep_run(
+    ctx: typer.Context,
+    config_file: Path = typer.Option(..., "--config", help="Sweep YAML config with top-level params mapping"),
+    mode: str = typer.Option("single", "--mode", help="Execution mode: single|array|local"),
+    sweep_job: Optional[str] = typer.Option(None, "--job", help="Run only one params.<job> block from config"),
+    sweep_id: Optional[str] = typer.Option(None, "--sweep-id", help="Optional sweep id (default: auto-generated)"),
+    target: Optional[str] = typer.Option(None, "--target", help="Target name (defaults to active target)"),
+    cpus: Optional[int] = typer.Option(None, help="CPU cores (defaults to target setting)"),
+    memory: Optional[str] = typer.Option(None, help="Memory (defaults to target setting)"),
+    job_time: Optional[str] = typer.Option(None, "--time", help="Walltime (defaults to target setting)"),
+    job_name: Optional[str] = typer.Option(None, help="Base scheduler job name prefix"),
+    queue: Optional[str] = typer.Option(None, help="Queue (defaults to target setting if template needs it)"),
+    node: Optional[str] = typer.Option(None, help="Node (defaults to target setting)"),
+    parallel_environment: Optional[str] = typer.Option(
+        None, "--parallel-environment", help="Parallel environment (defaults to target setting if template needs it)"
+    ),
+) -> None:
+    """Run a sweep and persist manifest in .project_control/sweeps."""
+    mode_lc = mode.lower()
+    if mode_lc not in {"single", "array", "local"}:
+        raise typer.BadParameter("--mode must be one of: single, array, local")
+    if not ctx.args:
+        raise typer.BadParameter("Provide a command template, e.g. pc sweep run --config sweep.yml python train.py --lr {lr}")
+    if not config_file.exists() or not config_file.is_file():
+        raise typer.BadParameter(f"Sweep config file not found: {config_file}")
+
+    command_template = " ".join(shlex.quote(arg) for arg in ctx.args)
+    payload = yaml.safe_load(config_file.read_text()) or {}
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("Sweep config must be a YAML mapping with top-level key: params")
+
+    runs = _expand_sweep_runs(payload, command_template, sweep_job)
+    if not runs:
+        raise typer.BadParameter("No sweep runs generated from config")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if target:
+        if target not in cfg.targets:
+            raise typer.BadParameter(f"Target '{target}' not found")
+        target_name = target
+        target_cfg = cfg.targets[target]
+    else:
+        target_name, target_cfg = _active_target(cfg)
+
+    if mode_lc == "array" and target_cfg.scheduler.lower() == "none":
+        raise typer.BadParameter("Array mode is not supported for scheduler 'none'")
+
+    resolved_cpus = cpus if cpus is not None else target_cfg.default_cpus
+    resolved_memory = memory if memory is not None else target_cfg.default_memory
+    resolved_time = job_time if job_time is not None else target_cfg.default_time
+    resolved_node = node or target_cfg.default_node or "1"
+    resolved_queue = queue if queue is not None else target_cfg.default_queue
+    resolved_pe = parallel_environment if parallel_environment is not None else target_cfg.default_parallel_environment
+
+    if "{queue}" in target_cfg.template_header and not resolved_queue:
+        raise typer.BadParameter("--queue is required (or target default_queue) because template includes {queue}.")
+    if "{parallel_environment}" in target_cfg.template_header and not resolved_pe:
+        raise typer.BadParameter(
+            "--parallel-environment is required (or target default_parallel_environment) because template includes {parallel_environment}."
+        )
+
+    if sweep_id is None:
+        sweep_id = f"sweep-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+    if _sweep_manifest_path(project_root, sweep_id).exists():
+        raise typer.BadParameter(f"Sweep id already exists: {sweep_id}")
+
+    manifest = _build_sweep_manifest(
+        sweep_id=sweep_id,
+        mode=mode_lc,
+        target_name=target_name,
+        target=target_cfg,
+        config_file=config_file.resolve(),
+        command_template=command_template,
+        runs=runs,
+    )
+    _save_sweep_manifest(project_root, manifest)
+
+    resources = {
+        "cpus": resolved_cpus,
+        "memory": resolved_memory,
+        "time": resolved_time,
+        "node": resolved_node,
+        "queue": resolved_queue or "",
+        "parallel_environment": resolved_pe or "",
+    }
+    manifest["resources"] = resources
+    base_job_name = _slug_component(job_name or sweep_id)
+    run_indexes = list(range(len(manifest["runs"])))
+    if mode_lc == "single":
+        submitted = _submit_sweep_single(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=run_indexes,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    elif mode_lc == "local":
+        submitted = _submit_sweep_local(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=run_indexes,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    else:
+        submitted = _submit_sweep_array(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=run_indexes,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    _save_sweep_manifest(project_root, manifest)
+    typer.echo(f"Submitted sweep_id={sweep_id} mode={mode_lc} target={target_name} runs={submitted}")
+
+
+@sweep_app.command("list")
+def sweep_list() -> None:
+    """List sweep manifests."""
+    project_root = _project_root()
+    sweeps_dir = _sweeps_dir(project_root)
+    manifests = sorted(sweeps_dir.glob("*.json"), reverse=True)
+    if not manifests:
+        typer.echo("No sweeps found")
+        return
+    for path in manifests:
+        try:
+            manifest = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        runs = manifest.get("runs", [])
+        total = len(runs) if isinstance(runs, list) else 0
+        submitted = len([r for r in runs if isinstance(r, dict) and r.get("job_id")])
+        typer.echo(
+            f"{manifest.get('sweep_id', path.stem)}  mode={manifest.get('mode', '')} "
+            f"target={manifest.get('target', '')} runs={submitted}/{total} updated_at={manifest.get('updated_at', '')}"
+        )
+
+
+@sweep_app.command("show")
+def sweep_show(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+    """Show one sweep manifest."""
+    project_root = _project_root()
+    manifest = _load_sweep_manifest(project_root, sweep_id)
+    runs = manifest.get("runs", [])
+    typer.echo(
+        f"sweep_id={manifest.get('sweep_id')} mode={manifest.get('mode')} target={manifest.get('target')} "
+        f"scheduler={manifest.get('scheduler')} runs={len(runs) if isinstance(runs, list) else 0}"
+    )
+    if not isinstance(runs, list):
+        return
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        typer.echo(
+            f"- run_id={run.get('run_id')} job={run.get('sweep_job')} idx={run.get('sweep_index')} "
+            f"job_id={run.get('job_id')} status={run.get('status')}"
+        )
+
+
+@sweep_app.command("resume")
+def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+    """Resume pending runs from a sweep manifest."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    manifest = _load_sweep_manifest(project_root, sweep_id)
+    target_name = str(manifest.get("target", ""))
+    if target_name not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target_name}' from sweep manifest is not configured")
+    target_cfg = cfg.targets[target_name]
+
+    runs = manifest.get("runs", [])
+    if not isinstance(runs, list):
+        raise typer.BadParameter("Invalid sweep manifest runs format")
+    pending = [idx for idx, run in enumerate(runs) if isinstance(run, dict) and not run.get("job_id")]
+    if not pending:
+        typer.echo(f"No pending runs for sweep_id={sweep_id}")
+        return
+
+    mode = str(manifest.get("mode", "single")).lower()
+    base_job_name = _slug_component(sweep_id)
+    stored_resources = manifest.get("resources", {})
+    resources = {
+        "cpus": stored_resources.get("cpus", target_cfg.default_cpus),
+        "memory": stored_resources.get("memory", target_cfg.default_memory),
+        "time": stored_resources.get("time", target_cfg.default_time),
+        "node": stored_resources.get("node", target_cfg.default_node or "1"),
+        "queue": stored_resources.get("queue", target_cfg.default_queue or ""),
+        "parallel_environment": stored_resources.get(
+            "parallel_environment", target_cfg.default_parallel_environment or ""
+        ),
+    }
+    if mode == "single":
+        submitted = _submit_sweep_single(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=pending,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    elif mode == "local":
+        submitted = _submit_sweep_local(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=pending,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    elif mode == "array":
+        submitted = _submit_sweep_array(
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target=target_cfg,
+            manifest=manifest,
+            run_indexes=pending,
+            resources=resources,
+            base_job_name=base_job_name,
+        )
+    else:
+        raise typer.BadParameter(f"Unsupported sweep mode in manifest: {mode}")
+    _save_sweep_manifest(project_root, manifest)
+    typer.echo(f"Resumed sweep_id={sweep_id}; submitted={submitted}")
+
+
+@sweep_app.command("cancel")
+def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id")) -> None:
+    """Cancel submitted jobs in a sweep manifest."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    manifest = _load_sweep_manifest(project_root, sweep_id)
+    target_name = str(manifest.get("target", ""))
+    if target_name not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target_name}' from sweep manifest is not configured")
+    target_cfg = cfg.targets[target_name]
+    scheduler = str(manifest.get("scheduler", target_cfg.scheduler))
+
+    runs = manifest.get("runs", [])
+    if not isinstance(runs, list):
+        raise typer.BadParameter("Invalid sweep manifest runs format")
+
+    cancelled = 0
+    mode = str(manifest.get("mode", "single")).lower()
+    if mode == "local":
+        cancelled_local = 0
+        for run in runs:
+            if isinstance(run, dict) and run.get("status") == "PENDING":
+                run["status"] = "CANCELLED"
+                cancelled_local += 1
+        _save_sweep_manifest(project_root, manifest)
+        typer.echo(f"Cancel requested for sweep_id={sweep_id}; jobs={cancelled_local}")
+        return
+
+    if mode == "array" and manifest.get("array_job_id"):
+        cmd = _cancel_command_for_scheduler(scheduler, str(manifest["array_job_id"]))
+        proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+        if proc.returncode == 0:
+            cancelled += 1
+        else:
+            raise typer.BadParameter(proc.stderr.strip() or proc.stdout.strip() or "Failed to cancel array job")
+        for run in runs:
+            if isinstance(run, dict) and run.get("job_id"):
+                run["status"] = "CANCEL_REQUESTED"
+    else:
+        seen: set[str] = set()
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            job_id = str(run.get("job_id", "")).strip()
+            if not job_id or job_id in seen:
+                continue
+            seen.add(job_id)
+            cmd = _cancel_command_for_scheduler(scheduler, job_id)
+            proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+            if proc.returncode == 0:
+                cancelled += 1
+                run["status"] = "CANCEL_REQUESTED"
+    _save_sweep_manifest(project_root, manifest)
+    typer.echo(f"Cancel requested for sweep_id={sweep_id}; jobs={cancelled}")
 
 
 @analysis_app.command("use")
