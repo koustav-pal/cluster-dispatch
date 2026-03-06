@@ -106,6 +106,15 @@ def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
 
 
+def _is_local_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    return normalized in {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _is_local_none_target(target: TargetConfig) -> bool:
+    return target.scheduler.lower() == "none" and _is_local_host(target.host)
+
+
 def _slug_component(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
     cleaned = cleaned.strip("-._")
@@ -495,74 +504,34 @@ def _render_scheduler_header(
 
 @app.command()
 def init(
-    host: str = typer.Option(..., help="SSH host alias for the default target"),
-    scheduler: str = typer.Option(..., help="Default scheduler for this project: sge|univa|pbs|slurm|lsf|none"),
-    default_target: Optional[str] = typer.Option(
-        None,
-        "--target",
-        help="Default target name (defaults to current project root directory name)",
-    ),
-    remote_root: str = typer.Option(..., help="Remote absolute root directory for this project"),
-    default_cpus: int = typer.Option(1, "--cpus", help="Default CPUs for this target"),
-    default_memory: str = typer.Option("8G", "--memory", help="Default memory for this target"),
-    default_time: str = typer.Option("01:00:00", "--time", help="Default walltime for this target"),
-    default_node: str = typer.Option("1", "--node", help="Default node value for this target"),
-    default_queue: str = typer.Option("", "--queue", help="Default queue for this target"),
-    default_parallel_environment: str = typer.Option(
-        "", "--parallel-environment", help="Default parallel environment for this target"
-    ),
-    template_file: Path = typer.Option(
-        ...,
-        "--template-file",
-        help=(
-            "User-provided scheduler template file. Must include: "
-            "{cpus}, {memory}, {time}, {job_name}, {stdout}, {stderr}, {working_dir}. "
-            "Optional: {queue}, {node}, {parallel_environment}."
-        ),
-    ),
 ) -> None:
-    """Initialize .cluster_dispatch/config.yml and local state directories."""
-    scheduler = scheduler.lower()
-    if scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
-        raise typer.BadParameter("scheduler must be one of: sge, univa, pbs, slurm, lsf, none")
-    if not Path(remote_root).is_absolute():
-        raise typer.BadParameter("remote_root must be an absolute remote path")
+    """Initialize .cluster_dispatch/config.yml with default local target."""
 
     project_root = Path.cwd()
-    resolved_default_target = default_target or project_root.resolve().name
-    if not resolved_default_target:
-        resolved_default_target = "default"
     cfg_path = config_path(project_root)
 
     if cfg_path.exists():
         raise typer.BadParameter(f"{CONFIG_DIR}/{CONFIG_NAME} already exists in this directory")
-    if not template_file.exists() or not template_file.is_file():
-        raise typer.BadParameter(f"Template file not found: {template_file}")
 
-    user_template = template_file.read_text()
-    _validate_template_variables(user_template)
-    _run_cmd(["ssh", host, "mkdir", "-p", remote_root])
-
-    cfg = ProjectConfig(scheduler=scheduler, default_target=resolved_default_target)
-    cfg.targets[resolved_default_target] = TargetConfig(
-        host=host,
-        scheduler=scheduler,
-        remote_root=remote_root,
-        template_header=user_template,
-        default_cpus=default_cpus,
-        default_memory=default_memory,
-        default_time=default_time,
-        default_node=default_node,
-        default_queue=default_queue,
-        default_parallel_environment=default_parallel_environment,
+    local_target = "local"
+    local_root = str(project_root.resolve())
+    cfg = ProjectConfig(scheduler="none", default_target=local_target)
+    cfg.targets[local_target] = TargetConfig(
+        host="localhost",
+        scheduler="none",
+        remote_root=local_root,
+        template_header="",
+        default_cpus=1,
+        default_memory="8G",
+        default_time="01:00:00",
+        default_node="1",
+        default_queue="",
+        default_parallel_environment="",
     )
     save_config(project_root, cfg)
     ensure_state_dirs(project_root)
-    template_path = _template_path(project_root)
-    template_path.parent.mkdir(parents=True, exist_ok=True)
-    template_path.write_text(user_template)
     typer.echo(f"Initialized {cfg_path}")
-    typer.echo(f"Wrote scheduler template: {template_path}")
+    typer.echo("Default target set to 'local' (scheduler=none, host=localhost)")
 
 
 @target_app.command("add")
@@ -586,6 +555,11 @@ def target_add(
     template_file: Optional[Path] = typer.Option(None, help="Optional file containing scheduler header template"),
 ) -> None:
     """Add or update a compute target."""
+    if name.strip().lower() == "local":
+        raise typer.BadParameter(
+            "Target 'local' is managed by cdp init and cannot be modified. Add a new target name for custom configs."
+        )
+
     project_root = _project_root()
     cfg = load_config(project_root)
     scheduler = (scheduler or cfg.scheduler).lower()
@@ -716,7 +690,14 @@ def doctor(
     else:
         _add("WARN", "template", f"Template file not found at {template_path}")
 
-    for binary in ("ssh", "rsync"):
+    needs_ssh_binary = False
+    if remote:
+        if target and target in cfg.targets:
+            needs_ssh_binary = not _is_local_none_target(cfg.targets[target])
+        elif not target:
+            needs_ssh_binary = any(not _is_local_none_target(tcfg) for tcfg in cfg.targets.values())
+    required_binaries = ["rsync"] + (["ssh"] if needs_ssh_binary else [])
+    for binary in required_binaries:
         if shutil.which(binary):
             _add("PASS", "local_binary", f"{binary} found")
         else:
@@ -770,6 +751,21 @@ def doctor(
             _add("FAIL", f"target:{name}:template", str(exc))
 
         if not remote:
+            continue
+
+        if _is_local_none_target(tcfg):
+            _add("PASS", f"target:{name}:ssh", "Skipped (local target mode)")
+            if Path(tcfg.remote_root).is_dir():
+                _add("PASS", f"target:{name}:remote_root_exists", tcfg.remote_root)
+            else:
+                _add("WARN", f"target:{name}:remote_root_exists", f"Local root missing/inaccessible: {tcfg.remote_root}")
+            required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
+            if required_cmds:
+                missing = [c for c in required_cmds if shutil.which(c) is None]
+                if not missing:
+                    _add("PASS", f"target:{name}:scheduler_cmds", ", ".join(required_cmds))
+                else:
+                    _add("WARN", f"target:{name}:scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
             continue
 
         ssh_probe = subprocess.run(
@@ -1026,7 +1022,11 @@ def _submit_sweep_single(
     base_job_name: str,
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
-    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+    local_target_mode = _is_local_none_target(target)
+    if local_target_mode:
+        Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
     adapter = get_adapter(target.scheduler)
     submitted_count = 0
 
@@ -1054,15 +1054,21 @@ def _submit_sweep_single(
             working_dir=target.remote_root,
             remote_log_file=remote_log_file,
         )
-        _run_cmd(
-            [
-                "ssh",
-                target.host,
-                "bash",
-                "-lc",
-                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-            ]
-        )
+        if local_target_mode:
+            submit_path = Path(remote_submit_script)
+            submit_path.parent.mkdir(parents=True, exist_ok=True)
+            submit_path.write_text(submit_script)
+            submit_path.chmod(0o755)
+        else:
+            _run_cmd(
+                [
+                    "ssh",
+                    target.host,
+                    "bash",
+                    "-lc",
+                    f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
+                ]
+            )
         submit_result = adapter.submit(target.host, remote_submit_script)
         submitted_at = datetime.now().isoformat(timespec="seconds")
         run["job_id"] = submit_result.job_id
@@ -1611,7 +1617,10 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
 
     if mode == "array" and manifest.get("array_job_id"):
         cmd = _cancel_command_for_scheduler(scheduler, str(manifest["array_job_id"]))
-        proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+        if scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+            proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
+        else:
+            proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
         if proc.returncode == 0:
             cancelled += 1
         else:
@@ -1629,7 +1638,10 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
                 continue
             seen.add(job_id)
             cmd = _cancel_command_for_scheduler(scheduler, job_id)
-            proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+            if scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+                proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
+            else:
+                proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
             if proc.returncode == 0:
                 cancelled += 1
                 run["status"] = "CANCEL_REQUESTED"
@@ -1697,15 +1709,19 @@ def analysis_tag(
             raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
         remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
         remote_tag_path = f"{remote_analysis_root}/{tag_value}"
-        remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
-        proc = subprocess.run(
-            ["ssh", target.host, remote_cmd],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.returncode != 0 or proc.stdout.strip() != "OK":
-            raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+        if _is_local_none_target(target):
+            if not Path(remote_tag_path).exists():
+                raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+        else:
+            remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
+            proc = subprocess.run(
+                ["ssh", target.host, remote_cmd],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode != 0 or proc.stdout.strip() != "OK":
+                raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
 
     analysis_key = cfg.active_analysis or ""
     tags = cfg.analysis_tags.get(analysis_key, [])
@@ -1784,12 +1800,20 @@ def analysis_list(
         + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
         + "fi"
     )
-    proc = subprocess.run(
-        ["ssh", target.host, remote_cmd],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    if _is_local_none_target(target):
+        proc = subprocess.run(
+            ["bash", "-lc", remote_cmd],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    else:
+        proc = subprocess.run(
+            ["ssh", target.host, remote_cmd],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
     if proc.returncode != 0:
         raise typer.BadParameter(proc.stderr.strip() or "Failed to list remote directories")
 
@@ -1903,13 +1927,20 @@ def run(
     resolved_stderr = f"{remote_run_dir}/stderr"
 
     project_ignore = project_root / ".pcignore"
-
-    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
+    local_target_mode = _is_local_none_target(target)
+    if local_target_mode:
+        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
+        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
 
     rsync_cmd = ["rsync", "-az", "--delete"]
     if project_ignore.exists():
         rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
+    if local_target_mode:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
+    else:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
     _run_cmd(rsync_cmd)
 
     submit_script = _build_submit_script(
@@ -1931,15 +1962,21 @@ def run(
         remote_log_file=remote_log_file,
     )
 
-    _run_cmd(
-        [
-            "ssh",
-            target.host,
-            "bash",
-            "-lc",
-            f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-        ]
-    )
+    if local_target_mode:
+        submit_path = Path(remote_submit_script)
+        submit_path.parent.mkdir(parents=True, exist_ok=True)
+        submit_path.write_text(submit_script)
+        submit_path.chmod(0o755)
+    else:
+        _run_cmd(
+            [
+                "ssh",
+                target.host,
+                "bash",
+                "-lc",
+                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
+            ]
+        )
 
     adapter = get_adapter(target.scheduler)
     job_id = adapter.submit(target.host, remote_submit_script).job_id
@@ -2037,26 +2074,35 @@ def _show_last_status(follow: bool = False) -> None:
 
     if follow:
         typer.echo(f"Following log: {last['remote_log_file']}")
-        subprocess.run(
-            ["ssh", "-t", target_cfg.host, "bash", "-lc", f"tail -n 50 -f {shlex.quote(last['remote_log_file'])}"],
-            check=True,
-        )
+        if _is_local_none_target(target_cfg):
+            _show_local_log(Path(str(last["remote_log_file"])), follow=True, head=None, tail=50)
+        else:
+            subprocess.run(
+                ["ssh", "-t", target_cfg.host, "bash", "-lc", f"tail -n 50 -f {shlex.quote(last['remote_log_file'])}"],
+                check=True,
+            )
     else:
-        proc = subprocess.run(
-            [
-                "ssh",
-                target_cfg.host,
-                "bash",
-                "-lc",
-                f"if [ -f {shlex.quote(last['remote_log_file'])} ]; then tail -n 20 {shlex.quote(last['remote_log_file'])}; fi",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.stdout.strip():
-            typer.echo("--- log tail ---")
-            typer.echo(proc.stdout.rstrip())
+        if _is_local_none_target(target_cfg):
+            log_path = Path(str(last["remote_log_file"]))
+            if log_path.exists():
+                typer.echo("--- log tail ---")
+                _show_local_log(log_path, follow=False, head=None, tail=20)
+        else:
+            proc = subprocess.run(
+                [
+                    "ssh",
+                    target_cfg.host,
+                    "bash",
+                    "-lc",
+                    f"if [ -f {shlex.quote(last['remote_log_file'])} ]; then tail -n 20 {shlex.quote(last['remote_log_file'])}; fi",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if proc.stdout.strip():
+                typer.echo("--- log tail ---")
+                typer.echo(proc.stdout.rstrip())
 
 
 def _is_running_state(state: str) -> bool:
@@ -2285,12 +2331,21 @@ def cancel(
             continue
 
         cancel_cmd = _cancel_command_for_scheduler(rec_scheduler, rec_job_id)
-        proc = subprocess.run(
-            ["ssh", cfg.targets[rec_target].host, cancel_cmd],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        target_cfg = cfg.targets[rec_target]
+        if rec_scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+            proc = subprocess.run(
+                ["bash", "-lc", cancel_cmd],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            proc = subprocess.run(
+                ["ssh", target_cfg.host, cancel_cmd],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         label = f"job_id={rec_job_id} job_name={rec_job_name} target={rec_target}"
         if proc.returncode == 0:
             cancelled.append(label)
@@ -2344,6 +2399,7 @@ def logs(
     )
     submission_mode = str(selected.get("submission_mode", "")).strip().lower()
     selected_target = str(selected.get("target", ""))
+    selected_scheduler = str(selected.get("scheduler", "")).strip().lower()
     remote_log_file = str(selected.get("remote_log_file", "")).strip()
     if not remote_log_file:
         raise typer.BadParameter("Selected job does not have a remote log file")
@@ -2362,6 +2418,17 @@ def logs(
 
     if selected_target not in cfg.targets:
         raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
+    if selected_scheduler == "none" and _is_local_none_target(cfg.targets[selected_target]):
+        local_log_path = Path(remote_log_file).expanduser()
+        if not local_log_path.is_absolute():
+            local_log_path = (project_root / local_log_path).resolve()
+        if follow:
+            typer.echo(
+                f"Following local log for job_id={selected.get('job_id', '')} "
+                f"job_name={selected.get('job_name', '')}: {local_log_path}"
+            )
+        _show_local_log(local_log_path, follow=follow, head=head, tail=tail)
+        return
 
     line_count = tail if tail is not None else 50
     if head is not None:
@@ -2503,10 +2570,13 @@ def collect(
         if not clean_tag:
             continue
         tagged_remote = f"{remote_run_dir}/./{clean_tag}"
-        proc = _run_cmd(
-            ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"],
-            check=False,
-        )
+        if _is_local_none_target(target_cfg):
+            proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
+        else:
+            proc = _run_cmd(
+                ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"],
+                check=False,
+            )
         if proc.returncode == 0:
             pulled.append(clean_tag)
         else:
@@ -2657,18 +2727,26 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, 
         return stats, proc.stdout
 
     if scheduler_lc == "none":
-        proc = subprocess.run(
-            [
-                "ssh",
-                host,
-                "bash",
-                "-lc",
-                f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz=",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        if _is_local_host(host):
+            proc = subprocess.run(
+                ["bash", "-lc", f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz="],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            proc = subprocess.run(
+                [
+                    "ssh",
+                    host,
+                    "bash",
+                    "-lc",
+                    f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz=",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         line = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
         if not line:
             return {"state": "EXITED"}, proc.stdout
@@ -3168,9 +3246,12 @@ def pull(
             skipped.append(clean_tag)
             continue
         tagged_remote = f"{remote_analysis_root}/./{clean_tag}"
-        proc = _run_cmd(
-            ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"], check=False
-        )
+        if _is_local_none_target(target_cfg):
+            proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
+        else:
+            proc = _run_cmd(
+                ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"], check=False
+            )
         if proc.returncode == 0:
             pulled.append(clean_tag)
         else:

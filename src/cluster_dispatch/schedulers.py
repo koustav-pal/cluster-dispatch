@@ -27,6 +27,11 @@ class SchedulerAdapter(Protocol):
         ...
 
 
+def _is_local_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    return normalized in {"", "localhost", "127.0.0.1", "::1"}
+
+
 class SGEAdapter:
     def submit(self, host: str, submit_script: str) -> SubmitResult:
         proc = subprocess.run(
@@ -226,21 +231,37 @@ class LSFAdapter:
 
 class LocalAdapter:
     def submit(self, host: str, submit_script: str) -> SubmitResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        if _is_local_host(host):
+            proc = subprocess.run(
+                ["bash", "-lc", f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            proc = subprocess.run(
+                ["ssh", host, "bash", "-lc", f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
         return SubmitResult(job_id=proc.stdout.strip())
 
     def status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        if _is_local_host(host):
+            proc = subprocess.run(
+                ["bash", "-lc", f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            proc = subprocess.run(
+                ["ssh", host, "bash", "-lc", f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
         return StatusResult(state=proc.stdout.strip(), raw=proc.stdout)
 
     def accounting_status(self, host: str, job_id: str) -> StatusResult:

@@ -28,6 +28,8 @@ HPC workflows often become hard to manage when commands, job scripts, paths, and
 
 No timestamped run directories are used. Remote structure mirrors local analysis path.
 
+Local mode note: when target is `scheduler=none` with `host=localhost`/`127.0.0.1`, execution is local (no SSH).
+
 ## Current status behavior
 
 `cdp status` is context-aware:
@@ -91,21 +93,15 @@ Optional placeholders:
 ### 2. Initialize the project
 
 ```bash
-cdp init \
-  --host cluster-a \
-  --scheduler sge \
-  --remote-root /scratch/me/projects \
-  --template-file ./my_sge_template.tmpl
+cdp init
 ```
 
 What this does:
 - creates `.cluster_dispatch/config.yml`
 - creates local state dirs under `.cluster_dispatch/`
-- ensures remote project root exists:
-  `ssh <host> mkdir -p <remote_root>`
-- creates default target in config
+- creates default target `local` (`scheduler=none`, `host=localhost`, `remote_root=<project_root>`)
 
-If `--target` is omitted, it defaults to your current directory name.
+Then add remote targets explicitly with `cdp target add`.
 
 ### 3. Set analysis and tags
 
@@ -227,19 +223,7 @@ If template contains `{queue}` or `{parallel_environment}`, those values must re
 ### `cdp init`
 Initializes cluster-dispatch in current directory.
 
-Key options:
-- `--host` (required)
-- `--scheduler` (required: `sge|univa|pbs|slurm|lsf|none`)
-- `--remote-root` (required, absolute remote path)
-- `--template-file` (required)
-- `--target` (optional)
-- default resource options:
-  - `--cpus`
-  - `--memory`
-  - `--time`
-  - `--node`
-  - `--queue`
-  - `--parallel-environment`
+Creates `.cluster_dispatch/config.yml`, state directories, and a default `local` target.
 
 ### `cdp target add <name>`
 Adds/updates a target by name.
@@ -249,7 +233,13 @@ Key options:
 - `--scheduler`
 - `--remote-root`
 - `--template-file`
-- default resource options (same as init)
+- resource defaults:
+  - `--cpus`
+  - `--memory`
+  - `--time`
+  - `--node`
+  - `--queue`
+  - `--parallel-environment`
 
 ### `cdp target set <name>`
 Sets active default target.
