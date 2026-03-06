@@ -17,13 +17,13 @@ class StatusResult:
 
 
 class SchedulerAdapter(Protocol):
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
         ...
 
-    def status(self, host: str, job_id: str) -> StatusResult:
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
         ...
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
         ...
 
 
@@ -32,35 +32,32 @@ def _is_local_host(host: str) -> bool:
     return normalized in {"", "localhost", "127.0.0.1", "::1"}
 
 
+def _uses_local_transport(transport: str, host: str) -> bool:
+    return transport.strip().lower() == "local" or _is_local_host(host)
+
+
+def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = False) -> subprocess.CompletedProcess[str]:
+    if _uses_local_transport(transport, host):
+        return subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
+    return subprocess.run(["ssh", host, "bash", "-lc", command], capture_output=True, text=True, check=check)
+
+
 class SGEAdapter:
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qsub {submit_script}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=True)
         output = proc.stdout.strip()
         # Typical format: Your job 1234 ("name") has been submitted
         job_id = output.split()[2] if len(output.split()) >= 3 else output
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qstat -j {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"qstat -j {job_id}", transport=transport)
         if proc.returncode == 0:
             return StatusResult(state="RUNNING_OR_QUEUED", raw=proc.stdout)
         return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qacct -j {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"qacct -j {job_id}", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         exit_status = None
@@ -87,23 +84,14 @@ class UnivaAdapter(SGEAdapter):
 
 
 class PBSAdapter:
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qsub {submit_script}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=True)
         output = proc.stdout.strip()
         job_id = output.split()[0] if output else ""
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qstat -f {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"qstat -f {job_id}", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -114,12 +102,8 @@ class PBSAdapter:
                 break
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qstat -xf {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"qstat -xf {job_id}", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -143,24 +127,15 @@ class PBSAdapter:
 
 
 class SlurmAdapter:
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"sbatch {submit_script}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+        proc = _run_shell(host, f"sbatch {submit_script}", transport=transport, check=True)
         output = proc.stdout.strip()
         # Typical format: Submitted batch job 12345
         job_id = output.split()[-1] if output else ""
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"squeue -h -j {job_id} -o %T"],
-            capture_output=True,
-            text=True,
-        )
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"squeue -h -j {job_id} -o %T", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -169,12 +144,8 @@ class SlurmAdapter:
             return StatusResult(state="NOT_FOUND", raw=proc.stdout)
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"sacct -j {job_id} -X -n -o State | head -n 1"],
-            capture_output=True,
-            text=True,
-        )
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"sacct -j {job_id} -X -n -o State | head -n 1", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         state = proc.stdout.strip().split()[0] if proc.stdout.strip() else ""
@@ -185,13 +156,8 @@ class SlurmAdapter:
 
 
 class LSFAdapter:
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"bsub < {submit_script}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+        proc = _run_shell(host, f"bsub < {submit_script}", transport=transport, check=True)
         output = proc.stdout.strip()
         # Typical format: Job <12345> is submitted to default queue <normal>.
         job_id = output
@@ -199,24 +165,16 @@ class LSFAdapter:
             job_id = output.split("<", 1)[1].split(">", 1)[0]
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"bjobs -noheader -o STAT {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"bjobs -noheader -o STAT {job_id}", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
         state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else "UNKNOWN"
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"bjobs -a -noheader -o STAT {job_id}"],
-            capture_output=True,
-            text=True,
-        )
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"bjobs -a -noheader -o STAT {job_id}", transport=transport)
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
@@ -230,41 +188,15 @@ class LSFAdapter:
 
 
 class LocalAdapter:
-    def submit(self, host: str, submit_script: str) -> SubmitResult:
-        if _is_local_host(host):
-            proc = subprocess.run(
-                ["bash", "-lc", f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        else:
-            proc = subprocess.run(
-                ["ssh", host, "bash", "-lc", f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+        proc = _run_shell(host, f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!", transport=transport, check=True)
         return SubmitResult(job_id=proc.stdout.strip())
 
-    def status(self, host: str, job_id: str) -> StatusResult:
-        if _is_local_host(host):
-            proc = subprocess.run(
-                ["bash", "-lc", f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        else:
-            proc = subprocess.run(
-                ["ssh", host, "bash", "-lc", f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+        proc = _run_shell(host, f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi", transport=transport, check=True)
         return StatusResult(state=proc.stdout.strip(), raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str) -> StatusResult:
+    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
         return StatusResult(state="NOT_FOUND", raw="")
 
 

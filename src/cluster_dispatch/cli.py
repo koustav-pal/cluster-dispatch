@@ -111,8 +111,15 @@ def _is_local_host(host: str) -> bool:
     return normalized in {"", "localhost", "127.0.0.1", "::1"}
 
 
-def _is_local_none_target(target: TargetConfig) -> bool:
-    return target.scheduler.lower() == "none" and _is_local_host(target.host)
+def _uses_local_transport(target: TargetConfig) -> bool:
+    return target.transport.strip().lower() == "local"
+
+
+def _validate_transport(value: str) -> str:
+    transport = value.strip().lower()
+    if transport not in {"ssh", "local"}:
+        raise typer.BadParameter("transport must be one of: ssh, local")
+    return transport
 
 
 def _slug_component(value: str) -> str:
@@ -520,6 +527,7 @@ def init(
         host="localhost",
         scheduler="none",
         remote_root=local_root,
+        transport="local",
         template_header="",
         default_cpus=1,
         default_memory="8G",
@@ -552,6 +560,7 @@ def target_add(
     scheduler: Optional[str] = typer.Option(
         None, help="sge|univa|pbs|slurm|lsf|none; defaults to project scheduler"
     ),
+    transport: Optional[str] = typer.Option(None, help="ssh|local; defaults to existing target transport or ssh"),
     template_file: Optional[Path] = typer.Option(None, help="Optional file containing scheduler header template"),
 ) -> None:
     """Add or update a compute target."""
@@ -580,7 +589,10 @@ def target_add(
         _validate_template_variables(template_header)
 
     existing = cfg.targets.get(name)
-    resolved_host = host or (existing.host if existing else None)
+    resolved_transport = _validate_transport(
+        transport if transport is not None else (existing.transport if existing else "ssh")
+    )
+    resolved_host = host or (existing.host if existing else ("localhost" if resolved_transport == "local" else None))
     resolved_remote_root = remote_root or (existing.remote_root if existing else None)
     if not resolved_host:
         raise typer.BadParameter(
@@ -612,6 +624,7 @@ def target_add(
         host=resolved_host,
         scheduler=scheduler,
         remote_root=resolved_remote_root,
+        transport=resolved_transport,
         template_header=template_header,
         default_cpus=resolved_default_cpus,
         default_memory=resolved_default_memory,
@@ -646,7 +659,7 @@ def target_list() -> None:
         return
     for name, t in cfg.targets.items():
         marker = "*" if name == cfg.default_target else " "
-        typer.echo(f"{marker} {name}: host={t.host} scheduler={t.scheduler}")
+        typer.echo(f"{marker} {name}: host={t.host} transport={t.transport} scheduler={t.scheduler}")
 
 
 @app.command("doctor")
@@ -693,9 +706,9 @@ def doctor(
     needs_ssh_binary = False
     if remote:
         if target and target in cfg.targets:
-            needs_ssh_binary = not _is_local_none_target(cfg.targets[target])
+            needs_ssh_binary = not _uses_local_transport(cfg.targets[target])
         elif not target:
-            needs_ssh_binary = any(not _is_local_none_target(tcfg) for tcfg in cfg.targets.values())
+            needs_ssh_binary = any(not _uses_local_transport(tcfg) for tcfg in cfg.targets.values())
     required_binaries = ["rsync"] + (["ssh"] if needs_ssh_binary else [])
     for binary in required_binaries:
         if shutil.which(binary):
@@ -753,7 +766,7 @@ def doctor(
         if not remote:
             continue
 
-        if _is_local_none_target(tcfg):
+        if _uses_local_transport(tcfg):
             _add("PASS", f"target:{name}:ssh", "Skipped (local target mode)")
             if Path(tcfg.remote_root).is_dir():
                 _add("PASS", f"target:{name}:remote_root_exists", tcfg.remote_root)
@@ -1022,7 +1035,7 @@ def _submit_sweep_single(
     base_job_name: str,
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
-    local_target_mode = _is_local_none_target(target)
+    local_target_mode = _uses_local_transport(target)
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
     else:
@@ -1069,7 +1082,7 @@ def _submit_sweep_single(
                     f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
                 ]
             )
-        submit_result = adapter.submit(target.host, remote_submit_script)
+        submit_result = adapter.submit(target.host, remote_submit_script, transport=target.transport)
         submitted_at = datetime.now().isoformat(timespec="seconds")
         run["job_id"] = submit_result.job_id
         run["job_name"] = run_name
@@ -1127,7 +1140,11 @@ def _submit_sweep_array(
         return 0
 
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
-    _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+    local_target_mode = _uses_local_transport(target)
+    if local_target_mode:
+        Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
 
     local_sweeps = _sweeps_dir(project_root)
     sweep_id = str(manifest["sweep_id"])
@@ -1164,8 +1181,12 @@ def _submit_sweep_array(
 
     tsv_remote = f"{remote_sweep_dir}/{tsv_local.name}"
     wrapper_remote = f"{remote_sweep_dir}/{wrapper_local.name}"
-    _run_cmd(["rsync", "-az", str(tsv_local), f"{target.host}:{tsv_remote}"])
-    _run_cmd(["rsync", "-az", str(wrapper_local), f"{target.host}:{wrapper_remote}"])
+    if local_target_mode:
+        _run_cmd(["rsync", "-az", str(tsv_local), tsv_remote])
+        _run_cmd(["rsync", "-az", str(wrapper_local), wrapper_remote])
+    else:
+        _run_cmd(["rsync", "-az", str(tsv_local), f"{target.host}:{tsv_remote}"])
+        _run_cmd(["rsync", "-az", str(wrapper_local), f"{target.host}:{wrapper_remote}"])
 
     array_size = len(run_indexes)
     array_header = _render_scheduler_header(
@@ -1194,18 +1215,24 @@ def _submit_sweep_array(
         working_dir=target.remote_root,
         remote_log_file=remote_log_file,
     )
-    _run_cmd(
-        [
-            "ssh",
-            target.host,
-            "bash",
-            "-lc",
-            f"cat > {shlex.quote(remote_array_submit)} <<'PC_EOF'\n{array_script}PC_EOF\nchmod +x {shlex.quote(remote_array_submit)}",
-        ]
-    )
+    if local_target_mode:
+        array_submit_path = Path(remote_array_submit)
+        array_submit_path.parent.mkdir(parents=True, exist_ok=True)
+        array_submit_path.write_text(array_script)
+        array_submit_path.chmod(0o755)
+    else:
+        _run_cmd(
+            [
+                "ssh",
+                target.host,
+                "bash",
+                "-lc",
+                f"cat > {shlex.quote(remote_array_submit)} <<'PC_EOF'\n{array_script}PC_EOF\nchmod +x {shlex.quote(remote_array_submit)}",
+            ]
+        )
 
     adapter = get_adapter(target.scheduler)
-    submit_result = adapter.submit(target.host, remote_array_submit)
+    submit_result = adapter.submit(target.host, remote_array_submit, transport=target.transport)
     base_job_id = submit_result.job_id
     manifest["array_job_id"] = base_job_id
 
@@ -1617,7 +1644,7 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
 
     if mode == "array" and manifest.get("array_job_id"):
         cmd = _cancel_command_for_scheduler(scheduler, str(manifest["array_job_id"]))
-        if scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
         else:
             proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
@@ -1638,7 +1665,7 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
                 continue
             seen.add(job_id)
             cmd = _cancel_command_for_scheduler(scheduler, job_id)
-            if scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+            if _uses_local_transport(target_cfg):
                 proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
             else:
                 proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
@@ -1709,7 +1736,7 @@ def analysis_tag(
             raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
         remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
         remote_tag_path = f"{remote_analysis_root}/{tag_value}"
-        if _is_local_none_target(target):
+        if _uses_local_transport(target):
             if not Path(remote_tag_path).exists():
                 raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
         else:
@@ -1800,7 +1827,7 @@ def analysis_list(
         + ('for d in "$P"/*; do basename "$d"; done | sort; ' if all_entries else 'for d in "$P"/*; do [ -d "$d" ] && basename "$d"; done | sort; ')
         + "fi"
     )
-    if _is_local_none_target(target):
+    if _uses_local_transport(target):
         proc = subprocess.run(
             ["bash", "-lc", remote_cmd],
             text=True,
@@ -1927,7 +1954,7 @@ def run(
     resolved_stderr = f"{remote_run_dir}/stderr"
 
     project_ignore = project_root / ".pcignore"
-    local_target_mode = _is_local_none_target(target)
+    local_target_mode = _uses_local_transport(target)
     if local_target_mode:
         Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
         Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
@@ -1979,7 +2006,7 @@ def run(
         )
 
     adapter = get_adapter(target.scheduler)
-    job_id = adapter.submit(target.host, remote_submit_script).job_id
+    job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
 
     now = datetime.now().isoformat(timespec="seconds")
     last_job = LastJob(
@@ -2068,13 +2095,13 @@ def _show_last_status(follow: bool = False) -> None:
                 break
     if state == "UNKNOWN":
         adapter = get_adapter(last["scheduler"])
-        result = adapter.status(target_cfg.host, job_id)
+        result = adapter.status(target_cfg.host, job_id, transport=target_cfg.transport)
         state = result.state
     typer.echo(f"job_id={job_id} target={target} state={state}")
 
     if follow:
         typer.echo(f"Following log: {last['remote_log_file']}")
-        if _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             _show_local_log(Path(str(last["remote_log_file"])), follow=True, head=None, tail=50)
         else:
             subprocess.run(
@@ -2082,7 +2109,7 @@ def _show_last_status(follow: bool = False) -> None:
                 check=True,
             )
     else:
-        if _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             log_path = Path(str(last["remote_log_file"]))
             if log_path.exists():
                 typer.echo("--- log tail ---")
@@ -2138,14 +2165,15 @@ def _resolve_and_persist_job_state(
         return record_state
 
     adapter = get_adapter(scheduler)
-    status_result = adapter.status(cfg.targets[target_name].host, job_id)
+    target_cfg = cfg.targets[target_name]
+    status_result = adapter.status(target_cfg.host, job_id, transport=target_cfg.transport)
     state = status_result.state
     if state == "NOT_FOUND":
         stored_final_state = str(payload.get("final_state", "")).strip()
         if stored_final_state:
             state = stored_final_state
         else:
-            accounting_result = adapter.accounting_status(cfg.targets[target_name].host, job_id)
+            accounting_result = adapter.accounting_status(target_cfg.host, job_id, transport=target_cfg.transport)
             if accounting_result.state != "NOT_FOUND":
                 state = accounting_result.state
                 payload["final_state"] = accounting_result.state
@@ -2332,7 +2360,7 @@ def cancel(
 
         cancel_cmd = _cancel_command_for_scheduler(rec_scheduler, rec_job_id)
         target_cfg = cfg.targets[rec_target]
-        if rec_scheduler.lower() == "none" and _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             proc = subprocess.run(
                 ["bash", "-lc", cancel_cmd],
                 text=True,
@@ -2399,7 +2427,6 @@ def logs(
     )
     submission_mode = str(selected.get("submission_mode", "")).strip().lower()
     selected_target = str(selected.get("target", ""))
-    selected_scheduler = str(selected.get("scheduler", "")).strip().lower()
     remote_log_file = str(selected.get("remote_log_file", "")).strip()
     if not remote_log_file:
         raise typer.BadParameter("Selected job does not have a remote log file")
@@ -2418,7 +2445,7 @@ def logs(
 
     if selected_target not in cfg.targets:
         raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
-    if selected_scheduler == "none" and _is_local_none_target(cfg.targets[selected_target]):
+    if _uses_local_transport(cfg.targets[selected_target]):
         local_log_path = Path(remote_log_file).expanduser()
         if not local_log_path.is_absolute():
             local_log_path = (project_root / local_log_path).resolve()
@@ -2570,7 +2597,7 @@ def collect(
         if not clean_tag:
             continue
         tagged_remote = f"{remote_run_dir}/./{clean_tag}"
-        if _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
         else:
             proc = _run_cmd(
@@ -2596,17 +2623,28 @@ def collect(
             typer.echo(f"- {item}")
 
 
-def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, str], str]:
+def _fetch_job_stats(host: str, scheduler: str, job_id: str, transport: str = "ssh") -> tuple[dict[str, str], str]:
     scheduler_lc = scheduler.lower()
     quoted_job_id = shlex.quote(job_id)
+    local_transport = transport.strip().lower() == "local" or _is_local_host(host)
 
-    if scheduler_lc in {"sge", "univa"}:
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qacct -j {quoted_job_id}"],
+    def _run_stats_cmd(command: str) -> subprocess.CompletedProcess[str]:
+        if local_transport:
+            return subprocess.run(
+                ["bash", "-lc", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        return subprocess.run(
+            ["ssh", host, "bash", "-lc", command],
             text=True,
             capture_output=True,
             check=False,
         )
+
+    if scheduler_lc in {"sge", "univa"}:
+        proc = _run_stats_cmd(f"qacct -j {quoted_job_id}")
         if proc.returncode != 0:
             raise typer.BadParameter(proc.stderr.strip() or "Failed to query SGE/Univa accounting")
         stats: dict[str, str] = {}
@@ -2640,12 +2678,7 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, 
         return stats, proc.stdout
 
     if scheduler_lc == "pbs":
-        proc = subprocess.run(
-            ["ssh", host, "bash", "-lc", f"qstat -xf {quoted_job_id}"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        proc = _run_stats_cmd(f"qstat -xf {quoted_job_id}")
         if proc.returncode != 0:
             raise typer.BadParameter(proc.stderr.strip() or "Failed to query PBS accounting")
         stats = {}
@@ -2663,17 +2696,8 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, 
         return stats, proc.stdout
 
     if scheduler_lc == "slurm":
-        proc = subprocess.run(
-            [
-                "ssh",
-                host,
-                "bash",
-                "-lc",
-                f"sacct -j {quoted_job_id} -X -P -n -o JobIDRaw,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,MaxVMSize,AveRSS,ReqMem",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
+        proc = _run_stats_cmd(
+            f"sacct -j {quoted_job_id} -X -P -n -o JobIDRaw,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,MaxVMSize,AveRSS,ReqMem"
         )
         if proc.returncode != 0:
             raise typer.BadParameter(proc.stderr.strip() or "Failed to query Slurm accounting")
@@ -2701,18 +2725,7 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, 
         return stats, proc.stdout
 
     if scheduler_lc == "lsf":
-        proc = subprocess.run(
-            [
-                "ssh",
-                host,
-                "bash",
-                "-lc",
-                f"bjobs -a -noheader -o 'STAT EXIT_CODE CPU_USED RUN_TIME MAX_MEM MEM SWAP' {quoted_job_id}",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        proc = _run_stats_cmd(f"bjobs -a -noheader -o 'STAT EXIT_CODE CPU_USED RUN_TIME MAX_MEM MEM SWAP' {quoted_job_id}")
         if proc.returncode != 0:
             raise typer.BadParameter(proc.stderr.strip() or "Failed to query LSF accounting")
         line = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
@@ -2727,26 +2740,7 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str) -> tuple[dict[str, 
         return stats, proc.stdout
 
     if scheduler_lc == "none":
-        if _is_local_host(host):
-            proc = subprocess.run(
-                ["bash", "-lc", f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz="],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        else:
-            proc = subprocess.run(
-                [
-                    "ssh",
-                    host,
-                    "bash",
-                    "-lc",
-                    f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz=",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+        proc = _run_stats_cmd(f"ps -p {quoted_job_id} -o pid=,etime=,%cpu=,%mem=,rss=,vsz=")
         line = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
         if not line:
             return {"state": "EXITED"}, proc.stdout
@@ -2942,8 +2936,13 @@ def stats(
     if not selected_scheduler:
         selected_scheduler = cfg.targets[selected_target].scheduler
 
-    host = cfg.targets[selected_target].host
-    usage_stats, _ = _fetch_job_stats(host=host, scheduler=selected_scheduler, job_id=selected_job_id)
+    target_cfg = cfg.targets[selected_target]
+    usage_stats, _ = _fetch_job_stats(
+        host=target_cfg.host,
+        scheduler=selected_scheduler,
+        job_id=selected_job_id,
+        transport=target_cfg.transport,
+    )
     display_stats = _normalize_stats_for_display(usage_stats)
     rows = [
         ("job_id", selected_job_id),
@@ -3246,7 +3245,7 @@ def pull(
             skipped.append(clean_tag)
             continue
         tagged_remote = f"{remote_analysis_root}/./{clean_tag}"
-        if _is_local_none_target(target_cfg):
+        if _uses_local_transport(target_cfg):
             proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
         else:
             proc = _run_cmd(

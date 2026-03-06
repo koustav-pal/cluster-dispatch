@@ -20,6 +20,7 @@ class TargetConfig:
     host: str
     scheduler: str  # sge | univa | pbs | slurm | lsf | none
     remote_root: str
+    transport: str = "ssh"  # ssh | local
     template_header: str = ""
     default_cpus: int = 1
     default_memory: str = "8G"
@@ -54,6 +55,7 @@ def _parse_targets(raw: dict[str, Any]) -> dict[str, TargetConfig]:
     for name, data in raw.items():
         parsed[name] = TargetConfig(
             host=data["host"],
+            transport=data.get("transport", "ssh"),
             scheduler=data["scheduler"],
             remote_root=data.get("remote_root", ""),
             template_header=data.get("template_header", ""),

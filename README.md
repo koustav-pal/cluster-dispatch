@@ -192,6 +192,7 @@ Add another target:
 
 ```bash
 cdp target add cluster-b \
+  --transport ssh \
   --host cluster-b \
   --scheduler pbs \
   --remote-root /scratch/me/projects
@@ -229,6 +230,7 @@ Creates `.cluster_dispatch/config.yml`, state directories, and a default `local`
 Adds/updates a target by name.
 
 Key options:
+- `--transport` (`ssh|local`)
 - `--host`
 - `--scheduler`
 - `--remote-root`
