@@ -54,8 +54,8 @@ Recommended:
 ### From source (recommended currently)
 
 ```bash
-git clone https://github.com/koustav-pal/project-control.git
-cd project-control
+git clone https://github.com/koustav-pal/cluster-dispatch.git
+cd cluster-dispatch
 pip install -e .
 ```
 
