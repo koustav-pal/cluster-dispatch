@@ -5,6 +5,8 @@ import secrets
 import subprocess
 import json
 import re
+import tarfile
+import io
 import sys
 import socket
 import itertools
@@ -616,6 +618,23 @@ def _parse_iso_ts(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _export_manifest_payload(
+    *,
+    include_jobs: bool,
+    include_sync: bool,
+    include_sweeps: bool,
+    redact_hosts: bool,
+) -> dict[str, Any]:
+    return {
+        "format": "cluster-dispatch-export-v1",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "include_jobs": include_jobs,
+        "include_sync": include_sync,
+        "include_sweeps": include_sweeps,
+        "redact_hosts": redact_hosts,
+    }
 
 
 def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
@@ -4557,6 +4576,143 @@ def config_export(
         typer.echo(json.dumps(snapshot, indent=2))
     else:
         typer.echo(yaml.safe_dump(snapshot, sort_keys=False))
+
+
+@app.command("export")
+def export_bundle(
+    output: Optional[Path] = typer.Option(None, "--output", help="Output tar.gz bundle path"),
+    include_jobs: bool = typer.Option(False, "--jobs/--no-jobs", help="Include .cluster_dispatch/jobs records"),
+    include_sync: bool = typer.Option(False, "--sync/--no-sync", help="Include .cluster_dispatch/sync records"),
+    include_sweeps: bool = typer.Option(False, "--sweeps/--no-sweeps", help="Include .cluster_dispatch/sweeps manifests"),
+    redact_hosts: bool = typer.Option(False, "--redact-hosts", help="Redact target host values in exported config"),
+) -> None:
+    """Export project metadata bundle as tar.gz."""
+    project_root = _project_root()
+    bundle_path = (output or Path(f"cdp-export-{datetime.now().strftime('%Y%m%d%H%M%S')}.tar.gz")).resolve()
+    cfg = load_config(project_root)
+
+    manifest = _export_manifest_payload(
+        include_jobs=include_jobs,
+        include_sync=include_sync,
+        include_sweeps=include_sweeps,
+        redact_hosts=redact_hosts,
+    )
+
+    files_to_add: list[Path] = []
+    base = project_root / CONFIG_DIR
+    config_file = base / CONFIG_NAME
+    files_to_add.append(config_file)
+    state_file = base / "state.json"
+    if state_file.exists():
+        files_to_add.append(state_file)
+    ignore_file = project_root / IGNORE_FILE_NAME
+    if ignore_file.exists():
+        files_to_add.append(ignore_file)
+
+    if include_jobs:
+        files_to_add.extend(sorted((base / JOBS_DIR).glob("*.json")))
+    if include_sync:
+        files_to_add.extend(sorted((base / SYNC_EVENTS_DIR_NAME).glob("*.json")))
+    if include_sweeps:
+        files_to_add.extend(sorted((base / SWEEPS_DIR_NAME).glob("*.json")))
+
+    with tarfile.open(bundle_path, "w:gz") as tar:
+        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+        manifest_info = tarfile.TarInfo(name="export_manifest.json")
+        manifest_info.size = len(manifest_bytes)
+        tar.addfile(manifest_info, io.BytesIO(manifest_bytes))
+
+        if redact_hosts:
+            raw_cfg = yaml.safe_load(config_file.read_text()) or {}
+            targets = raw_cfg.get("targets", {})
+            if isinstance(targets, dict):
+                for target_payload in targets.values():
+                    if isinstance(target_payload, dict) and "host" in target_payload:
+                        target_payload["host"] = "<redacted>"
+            redacted = yaml.safe_dump(raw_cfg, sort_keys=False).encode("utf-8")
+            cfg_info = tarfile.TarInfo(name=f"{CONFIG_DIR}/{CONFIG_NAME}")
+            cfg_info.size = len(redacted)
+            tar.addfile(cfg_info, io.BytesIO(redacted))
+            skip_config = True
+        else:
+            skip_config = False
+
+        for path in files_to_add:
+            if skip_config and path == config_file:
+                continue
+            if not path.exists() or not path.is_file():
+                continue
+            arcname = path.relative_to(project_root).as_posix()
+            tar.add(path, arcname=arcname)
+
+    typer.echo(f"Exported bundle: {bundle_path}")
+    typer.echo(
+        f"Included: config,state,ignore"
+        f"{',jobs' if include_jobs else ''}"
+        f"{',sync' if include_sync else ''}"
+        f"{',sweeps' if include_sweeps else ''}"
+    )
+
+
+@app.command("import")
+def import_bundle(
+    bundle: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Path to export tar.gz bundle"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing files"),
+    include_jobs: bool = typer.Option(True, "--jobs/--no-jobs", help="Import jobs records from bundle"),
+    include_sync: bool = typer.Option(True, "--sync/--no-sync", help="Import sync records from bundle"),
+    include_sweeps: bool = typer.Option(True, "--sweeps/--no-sweeps", help="Import sweeps manifests from bundle"),
+) -> None:
+    """Import project metadata bundle into current directory."""
+    dest_root = Path.cwd().resolve()
+    allowed_prefixes = {f"{CONFIG_DIR}/", IGNORE_FILE_NAME, "export_manifest.json"}
+    included_sections = {
+        JOBS_DIR: include_jobs,
+        SYNC_EVENTS_DIR_NAME: include_sync,
+        SWEEPS_DIR_NAME: include_sweeps,
+    }
+
+    extracted = 0
+    skipped = 0
+    with tarfile.open(bundle, "r:gz") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        for member in members:
+            name = member.name.strip("/")
+            if not name:
+                skipped += 1
+                continue
+            if ".." in Path(name).parts:
+                skipped += 1
+                continue
+            if not any(name == p or name.startswith(p) for p in allowed_prefixes):
+                skipped += 1
+                continue
+            if name.startswith(f"{CONFIG_DIR}/{JOBS_DIR}/") and not included_sections[JOBS_DIR]:
+                skipped += 1
+                continue
+            if name.startswith(f"{CONFIG_DIR}/{SYNC_EVENTS_DIR_NAME}/") and not included_sections[SYNC_EVENTS_DIR_NAME]:
+                skipped += 1
+                continue
+            if name.startswith(f"{CONFIG_DIR}/{SWEEPS_DIR_NAME}/") and not included_sections[SWEEPS_DIR_NAME]:
+                skipped += 1
+                continue
+
+            out_path = dest_root / name
+            if out_path.exists() and not overwrite:
+                raise typer.BadParameter(
+                    f"Refusing to overwrite existing file: {out_path}. Re-run with --overwrite."
+                )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                skipped += 1
+                continue
+            out_path.write_bytes(source.read())
+            extracted += 1
+
+    typer.echo(f"Imported bundle: {bundle}")
+    typer.echo(f"Files extracted: {extracted}")
+    if skipped:
+        typer.echo(f"Files skipped: {skipped}")
 
 
 @cleanup_app.command("records")

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+import tarfile
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -430,6 +431,47 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("sync_total", payload)
         self.assertIn("jobs_by_state", payload)
         self.assertIn("resources", payload)
+
+    def test_export_bundle_includes_optional_sections(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(7)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        sync_result = _invoke(self.runner, self.project, ["sync", "push"])
+        self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+
+        bundle = self.project / "backup.tar.gz"
+        export_result = _invoke(
+            self.runner,
+            self.project,
+            ["export", "--output", str(bundle), "--jobs", "--sync"],
+        )
+        self.assertEqual(export_result.exit_code, 0, export_result.output)
+        self.assertTrue(bundle.exists())
+
+        with tarfile.open(bundle, "r:gz") as tar:
+            names = set(tar.getnames())
+        self.assertIn("export_manifest.json", names)
+        self.assertIn(".cluster_dispatch/config.yml", names)
+        self.assertTrue(any(n.startswith(".cluster_dispatch/jobs/") for n in names))
+        self.assertTrue(any(n.startswith(".cluster_dispatch/sync/") for n in names))
+
+    def test_import_bundle_round_trip(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(8)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+
+        bundle = self.project / "roundtrip.tar.gz"
+        export_result = _invoke(
+            self.runner,
+            self.project,
+            ["export", "--output", str(bundle), "--jobs"],
+        )
+        self.assertEqual(export_result.exit_code, 0, export_result.output)
+
+        imported_dir = self.base / "imported"
+        imported_dir.mkdir(parents=True, exist_ok=True)
+        import_result = _invoke(self.runner, imported_dir, ["import", str(bundle)])
+        self.assertEqual(import_result.exit_code, 0, import_result.output)
+        self.assertTrue((imported_dir / ".cluster_dispatch" / "config.yml").exists())
+        self.assertTrue((imported_dir / ".cluster_dispatch" / "jobs").exists())
 
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])

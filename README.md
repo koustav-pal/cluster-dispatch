@@ -211,6 +211,8 @@ cdp cleanup records --dry-run --older-than-days 30 --keep-last 200
 cdp cleanup records --apply --jobs --sync --target cluster-a
 cdp report
 cdp report --target cluster-a --days 7 --json
+cdp export --output backup.tar.gz --jobs --sync --sweeps
+cdp import backup.tar.gz --overwrite
 cdp analysis pull
 ```
 
@@ -464,6 +466,12 @@ Builds an operational summary from local job and sync records.
 - recent failures
 - sync activity summary
 - lightweight resource usage summary from recorded request fields
+
+### `cdp export [--output <tar.gz>] [--jobs] [--sync] [--sweeps] [--redact-hosts]`
+Exports project metadata into a tar.gz bundle.
+
+### `cdp import <bundle.tar.gz> [--overwrite] [--jobs/--no-jobs] [--sync/--no-sync] [--sweeps/--no-sweeps]`
+Imports project metadata bundle into current directory.
 
 ## Files and state
 
