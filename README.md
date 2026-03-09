@@ -65,6 +65,19 @@ pip install -e .
 cdp --help
 ```
 
+### Optional shell completion
+
+```bash
+cdp --install-completion
+```
+
+## Migration notes
+
+If you used earlier internal naming:
+- command `pc` is now `cdp`
+- metadata directory `.project_control` is now `.cluster_dispatch`
+- ignore file `.pcignore` is now `.cdpignore`
+
 ## Quick start
 
 ### 1. Create a scheduler template
