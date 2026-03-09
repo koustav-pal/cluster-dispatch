@@ -543,6 +543,21 @@ def _write_sync_event(project_root: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
+def _load_sync_events(project_root: Path) -> list[dict[str, Any]]:
+    sync_dir = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
+    if not sync_dir.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for path in sorted(sync_dir.glob("*.json"), reverse=True):
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        payload["_record_file"] = str(path)
+        events.append(payload)
+    return events
+
+
 def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
     return _sweeps_dir(project_root) / f"{sweep_id}.json"
 
@@ -4083,6 +4098,62 @@ def sync_pull(
 ) -> None:
     """Pull active analysis data from the active target."""
     _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run)
+
+
+@sync_app.command("status")
+def sync_status(
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum sync events to display"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by target name", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by analysis path", autocompletion=_complete_record_analyses
+    ),
+    action: Optional[str] = typer.Option(None, "--action", help="Filter by action: push|pull"),
+    as_json: bool = typer.Option(False, "--json", help="Render matched events as JSON"),
+) -> None:
+    """Show recorded sync events."""
+    project_root = _project_root()
+    events = _load_sync_events(project_root)
+    if not events:
+        typer.echo("No sync events recorded")
+        return
+
+    action_filter: Optional[str] = None
+    if action:
+        action_lc = action.strip().lower()
+        if action_lc not in {"push", "pull"}:
+            raise typer.BadParameter("--action must be one of: push, pull")
+        action_filter = action_lc
+
+    def _matches(event: dict[str, Any]) -> bool:
+        if target and str(event.get("target", "")) != target:
+            return False
+        if analysis and str(event.get("analysis", "")) != analysis:
+            return False
+        if action_filter and str(event.get("action", "")).lower() != action_filter:
+            return False
+        return True
+
+    matched = [event for event in events if _matches(event)][:limit]
+    if not matched:
+        typer.echo("No sync events found for the provided filters")
+        return
+
+    if as_json:
+        for event in matched:
+            event.pop("_record_file", None)
+        typer.echo(json.dumps(matched, indent=2))
+        return
+
+    typer.echo("Sync events:")
+    for event in matched:
+        typer.echo(
+            f"{str(event.get('recorded_at', ''))}  action={str(event.get('action', ''))} "
+            f"target={str(event.get('target', ''))} analysis={str(event.get('analysis', ''))} "
+            f"mode={str(event.get('mode', ''))} source={str(event.get('source', ''))} "
+            f"destination={str(event.get('destination', ''))}"
+        )
 
 
 @analysis_app.command("pull")

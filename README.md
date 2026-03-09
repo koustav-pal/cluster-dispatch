@@ -201,6 +201,8 @@ cdp status global
 cdp sync push
 cdp sync pull
 cdp sync pull --all
+cdp sync status
+cdp sync status --target cluster-a --action push --limit 10
 cdp analysis pull
 ```
 
@@ -423,6 +425,9 @@ Pulls active analysis data from the active target.
 - `--all`: pull full active analysis directory
 - `--dry-run` previews sync commands with no side effects
 - writes sync events under `.cluster_dispatch/sync/` for non-dry-run runs
+
+### `cdp sync status [--target ...] [--analysis ...] [--action push|pull] [--limit N] [--json]`
+Lists recorded sync events from `.cluster_dispatch/sync/*.json`.
 
 ## Files and state
 

@@ -212,6 +212,29 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("source", payload)
         self.assertIn("destination", payload)
 
+    def test_sync_status_lists_events(self) -> None:
+        push_result = _invoke(self.runner, self.project, ["sync", "push"])
+        self.assertEqual(push_result.exit_code, 0, push_result.output)
+
+        status_result = _invoke(self.runner, self.project, ["sync", "status"])
+        self.assertEqual(status_result.exit_code, 0, status_result.output)
+        self.assertIn("Sync events:", status_result.output)
+        self.assertIn("action=push", status_result.output)
+
+    def test_sync_status_json_and_filter(self) -> None:
+        push_result = _invoke(self.runner, self.project, ["sync", "push"])
+        self.assertEqual(push_result.exit_code, 0, push_result.output)
+
+        status_json = _invoke(
+            self.runner,
+            self.project,
+            ["sync", "status", "--action", "push", "--limit", "5", "--json"],
+        )
+        self.assertEqual(status_json.exit_code, 0, status_json.output)
+        payload = json.loads(status_json.output)
+        self.assertTrue(payload)
+        self.assertTrue(all(item.get("action") == "push" for item in payload))
+
     def test_target_remove_default_requires_force(self) -> None:
         template = self.project / "none.tmpl"
         template.write_text(
