@@ -14,7 +14,7 @@ import shutil
 import time
 from importlib.metadata import PackageNotFoundError, version
 from string import Formatter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Optional, Any
 
@@ -48,6 +48,7 @@ status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 ignore_app = typer.Typer(help="Manage .cdpignore patterns")
 sync_app = typer.Typer(help="Explicit synchronization commands")
 config_app = typer.Typer(help="Inspect project configuration")
+cleanup_app = typer.Typer(help="Clean up local metadata and manifests")
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
 analysis_app.add_typer(sweep_app, name="sweep")
@@ -56,6 +57,7 @@ app.add_typer(status_app, name="status")
 app.add_typer(ignore_app, name="ignore")
 app.add_typer(sync_app, name="sync")
 app.add_typer(config_app, name="config")
+app.add_typer(cleanup_app, name="cleanup")
 
 
 TEMPLATES_DIR_NAME = "templates"
@@ -602,6 +604,18 @@ def _load_sync_events(project_root: Path) -> list[dict[str, Any]]:
         payload["_record_file"] = str(path)
         events.append(payload)
     return events
+
+
+def _parse_iso_ts(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
@@ -4394,6 +4408,159 @@ def config_export(
         typer.echo(json.dumps(snapshot, indent=2))
     else:
         typer.echo(yaml.safe_dump(snapshot, sort_keys=False))
+
+
+@cleanup_app.command("records")
+def cleanup_records(
+    jobs: bool = typer.Option(True, "--jobs/--no-jobs", help="Clean up job records"),
+    sync: bool = typer.Option(True, "--sync/--no-sync", help="Clean up sync event records"),
+    sweeps: bool = typer.Option(False, "--sweeps/--no-sweeps", help="Clean up sweep manifests"),
+    older_than_days: Optional[int] = typer.Option(
+        None, "--older-than-days", min=0, help="Delete records older than this many days"
+    ),
+    keep_last: int = typer.Option(0, "--keep-last", min=0, help="Always keep most recent N records per category"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by target name", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by analysis path", autocompletion=_complete_record_analyses
+    ),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview only by default; use --apply to delete"),
+    as_json: bool = typer.Option(False, "--json", help="Print cleanup summary as JSON"),
+) -> None:
+    """Clean local metadata records with retention filters."""
+    project_root = _project_root()
+    cutoff: Optional[datetime] = None
+    if older_than_days is not None:
+        cutoff = datetime.now() - timedelta(days=older_than_days)
+
+    summary: dict[str, Any] = {
+        "dry_run": dry_run,
+        "filters": {
+            "target": target,
+            "analysis": analysis,
+            "older_than_days": older_than_days,
+            "keep_last": keep_last,
+            "jobs": jobs,
+            "sync": sync,
+            "sweeps": sweeps,
+        },
+        "categories": {},
+    }
+
+    def _candidate_paths(
+        items: list[tuple[Path, Optional[datetime]]],
+    ) -> list[Path]:
+        ordered = sorted(
+            items,
+            key=lambda entry: (entry[1] is not None, entry[1] or datetime.min, entry[0].name),
+            reverse=True,
+        )
+        keep_set: set[Path] = {path for path, _ in ordered[:keep_last]} if keep_last else set()
+        candidates: list[Path] = []
+        for path, ts in ordered:
+            if path in keep_set:
+                continue
+            if cutoff is not None and (ts is None or ts >= cutoff):
+                continue
+            candidates.append(path)
+        return candidates
+
+    def _record_category_result(name: str, scanned: int, matched: int, deleted: list[str]) -> None:
+        summary["categories"][name] = {
+            "scanned": scanned,
+            "matched": matched,
+            "deleted": deleted,
+            "deleted_count": len(deleted),
+        }
+
+    if jobs:
+        job_entries: list[tuple[Path, Optional[datetime]]] = []
+        jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
+        scanned = 0
+        if jobs_dir.exists():
+            for path in jobs_dir.glob("*.json"):
+                scanned += 1
+                try:
+                    payload = json.loads(path.read_text())
+                except json.JSONDecodeError:
+                    continue
+                if target and str(payload.get("target", "")) != target:
+                    continue
+                if analysis and str(payload.get("analysis", "")) != analysis:
+                    continue
+                job_entries.append((path, _parse_iso_ts(payload.get("submitted_at"))))
+        candidates = _candidate_paths(job_entries)
+        deleted_paths: list[str] = []
+        for path in candidates:
+            deleted_paths.append(str(path))
+            if not dry_run:
+                path.unlink(missing_ok=True)
+        _record_category_result("jobs", scanned, len(job_entries), deleted_paths)
+
+    if sync:
+        sync_entries: list[tuple[Path, Optional[datetime]]] = []
+        sync_dir = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
+        scanned = 0
+        if sync_dir.exists():
+            for path in sync_dir.glob("*.json"):
+                scanned += 1
+                try:
+                    payload = json.loads(path.read_text())
+                except json.JSONDecodeError:
+                    continue
+                if target and str(payload.get("target", "")) != target:
+                    continue
+                if analysis and str(payload.get("analysis", "")) != analysis:
+                    continue
+                sync_entries.append((path, _parse_iso_ts(payload.get("recorded_at"))))
+        candidates = _candidate_paths(sync_entries)
+        deleted_paths = []
+        for path in candidates:
+            deleted_paths.append(str(path))
+            if not dry_run:
+                path.unlink(missing_ok=True)
+        _record_category_result("sync", scanned, len(sync_entries), deleted_paths)
+
+    if sweeps:
+        sweep_entries: list[tuple[Path, Optional[datetime]]] = []
+        sweeps_dir = project_root / CONFIG_DIR / SWEEPS_DIR_NAME
+        scanned = 0
+        if sweeps_dir.exists():
+            for path in sweeps_dir.glob("*.json"):
+                scanned += 1
+                try:
+                    payload = json.loads(path.read_text())
+                except json.JSONDecodeError:
+                    continue
+                if target and str(payload.get("target", "")) != target:
+                    continue
+                if analysis and str(payload.get("analysis", "")) != analysis:
+                    continue
+                sweep_entries.append((path, _parse_iso_ts(payload.get("created_at"))))
+        candidates = _candidate_paths(sweep_entries)
+        deleted_paths = []
+        for path in candidates:
+            deleted_paths.append(str(path))
+            if not dry_run:
+                path.unlink(missing_ok=True)
+        _record_category_result("sweeps", scanned, len(sweep_entries), deleted_paths)
+
+    total_deleted = sum(cat["deleted_count"] for cat in summary["categories"].values())
+    summary["deleted_total"] = total_deleted
+    if as_json:
+        typer.echo(json.dumps(summary, indent=2))
+        return
+
+    typer.echo("Cleanup summary:")
+    typer.echo(f"Mode: {'dry-run' if dry_run else 'apply'}")
+    for name, cat in summary["categories"].items():
+        typer.echo(
+            f"- {name}: scanned={cat['scanned']} matched={cat['matched']} "
+            f"to_delete={cat['deleted_count']}"
+        )
+    if total_deleted and dry_run:
+        typer.echo("Use --apply to perform deletion.")
 
 
 @analysis_app.command("pull")

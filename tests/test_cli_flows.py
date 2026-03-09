@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import TestCase, mock
@@ -369,6 +370,43 @@ class TestClusterDispatchFlows(TestCase):
         self.assertEqual(yaml_result.exit_code, 0, yaml_result.output)
         self.assertIn("project_root:", yaml_result.output)
         self.assertIn("targets:", yaml_result.output)
+
+    def test_cleanup_records_dry_run_and_apply(self) -> None:
+        jobs_dir = self.project / ".cluster_dispatch" / "jobs"
+        sync_dir = self.project / ".cluster_dispatch" / "sync"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        sync_dir.mkdir(parents=True, exist_ok=True)
+
+        old_ts = (datetime.now() - timedelta(days=40)).isoformat(timespec="seconds")
+        new_ts = datetime.now().isoformat(timespec="seconds")
+        old_job = jobs_dir / "old.json"
+        new_job = jobs_dir / "new.json"
+        old_sync = sync_dir / "old.json"
+        old_job.write_text(json.dumps({"submitted_at": old_ts, "target": "local", "analysis": "analysis/a"}, indent=2))
+        new_job.write_text(json.dumps({"submitted_at": new_ts, "target": "local", "analysis": "analysis/a"}, indent=2))
+        old_sync.write_text(json.dumps({"recorded_at": old_ts, "target": "local", "analysis": "analysis/a"}, indent=2))
+
+        dry_result = _invoke(
+            self.runner,
+            self.project,
+            ["cleanup", "records", "--older-than-days", "30", "--json"],
+        )
+        self.assertEqual(dry_result.exit_code, 0, dry_result.output)
+        dry_payload = json.loads(dry_result.output)
+        self.assertGreaterEqual(dry_payload["categories"]["jobs"]["deleted_count"], 1)
+        self.assertGreaterEqual(dry_payload["categories"]["sync"]["deleted_count"], 1)
+        self.assertTrue(old_job.exists())
+        self.assertTrue(old_sync.exists())
+
+        apply_result = _invoke(
+            self.runner,
+            self.project,
+            ["cleanup", "records", "--older-than-days", "30", "--apply"],
+        )
+        self.assertEqual(apply_result.exit_code, 0, apply_result.output)
+        self.assertFalse(old_job.exists())
+        self.assertFalse(old_sync.exists())
+        self.assertTrue(new_job.exists())
 
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])

@@ -207,6 +207,8 @@ cdp sync status
 cdp sync status --target cluster-a --action push --limit 10
 cdp config show
 cdp config export --format yaml
+cdp cleanup records --dry-run --older-than-days 30 --keep-last 200
+cdp cleanup records --apply --jobs --sync --target cluster-a
 cdp analysis pull
 ```
 
@@ -445,6 +447,14 @@ Shows resolved project context (project root, active/default target, active anal
 
 ### `cdp config export [--format json|yaml]`
 Exports full configuration snapshot for automation/debugging.
+
+### `cdp cleanup records [options]`
+Cleans local metadata with retention/filter controls.
+- categories: `--jobs/--no-jobs`, `--sync/--no-sync`, `--sweeps/--no-sweeps`
+- retention: `--older-than-days`, `--keep-last`
+- filters: `--target`, `--analysis`
+- mode: default `--dry-run`; use `--apply` to delete
+- reporting: `--json` for machine-readable summary
 
 ## Files and state
 
