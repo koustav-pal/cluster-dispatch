@@ -83,6 +83,26 @@ DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
 }
 
 IGNORE_FILE_NAME = ".cdpignore"
+GITIGNORE_FILE_NAME = ".gitignore"
+DEFAULT_GITIGNORE_CONTENT = (
+    "# Git version control exclusions\n"
+    "# .gitignore controls what Git tracks.\n"
+    "# .cdpignore controls what cdp excludes from remote sync.\n"
+    "__pycache__/\n"
+    "*.py[cod]\n"
+    "*.egg-info/\n"
+    "build/\n"
+    "dist/\n"
+    ".pytest_cache/\n"
+    ".mypy_cache/\n"
+    ".DS_Store\n"
+    ".venv/\n"
+    "\n"
+    "# data/\n"
+    "# results/\n"
+    "# cache/\n"
+    "# scratch/\n"
+)
 
 
 def _project_root() -> Path:
@@ -91,6 +111,44 @@ def _project_root() -> Path:
 
 def _ignore_file(project_root: Path) -> Path:
     return project_root / IGNORE_FILE_NAME
+
+
+def get_git_info(project_root: Path) -> Optional[dict[str, Any]]:
+    repo_root_proc = subprocess.run(
+        ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if repo_root_proc.returncode != 0:
+        return None
+
+    repo_root = repo_root_proc.stdout.strip()
+    branch_proc = subprocess.run(
+        ["git", "-C", str(project_root), "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    head_proc = subprocess.run(
+        ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    dirty_proc = subprocess.run(
+        ["git", "-C", str(project_root), "status", "--porcelain"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    return {
+        "repo_root": repo_root,
+        "branch": branch_proc.stdout.strip() if branch_proc.returncode == 0 else "",
+        "head": head_proc.stdout.strip() if head_proc.returncode == 0 else "",
+        "dirty": bool(dirty_proc.stdout.strip()) if dirty_proc.returncode == 0 else False,
+    }
 
 
 def _require_active_analysis(cfg: ProjectConfig, project_root: Path) -> Path:
@@ -520,10 +578,17 @@ def _render_scheduler_header(
 
 @app.command()
 def init(
+    project_path: Optional[Path] = typer.Argument(
+        None, help="Project directory to initialize (defaults to current directory)"
+    ),
+    with_git: bool = typer.Option(
+        False, "--with-git", help="Also initialize Git repository if one is not already detected"
+    ),
 ) -> None:
     """Initialize .cluster_dispatch/config.yml with default local target."""
 
-    project_root = Path.cwd()
+    project_root = (project_path or Path.cwd()).resolve()
+    project_root.mkdir(parents=True, exist_ok=True)
     cfg_path = config_path(project_root)
     parent_project_root: Optional[Path] = None
     for candidate in project_root.parents:
@@ -575,6 +640,31 @@ def init(
     typer.echo("Default target set to 'local' (scheduler=none, host=localhost)")
     if created_ignore:
         typer.echo(f"Created {ignore_path}")
+
+    if with_git:
+        if shutil.which("git") is None:
+            raise typer.BadParameter("Git is not installed or not on PATH, but --with-git was requested")
+
+        git_info = get_git_info(project_root)
+        if git_info is None:
+            init_proc = subprocess.run(
+                ["git", "init"],
+                cwd=project_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if init_proc.returncode != 0:
+                error_message = (init_proc.stderr or init_proc.stdout or "unknown git error").strip()
+                raise typer.BadParameter(f"Failed to initialize Git repository: {error_message}")
+            typer.echo(f"Initialized Git repository in {project_root}")
+        else:
+            typer.echo("Git repository already detected.")
+
+        gitignore_path = project_root / GITIGNORE_FILE_NAME
+        if not gitignore_path.exists():
+            gitignore_path.write_text(DEFAULT_GITIGNORE_CONTENT)
+            typer.echo(f"Created {gitignore_path}")
 
 
 @target_app.command("add")

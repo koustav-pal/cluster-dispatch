@@ -94,6 +94,8 @@ Optional placeholders:
 
 ```bash
 cdp init
+cdp init myproj
+cdp init myproj --with-git
 ```
 
 What this does:
@@ -101,6 +103,10 @@ What this does:
 - creates local state dirs under `.cluster_dispatch/`
 - creates `.cdpignore` at project root (if missing)
 - creates default target `local` (`scheduler=none`, `host=localhost`, `remote_root=<project_root>`)
+- with `--with-git`:
+  - initializes Git if no repository is detected
+  - does not reinitialize if already inside a Git repository
+  - creates `.gitignore` if missing (does not overwrite existing file)
 
 Then add remote targets explicitly with `cdp target add`.
 
@@ -223,9 +229,17 @@ If template contains `{queue}` or `{parallel_environment}`, those values must re
 ## Command reference
 
 ### `cdp init`
-Initializes cluster-dispatch in current directory.
+Initializes cluster-dispatch in current directory or an optional project path.
 
 Creates `.cluster_dispatch/config.yml`, state directories, and a default `local` target.
+
+Examples:
+
+```bash
+cdp init
+cdp init myproj
+cdp init myproj --with-git
+```
 
 ### `cdp target add <name>`
 Adds/updates a target by name.
@@ -382,6 +396,22 @@ All metadata is under project root `.cluster_dispatch/`:
   per-run job records (all launches are preserved)
 - `.cluster_dispatch/templates/scheduler_header.tmpl`:
   active scheduler template
+
+Ignore files:
+- `.gitignore`:
+  Git version-control exclusions
+- `.cdpignore`:
+  cluster sync exclusions used by `cdp` transfers
+
+Recommended workflow:
+- Track scripts, templates, and configs with Git
+- Keep large datasets outside Git
+- Use `.cdpignore` to exclude heavy local content from cluster synchronization
+
+Planned Git-aware extensions (future):
+- record Git commit metadata in run records
+- `cdp git status`
+- reproducibility guardrails such as `--require-git-clean`
 
 ## Example template (PBS Pro)
 
