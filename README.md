@@ -180,6 +180,8 @@ cdp logs --job-name run001 --head 50
 cdp logs --follow
 cdp cancel --job-id 123456
 cdp cancel --job-name run001 --target cluster-a
+cdp retry --job-id 123456
+cdp retry --job-name run001 --dry-run
 cdp stats --job-id 123456
 cdp stats --job-name run001
 cdp collect --job-id 123456
@@ -396,6 +398,13 @@ Subcommands:
 Option:
 - `cdp status --target <name>` for target-scoped status from any context.
 
+### `cdp retry [--job-id ... | --job-name ...] [--target ...] [--analysis ...] [--dry-run]`
+Retries a previous normal (non-sweep) run from recorded provenance.
+- default (no filters): retries the most recent normal run record
+- with filters: retries the most recent matching normal run
+- reuses recorded command/resources/target/analysis
+- `--dry-run` previews retry without side effects
+
 ### `cdp analysis pull [--remote]`
 Pulls only tagged paths for active analysis from remote run directory.
 - default: pulls tagged paths that already exist locally
@@ -431,6 +440,7 @@ All metadata is under project root `.cluster_dispatch/`:
   - `run_id`: deterministic run-definition identity
   - `job_id`: scheduler/local execution identity
   - `sweep_id`: parent sweep identity (sweep jobs only)
+  Schema contract: `docs/JOB_RECORD_SCHEMA.md`
 - `.cluster_dispatch/templates/scheduler_header.tmpl`:
   active scheduler template
 

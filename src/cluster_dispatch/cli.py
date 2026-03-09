@@ -2384,7 +2384,6 @@ def run(
     resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
     resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
     resolved_job_name = job_name or f"cdp-{secrets.token_hex(4)}"
-    resolved_working_dir = target.remote_root
     resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
     resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
     resolved_parallel_environment = (
@@ -2392,185 +2391,25 @@ def run(
         if parallel_environment is not None
         else str(profile_values.get("parallel_environment", target.default_parallel_environment))
     )
-
-    requires_queue = "{queue}" in target.template_header
-    requires_pe = "{parallel_environment}" in target.template_header
-    if requires_queue and not resolved_queue:
-        raise typer.BadParameter(
-            "--queue is required (or set target default_queue) because template includes {queue}."
-        )
-    if requires_pe and not resolved_parallel_environment:
-        raise typer.BadParameter(
-            "--parallel-environment is required (or set target default_parallel_environment) because template includes {parallel_environment}."
-        )
-
     analysis_rel = (cfg.active_analysis or "").strip("/")
-    if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
-    run_id = _deterministic_analysis_run_id(
-        target_name=target_name,
+    _submit_or_preview_analysis_run(
+        project_root=project_root,
+        cfg=cfg,
+        analysis_dir=analysis_dir,
         analysis_rel=analysis_rel,
+        target_name=target_name,
+        target=target,
         command=command,
-        scheduler=target.scheduler,
-        resources={
-            "cpus": resolved_cpus,
-            "memory": resolved_memory,
-            "time": resolved_time,
-            "node": resolved_node,
-            "queue": resolved_queue,
-            "parallel_environment": resolved_parallel_environment,
-            "job_name": resolved_job_name,
-        },
+        profile_name=profile,
+        cpus=resolved_cpus,
+        memory=resolved_memory,
+        walltime=resolved_time,
+        job_name=resolved_job_name,
+        queue=resolved_queue,
+        node=resolved_node,
+        parallel_environment=resolved_parallel_environment,
+        dry_run=dry_run,
     )
-    run_id = f"run-{run_id}"
-    remote_run_dir = f"{remote_analysis_root}/{run_id}"
-    remote_submit_script = f"{remote_run_dir}/pc_submit.sh"
-    remote_log_file = f"{remote_run_dir}/run.log"
-    resolved_stdout = f"{remote_run_dir}/stdout"
-    resolved_stderr = f"{remote_run_dir}/stderr"
-
-    submit_script = _build_submit_script(
-        header=_render_scheduler_header(
-            target.template_header,
-            cpus=resolved_cpus,
-            memory=resolved_memory,
-            walltime=resolved_time,
-            job_name=resolved_job_name,
-            stdout=resolved_stdout,
-            stderr=resolved_stderr,
-            working_dir=resolved_working_dir,
-            queue=resolved_queue or "",
-            node=resolved_node,
-            parallel_environment=resolved_parallel_environment or "",
-        ),
-        command=command,
-        working_dir=resolved_working_dir,
-        remote_log_file=remote_log_file,
-    )
-
-    project_ignore = _ignore_file(project_root)
-    local_target_mode = _uses_local_transport(target)
-    if dry_run:
-        typer.echo("Dry run: no changes will be made")
-        typer.echo("")
-        typer.echo(f"Project root: {project_root}")
-        typer.echo(f"Analysis: {analysis_rel}")
-        typer.echo(f"Target: {target_name}")
-        typer.echo(f"Scheduler: {target.scheduler}")
-        typer.echo(f"Remote path: {remote_analysis_root}")
-        if project_ignore.exists():
-            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} detected")
-        else:
-            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} not found")
-        typer.echo(f"Command: {command}")
-        typer.echo("")
-        typer.echo("Planned actions:")
-        typer.echo("1. Sync analysis directory to remote target")
-        typer.echo("2. Prepare scheduler submission")
-        typer.echo("3. Submit job to scheduler")
-        typer.echo("4. Record job metadata locally")
-        typer.echo("Record preview: includes identity, resources, paths, sync, environment, and optional git metadata")
-        typer.echo("")
-        typer.echo("Submission script preview:")
-        for line in submit_script.splitlines()[:16]:
-            typer.echo(line)
-        if len(submit_script.splitlines()) > 16:
-            typer.echo("...")
-        return
-
-    if local_target_mode:
-        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
-        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
-
-    rsync_cmd = ["rsync", "-az", "--delete"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    if local_target_mode:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
-    else:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
-    _run_cmd(rsync_cmd)
-
-    if local_target_mode:
-        submit_path = Path(remote_submit_script)
-        submit_path.parent.mkdir(parents=True, exist_ok=True)
-        submit_path.write_text(submit_script)
-        submit_path.chmod(0o755)
-    else:
-        _run_cmd(
-            [
-                "ssh",
-                target.host,
-                "bash",
-                "-lc",
-                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-            ]
-        )
-
-    adapter = get_adapter(target.scheduler)
-    job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
-
-    now = datetime.now().isoformat(timespec="seconds")
-    last_job = LastJob(
-        job_id=job_id,
-        target=target_name,
-        scheduler=target.scheduler,
-        remote_run_dir=remote_run_dir,
-        remote_log_file=remote_log_file,
-        run_id=run_id,
-    )
-
-    state = load_state(project_root)
-    state["last_job"] = last_job.__dict__
-    state["last_updated"] = now
-    save_state(project_root, state)
-
-    append_job_record(
-        project_root,
-        _build_job_record(
-            project_root=project_root,
-            submitted_at=now,
-            analysis=cfg.active_analysis,
-            analysis_tags=cfg.analysis_tags.get(cfg.active_analysis or "", []),
-            target_name=target_name,
-            scheduler=target.scheduler,
-            job_id=job_id,
-            run_id=run_id,
-            job_name=resolved_job_name,
-            state=("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
-            command=command,
-            remote_run_dir=remote_run_dir,
-            remote_log_file=remote_log_file,
-            working_dir=resolved_working_dir,
-            cpus=resolved_cpus,
-            memory=resolved_memory,
-            walltime=resolved_time,
-            node=resolved_node,
-            queue=resolved_queue,
-            parallel_environment=resolved_parallel_environment,
-            profile_name=profile,
-            submit_script_path=remote_submit_script,
-            submission_mode="single",
-            sync_source=str(analysis_dir.resolve()),
-            sync_destination=remote_analysis_root,
-            ignore_file_path=(str(project_ignore) if project_ignore.exists() else None),
-            ignore_used=project_ignore.exists(),
-            extra={
-                "stdout": resolved_stdout,
-                "stderr": resolved_stderr,
-            },
-        ),
-    )
-
-    typer.echo(f"Submitted job_id={job_id} target={target_name}")
-    typer.echo(f"Run id: {run_id}")
-    typer.echo(f"Job name: {resolved_job_name}")
-    typer.echo(f"Node: {resolved_node}")
-    typer.echo(f"Remote run dir: {remote_run_dir}")
-    typer.echo(f"Remote log: {remote_log_file}")
 
 
 def _show_last_status(follow: bool = False) -> None:
@@ -3045,6 +2884,106 @@ def history(
             f"job_name={str(rec.get('job_name', ''))} target={str(rec.get('target', ''))} "
             f"scheduler={str(rec.get('scheduler', ''))} analysis={str(rec.get('analysis', ''))}"
         )
+
+
+@app.command("retry")
+def retry(
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Retry from exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Retry from exact job name", autocompletion=_complete_job_names
+    ),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Restrict retry lookup to target", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Restrict retry lookup to analysis", autocompletion=_complete_record_analyses
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview retry actions without any modifications"),
+) -> None:
+    """Retry a previous normal run using recorded provenance."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    records = _load_job_records(project_root)
+    if not records:
+        raise typer.BadParameter("No job records found. Run `cdp analysis run ...` first.")
+
+    normal_records = [rec for rec in records if "sweep_id" not in rec]
+    if not normal_records:
+        raise typer.BadParameter("No normal run records found to retry.")
+
+    def _matches(rec: dict[str, Any]) -> bool:
+        if job_id and str(rec.get("job_id", "")) != job_id:
+            return False
+        if job_name and str(rec.get("job_name", "")) != job_name:
+            return False
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        return True
+
+    has_filters = any([job_id, job_name, target, analysis])
+    candidates = [rec for rec in normal_records if _matches(rec)] if has_filters else normal_records
+    if not candidates:
+        raise typer.BadParameter("No matching normal run records found for retry")
+    if len(candidates) > 1:
+        typer.echo(f"Multiple matches found ({len(candidates)}). Retrying the most recent record.")
+    selected = candidates[0]
+
+    analysis_rel = str(selected.get("analysis", "")).strip("/")
+    if not analysis_rel:
+        raise typer.BadParameter("Selected record is missing analysis path")
+    analysis_dir = (project_root / analysis_rel).resolve()
+    if not analysis_dir.exists() or not analysis_dir.is_dir():
+        raise typer.BadParameter(f"Analysis directory not found for selected record: {analysis_dir}")
+    try:
+        analysis_dir.relative_to(project_root)
+    except ValueError as exc:
+        raise typer.BadParameter("Selected analysis path is outside project root") from exc
+
+    target_name = str(selected.get("target", "")).strip()
+    if not target_name:
+        raise typer.BadParameter("Selected record is missing target name")
+    if target_name not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target_name}' from selected record is not configured")
+    target_cfg = cfg.targets[target_name]
+
+    command = str(selected.get("command_resolved", "")).strip() or str(selected.get("command", "")).strip()
+    if not command:
+        raise typer.BadParameter("Selected record is missing command")
+
+    resource_block = selected.get("resources", {}) if isinstance(selected.get("resources", {}), dict) else {}
+    profile_name = str(resource_block.get("profile", "")).strip() or None
+
+    cpus_value = selected.get("cpus", resource_block.get("cpus", target_cfg.default_cpus))
+    memory_value = selected.get("memory", resource_block.get("memory", target_cfg.default_memory))
+    time_value = selected.get("time", resource_block.get("time", target_cfg.default_time))
+    node_value = selected.get("node", resource_block.get("node", target_cfg.default_node or "1"))
+    queue_value = selected.get("queue", resource_block.get("queue", target_cfg.default_queue))
+    pe_value = selected.get(
+        "parallel_environment",
+        resource_block.get("parallel_environment", target_cfg.default_parallel_environment),
+    )
+    retry_job_name = str(selected.get("job_name", "")).strip() or f"cdp-{secrets.token_hex(4)}"
+
+    _submit_or_preview_analysis_run(
+        project_root=project_root,
+        cfg=cfg,
+        analysis_dir=analysis_dir,
+        analysis_rel=analysis_rel,
+        target_name=target_name,
+        target=target_cfg,
+        command=command,
+        profile_name=profile_name,
+        cpus=int(cpus_value),
+        memory=str(memory_value),
+        walltime=str(time_value),
+        job_name=retry_job_name,
+        queue=str(queue_value),
+        node=str(node_value),
+        parallel_environment=str(pe_value),
+        dry_run=dry_run,
+    )
 
 
 @app.command("collect")
@@ -3920,6 +3859,210 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
         for item in skipped:
             typer.echo(f"- {item}")
     typer.echo(f"Recorded sync event: {record_path}")
+
+
+def _submit_or_preview_analysis_run(
+    *,
+    project_root: Path,
+    cfg: ProjectConfig,
+    analysis_dir: Path,
+    analysis_rel: str,
+    target_name: str,
+    target: TargetConfig,
+    command: str,
+    profile_name: Optional[str],
+    cpus: int,
+    memory: str,
+    walltime: str,
+    job_name: str,
+    queue: str,
+    node: str,
+    parallel_environment: str,
+    dry_run: bool,
+) -> None:
+    if not analysis_rel:
+        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
+    if not target.remote_root:
+        raise typer.BadParameter(
+            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
+        )
+
+    requires_queue = "{queue}" in target.template_header
+    requires_pe = "{parallel_environment}" in target.template_header
+    if requires_queue and not queue:
+        raise typer.BadParameter(
+            "--queue is required (or set target default_queue) because template includes {queue}."
+        )
+    if requires_pe and not parallel_environment:
+        raise typer.BadParameter(
+            "--parallel-environment is required (or set target default_parallel_environment) because template includes {parallel_environment}."
+        )
+
+    resolved_working_dir = target.remote_root
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+    run_id = _deterministic_analysis_run_id(
+        target_name=target_name,
+        analysis_rel=analysis_rel,
+        command=command,
+        scheduler=target.scheduler,
+        resources={
+            "cpus": cpus,
+            "memory": memory,
+            "time": walltime,
+            "node": node,
+            "queue": queue,
+            "parallel_environment": parallel_environment,
+            "job_name": job_name,
+        },
+    )
+    run_id = f"run-{run_id}"
+    remote_run_dir = f"{remote_analysis_root}/{run_id}"
+    remote_submit_script = f"{remote_run_dir}/pc_submit.sh"
+    remote_log_file = f"{remote_run_dir}/run.log"
+    resolved_stdout = f"{remote_run_dir}/stdout"
+    resolved_stderr = f"{remote_run_dir}/stderr"
+
+    submit_script = _build_submit_script(
+        header=_render_scheduler_header(
+            target.template_header,
+            cpus=cpus,
+            memory=memory,
+            walltime=walltime,
+            job_name=job_name,
+            stdout=resolved_stdout,
+            stderr=resolved_stderr,
+            working_dir=resolved_working_dir,
+            queue=queue or "",
+            node=node,
+            parallel_environment=parallel_environment or "",
+        ),
+        command=command,
+        working_dir=resolved_working_dir,
+        remote_log_file=remote_log_file,
+    )
+
+    project_ignore = _ignore_file(project_root)
+    local_target_mode = _uses_local_transport(target)
+    if dry_run:
+        typer.echo("Dry run: no changes will be made")
+        typer.echo("")
+        typer.echo(f"Project root: {project_root}")
+        typer.echo(f"Analysis: {analysis_rel}")
+        typer.echo(f"Target: {target_name}")
+        typer.echo(f"Scheduler: {target.scheduler}")
+        typer.echo(f"Remote path: {remote_analysis_root}")
+        if project_ignore.exists():
+            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} detected")
+        else:
+            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} not found")
+        typer.echo(f"Command: {command}")
+        typer.echo("")
+        typer.echo("Planned actions:")
+        typer.echo("1. Sync analysis directory to remote target")
+        typer.echo("2. Prepare scheduler submission")
+        typer.echo("3. Submit job to scheduler")
+        typer.echo("4. Record job metadata locally")
+        typer.echo("Record preview: includes identity, resources, paths, sync, environment, and optional git metadata")
+        typer.echo("")
+        typer.echo("Submission script preview:")
+        for line in submit_script.splitlines()[:16]:
+            typer.echo(line)
+        if len(submit_script.splitlines()) > 16:
+            typer.echo("...")
+        return
+
+    if local_target_mode:
+        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
+        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
+
+    rsync_cmd = ["rsync", "-az", "--delete"]
+    if project_ignore.exists():
+        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
+    if local_target_mode:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
+    else:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
+    _run_cmd(rsync_cmd)
+
+    if local_target_mode:
+        submit_path = Path(remote_submit_script)
+        submit_path.parent.mkdir(parents=True, exist_ok=True)
+        submit_path.write_text(submit_script)
+        submit_path.chmod(0o755)
+    else:
+        _run_cmd(
+            [
+                "ssh",
+                target.host,
+                "bash",
+                "-lc",
+                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
+            ]
+        )
+
+    adapter = get_adapter(target.scheduler)
+    job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
+
+    now = datetime.now().isoformat(timespec="seconds")
+    last_job = LastJob(
+        job_id=job_id,
+        target=target_name,
+        scheduler=target.scheduler,
+        remote_run_dir=remote_run_dir,
+        remote_log_file=remote_log_file,
+        run_id=run_id,
+    )
+
+    state = load_state(project_root)
+    state["last_job"] = last_job.__dict__
+    state["last_updated"] = now
+    save_state(project_root, state)
+
+    append_job_record(
+        project_root,
+        _build_job_record(
+            project_root=project_root,
+            submitted_at=now,
+            analysis=analysis_rel,
+            analysis_tags=cfg.analysis_tags.get(analysis_rel, []),
+            target_name=target_name,
+            scheduler=target.scheduler,
+            job_id=job_id,
+            run_id=run_id,
+            job_name=job_name,
+            state=("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
+            command=command,
+            remote_run_dir=remote_run_dir,
+            remote_log_file=remote_log_file,
+            working_dir=resolved_working_dir,
+            cpus=cpus,
+            memory=memory,
+            walltime=walltime,
+            node=node,
+            queue=queue,
+            parallel_environment=parallel_environment,
+            profile_name=profile_name,
+            submit_script_path=remote_submit_script,
+            submission_mode="single",
+            sync_source=str(analysis_dir.resolve()),
+            sync_destination=remote_analysis_root,
+            ignore_file_path=(str(project_ignore) if project_ignore.exists() else None),
+            ignore_used=project_ignore.exists(),
+            extra={
+                "stdout": resolved_stdout,
+                "stderr": resolved_stderr,
+            },
+        ),
+    )
+
+    typer.echo(f"Submitted job_id={job_id} target={target_name}")
+    typer.echo(f"Run id: {run_id}")
+    typer.echo(f"Job name: {job_name}")
+    typer.echo(f"Node: {node}")
+    typer.echo(f"Remote run dir: {remote_run_dir}")
+    typer.echo(f"Remote log: {remote_log_file}")
 
 
 @sync_app.command("push")

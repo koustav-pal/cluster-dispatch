@@ -312,3 +312,28 @@ class TestClusterDispatchFlows(TestCase):
         self.assertEqual(removed.exit_code, 0, removed.output)
         self.assertFalse((jobs_dir / "fake_remote.json").exists())
         self.assertFalse((sync_dir / "fake_remote.json").exists())
+
+    def test_retry_replays_most_recent_normal_run(self) -> None:
+        first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
+        self.assertEqual(first.exit_code, 0, first.output)
+        jobs_before = sorted((self.project / ".cluster_dispatch" / "jobs").glob("*.json"))
+        self.assertEqual(len(jobs_before), 1)
+
+        retry_result = _invoke(self.runner, self.project, ["retry"])
+        self.assertEqual(retry_result.exit_code, 0, retry_result.output)
+        self.assertIn("Submitted job_id=", retry_result.output)
+
+        jobs_after = sorted((self.project / ".cluster_dispatch" / "jobs").glob("*.json"))
+        self.assertEqual(len(jobs_after), 2)
+
+    def test_retry_dry_run_has_no_side_effects(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(11)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        jobs_before = sorted((self.project / ".cluster_dispatch" / "jobs").glob("*.json"))
+
+        dry_result = _invoke(self.runner, self.project, ["retry", "--dry-run"])
+        self.assertEqual(dry_result.exit_code, 0, dry_result.output)
+        self.assertIn("Dry run: no changes will be made", dry_result.output)
+
+        jobs_after = sorted((self.project / ".cluster_dispatch" / "jobs").glob("*.json"))
+        self.assertEqual(len(jobs_before), len(jobs_after))
