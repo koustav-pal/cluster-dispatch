@@ -41,11 +41,13 @@ analysis_app = typer.Typer(help="Manage active analysis directory")
 sweep_app = typer.Typer(help="Manage sweep orchestration")
 profile_app = typer.Typer(help="Manage resource profiles")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
+ignore_app = typer.Typer(help="Manage .cdpignore patterns")
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
 analysis_app.add_typer(sweep_app, name="sweep")
 app.add_typer(profile_app, name="profile")
 app.add_typer(status_app, name="status")
+app.add_typer(ignore_app, name="ignore")
 
 
 TEMPLATES_DIR_NAME = "templates"
@@ -79,9 +81,15 @@ DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
     },
 }
 
+IGNORE_FILE_NAME = ".cdpignore"
+
 
 def _project_root() -> Path:
     return find_project_root()
+
+
+def _ignore_file(project_root: Path) -> Path:
+    return project_root / IGNORE_FILE_NAME
 
 
 def _require_active_analysis(cfg: ProjectConfig, project_root: Path) -> Path:
@@ -516,9 +524,23 @@ def init(
 
     project_root = Path.cwd()
     cfg_path = config_path(project_root)
+    parent_project_root: Optional[Path] = None
+    for candidate in project_root.parents:
+        if config_path(candidate).exists():
+            parent_project_root = candidate
+            break
 
     if cfg_path.exists():
         raise typer.BadParameter(f"{CONFIG_DIR}/{CONFIG_NAME} already exists in this directory")
+    if parent_project_root is not None:
+        typer.secho(
+            (
+                f"Warning: cdp init is running inside an existing cdp project.\n"
+                f"Existing project root: {parent_project_root}\n"
+                f"Initializing nested project at: {project_root}"
+            ),
+            fg=typer.colors.YELLOW,
+        )
 
     local_target = "local"
     local_root = str(project_root.resolve())
@@ -538,8 +560,20 @@ def init(
     )
     save_config(project_root, cfg)
     ensure_state_dirs(project_root)
+    ignore_path = _ignore_file(project_root)
+    created_ignore = False
+    if not ignore_path.exists():
+        ignore_path.write_text(
+            "# cdp ignore patterns (rsync --exclude-from)\n"
+            "# Example:\n"
+            "# *.tmp\n"
+            "# data/raw/\n"
+        )
+        created_ignore = True
     typer.echo(f"Initialized {cfg_path}")
     typer.echo("Default target set to 'local' (scheduler=none, host=localhost)")
+    if created_ignore:
+        typer.echo(f"Created {ignore_path}")
 
 
 @target_app.command("add")
@@ -660,6 +694,66 @@ def target_list() -> None:
     for name, t in cfg.targets.items():
         marker = "*" if name == cfg.default_target else " "
         typer.echo(f"{marker} {name}: host={t.host} transport={t.transport} scheduler={t.scheduler}")
+
+
+@ignore_app.command("list")
+def ignore_list() -> None:
+    """List .cdpignore patterns."""
+    project_root = _project_root()
+    ignore_path = _ignore_file(project_root)
+    if not ignore_path.exists():
+        typer.echo(f"{IGNORE_FILE_NAME} not found in project root")
+        return
+    lines = ignore_path.read_text().splitlines()
+    patterns = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    if not patterns:
+        typer.echo(f"No ignore patterns in {IGNORE_FILE_NAME}")
+        return
+    typer.echo(f"Ignore patterns in {IGNORE_FILE_NAME}:")
+    for pattern in patterns:
+        typer.echo(f"- {pattern}")
+
+
+@ignore_app.command("add")
+def ignore_add(
+    pattern: str = typer.Argument(..., help="Pattern to add to .cdpignore"),
+) -> None:
+    """Add a pattern to .cdpignore."""
+    clean = pattern.strip()
+    if not clean:
+        raise typer.BadParameter("Pattern cannot be empty")
+    project_root = _project_root()
+    ignore_path = _ignore_file(project_root)
+    existing = ignore_path.read_text().splitlines() if ignore_path.exists() else []
+    if clean in existing:
+        typer.echo(f"Already present: {clean}")
+        return
+    with ignore_path.open("a", encoding="utf-8") as handle:
+        if existing and existing[-1].strip():
+            handle.write("\n")
+        handle.write(f"{clean}\n")
+    typer.echo(f"Added to {IGNORE_FILE_NAME}: {clean}")
+
+
+@ignore_app.command("remove")
+def ignore_remove(
+    pattern: str = typer.Argument(..., help="Exact pattern to remove from .cdpignore"),
+) -> None:
+    """Remove an exact pattern from .cdpignore."""
+    clean = pattern.strip()
+    if not clean:
+        raise typer.BadParameter("Pattern cannot be empty")
+    project_root = _project_root()
+    ignore_path = _ignore_file(project_root)
+    if not ignore_path.exists():
+        raise typer.BadParameter(f"{IGNORE_FILE_NAME} not found in project root")
+    lines = ignore_path.read_text().splitlines()
+    filtered = [line for line in lines if line != clean]
+    if len(filtered) == len(lines):
+        typer.echo(f"Pattern not found: {clean}")
+        return
+    ignore_path.write_text("\n".join(filtered).rstrip() + "\n")
+    typer.echo(f"Removed from {IGNORE_FILE_NAME}: {clean}")
 
 
 @app.command("doctor")
@@ -1953,7 +2047,7 @@ def run(
     resolved_stdout = f"{remote_run_dir}/stdout"
     resolved_stderr = f"{remote_run_dir}/stderr"
 
-    project_ignore = project_root / ".pcignore"
+    project_ignore = _ignore_file(project_root)
     local_target_mode = _uses_local_transport(target)
     if local_target_mode:
         Path(remote_run_dir).mkdir(parents=True, exist_ok=True)

@@ -99,6 +99,7 @@ cdp init
 What this does:
 - creates `.cluster_dispatch/config.yml`
 - creates local state dirs under `.cluster_dispatch/`
+- creates `.cdpignore` at project root (if missing)
 - creates default target `local` (`scheduler=none`, `host=localhost`, `remote_root=<project_root>`)
 
 Then add remote targets explicitly with `cdp target add`.
@@ -245,6 +246,15 @@ Key options:
 
 ### `cdp target set <name>`
 Sets active default target.
+
+### `cdp ignore list`
+Lists ignore patterns from `.cdpignore`.
+
+### `cdp ignore add <pattern>`
+Adds an rsync exclude pattern to `.cdpignore`.
+
+### `cdp ignore remove <pattern>`
+Removes an exact pattern from `.cdpignore`.
 
 ### `cdp analysis use <path>`
 Sets active analysis directory (must be under project root).
