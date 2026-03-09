@@ -350,6 +350,26 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("checks", payload)
         self.assertTrue(payload["checks"])
 
+    def test_config_show(self) -> None:
+        result = _invoke(self.runner, self.project, ["config", "show"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Project root:", result.output)
+        self.assertIn("Default target:", result.output)
+        self.assertIn("Targets:", result.output)
+
+    def test_config_export_json_and_yaml(self) -> None:
+        json_result = _invoke(self.runner, self.project, ["config", "export", "--format", "json"])
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        json_payload = json.loads(json_result.output)
+        self.assertIn("project_root", json_payload)
+        self.assertIn("targets", json_payload)
+        self.assertIn("active_target", json_payload)
+
+        yaml_result = _invoke(self.runner, self.project, ["config", "export", "--format", "yaml"])
+        self.assertEqual(yaml_result.exit_code, 0, yaml_result.output)
+        self.assertIn("project_root:", yaml_result.output)
+        self.assertIn("targets:", yaml_result.output)
+
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
         self.assertEqual(first.exit_code, 0, first.output)

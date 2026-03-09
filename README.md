@@ -205,6 +205,8 @@ cdp sync pull
 cdp sync pull --all
 cdp sync status
 cdp sync status --target cluster-a --action push --limit 10
+cdp config show
+cdp config export --format yaml
 cdp analysis pull
 ```
 
@@ -437,6 +439,12 @@ Pulls active analysis data from the active target.
 
 ### `cdp sync status [--target ...] [--analysis ...] [--action push|pull] [--limit N] [--json]`
 Lists recorded sync events from `.cluster_dispatch/sync/*.json`.
+
+### `cdp config show`
+Shows resolved project context (project root, active/default target, active analysis, paths, and targets).
+
+### `cdp config export [--format json|yaml]`
+Exports full configuration snapshot for automation/debugging.
 
 ## Files and state
 
