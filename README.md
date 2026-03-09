@@ -196,6 +196,9 @@ cdp analysis sweep resume sweep-20260101010101-abc123
 cdp analysis sweep cancel sweep-20260101010101-abc123
 cdp status list --analysis analyses/run_001
 cdp status global
+cdp sync push
+cdp sync pull
+cdp sync pull --all
 cdp analysis pull
 ```
 
@@ -390,6 +393,20 @@ Option:
 Pulls only tagged paths for active analysis from remote run directory.
 - default: pulls tagged paths that already exist locally
 - `--remote`: also pulls tagged paths that are remote-only (not present locally)
+
+### `cdp sync push [--dry-run]`
+Pushes active analysis to the active target explicitly.
+- respects `.cdpignore` if present
+- `--dry-run` previews sync commands with no side effects
+- writes sync events under `.cluster_dispatch/sync/` for non-dry-run runs
+
+### `cdp sync pull [--remote] [--all] [--dry-run]`
+Pulls active analysis data from the active target.
+- default: pulls tagged paths only
+- `--remote`: include remote-only tagged paths
+- `--all`: pull full active analysis directory
+- `--dry-run` previews sync commands with no side effects
+- writes sync events under `.cluster_dispatch/sync/` for non-dry-run runs
 
 ## Files and state
 

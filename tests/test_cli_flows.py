@@ -188,3 +188,26 @@ class TestClusterDispatchFlows(TestCase):
         ]:
             self.assertIn(key, record)
 
+    def test_sync_push_dry_run_no_side_effects(self) -> None:
+        sync_dir = self.project / ".cluster_dispatch" / "sync"
+        self.assertFalse(sync_dir.exists())
+
+        result = _invoke(self.runner, self.project, ["sync", "push", "--dry-run"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Dry run: no changes will be made", result.output)
+        self.assertIn("Action: sync push", result.output)
+        self.assertFalse(sync_dir.exists(), "Dry-run must not write sync records")
+
+    def test_sync_push_writes_sync_event_record(self) -> None:
+        result = _invoke(self.runner, self.project, ["sync", "push"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Recorded sync event:", result.output)
+
+        sync_dir = self.project / ".cluster_dispatch" / "sync"
+        records = sorted(sync_dir.glob("*.json"))
+        self.assertTrue(records, "Expected at least one sync event record")
+        payload = json.loads(records[-1].read_text())
+        self.assertEqual(payload.get("action"), "push")
+        self.assertEqual(payload.get("target"), "local")
+        self.assertIn("source", payload)
+        self.assertIn("destination", payload)

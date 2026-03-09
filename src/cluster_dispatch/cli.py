@@ -46,17 +46,20 @@ sweep_app = typer.Typer(help="Manage sweep orchestration")
 profile_app = typer.Typer(help="Manage resource profiles")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 ignore_app = typer.Typer(help="Manage .cdpignore patterns")
+sync_app = typer.Typer(help="Explicit synchronization commands")
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
 analysis_app.add_typer(sweep_app, name="sweep")
 app.add_typer(profile_app, name="profile")
 app.add_typer(status_app, name="status")
 app.add_typer(ignore_app, name="ignore")
+app.add_typer(sync_app, name="sync")
 
 
 TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
 SWEEPS_DIR_NAME = "sweeps"
+SYNC_EVENTS_DIR_NAME = "sync"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
     "small": {
@@ -514,6 +517,29 @@ def _complete_record_analyses(incomplete: str) -> list[str]:
 def _sweeps_dir(project_root: Path) -> Path:
     path = project_root / CONFIG_DIR / SWEEPS_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sync_events_dir(project_root: Path) -> Path:
+    path = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_sync_event(project_root: Path, payload: dict[str, Any]) -> Path:
+    now = datetime.now().isoformat(timespec="seconds")
+    stamp = now.replace(":", "-")
+    action = str(payload.get("action", "sync")).strip() or "sync"
+    target = str(payload.get("target", "")).strip() or "unknown"
+    stem = f"{stamp}__{action}__{target}"
+    clean_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
+    path = _sync_events_dir(project_root) / f"{clean_stem}.json"
+    counter = 1
+    while path.exists():
+        path = _sync_events_dir(project_root) / f"{clean_stem}__{counter}.json"
+        counter += 1
+    payload["recorded_at"] = now
+    path.write_text(json.dumps(payload, indent=2))
     return path
 
 
@@ -3616,35 +3642,131 @@ def status_global(
     _show_global_status(limit=limit)
 
 
-@analysis_app.command("pull")
-def pull(
-    remote: bool = typer.Option(
-        False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
-    ),
-) -> None:
-    """Pull all tagged paths into the active analysis directory."""
+def _resolve_sync_context() -> tuple[Path, ProjectConfig, Path, str, TargetConfig, str, str]:
     project_root = _project_root()
     cfg = load_config(project_root)
     analysis_dir = _require_active_analysis(cfg, project_root)
-
     target_name, target_cfg = _active_target(cfg)
     if not target_cfg.remote_root:
         raise typer.BadParameter(
             f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
         )
-
     analysis_rel = (cfg.active_analysis or "").strip("/")
     if not analysis_rel:
         raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
     remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
+    return project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root
+
+
+def _sync_push(dry_run: bool) -> None:
+    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
+    project_ignore = _ignore_file(project_root)
+    local_target_mode = _uses_local_transport(target_cfg)
+
+    mkdir_cmd = ["mkdir", "-p", remote_analysis_root]
+    rsync_cmd = ["rsync", "-az", "--delete"]
+    if project_ignore.exists():
+        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
+    if local_target_mode:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
+    else:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{target_cfg.host}:{remote_analysis_root}/"])
+
+    if dry_run:
+        typer.echo("Dry run: no changes will be made")
+        typer.echo(f"Action: sync push")
+        typer.echo(f"Project root: {project_root}")
+        typer.echo(f"Analysis: {analysis_rel}")
+        typer.echo(f"Target: {target_name}")
+        typer.echo(f"Transport: {target_cfg.transport}")
+        typer.echo(f"Source: {analysis_dir}/")
+        typer.echo(f"Destination: {remote_analysis_root}/")
+        typer.echo(
+            f"Sync exclusions: {IGNORE_FILE_NAME} detected" if project_ignore.exists() else f"Sync exclusions: {IGNORE_FILE_NAME} not found"
+        )
+        if local_target_mode:
+            typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in mkdir_cmd)}")
+        else:
+            typer.echo(f"Would run: ssh {shlex.quote(target_cfg.host)} {' '.join(shlex.quote(arg) for arg in mkdir_cmd)}")
+        typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in rsync_cmd)}")
+        return
+
+    if local_target_mode:
+        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target_cfg.host, *mkdir_cmd])
+    _run_cmd(rsync_cmd)
+
+    record_path = _write_sync_event(
+        project_root,
+        {
+            "action": "push",
+            "target": target_name,
+            "analysis": cfg.active_analysis,
+            "scheduler": target_cfg.scheduler,
+            "transport": target_cfg.transport,
+            "source": str(analysis_dir.resolve()),
+            "destination": remote_analysis_root,
+            "ignore_file": str(project_ignore) if project_ignore.exists() else None,
+            "ignore_used": project_ignore.exists(),
+        },
+    )
+    typer.echo(f"Synced analysis to target '{target_name}': {analysis_dir} -> {remote_analysis_root}")
+    typer.echo(f"Recorded sync event: {record_path}")
+
+
+def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
+    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
+    local_target_mode = _uses_local_transport(target_cfg)
+
+    if all_paths:
+        rsync_cmd = ["rsync", "-az"]
+        if local_target_mode:
+            rsync_cmd.extend([f"{remote_analysis_root}/", f"{analysis_dir}/"])
+        else:
+            rsync_cmd.extend([f"{target_cfg.host}:{remote_analysis_root}/", f"{analysis_dir}/"])
+
+        if dry_run:
+            typer.echo("Dry run: no changes will be made")
+            typer.echo("Action: sync pull")
+            typer.echo(f"Project root: {project_root}")
+            typer.echo(f"Analysis: {analysis_rel}")
+            typer.echo(f"Target: {target_name}")
+            typer.echo(f"Transport: {target_cfg.transport}")
+            typer.echo(f"Source: {remote_analysis_root}/")
+            typer.echo(f"Destination: {analysis_dir}/")
+            typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in rsync_cmd)}")
+            return
+
+        _run_cmd(rsync_cmd)
+        record_path = _write_sync_event(
+            project_root,
+            {
+                "action": "pull",
+                "mode": "all",
+                "target": target_name,
+                "analysis": cfg.active_analysis,
+                "scheduler": target_cfg.scheduler,
+                "transport": target_cfg.transport,
+                "source": remote_analysis_root,
+                "destination": str(analysis_dir.resolve()),
+                "ignore_file": None,
+                "ignore_used": False,
+            },
+        )
+        typer.echo(f"Pulled full analysis from target '{target_name}': {remote_analysis_root} -> {analysis_dir}")
+        typer.echo(f"Recorded sync event: {record_path}")
+        return
 
     analysis_tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
     if not analysis_tags:
         raise typer.BadParameter(
             "No tags found for active analysis. Tag paths with `cdp analysis tag <path>` before pulling."
         )
+
     pulled: list[str] = []
     skipped: list[str] = []
+    planned_cmds: list[list[str]] = []
     for tag_dir in analysis_tags:
         clean_tag = tag_dir.strip("/")
         if not clean_tag:
@@ -3653,16 +3775,60 @@ def pull(
             skipped.append(clean_tag)
             continue
         tagged_remote = f"{remote_analysis_root}/./{clean_tag}"
-        if _uses_local_transport(target_cfg):
-            proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
+        if local_target_mode:
+            cmd = ["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"]
         else:
-            proc = _run_cmd(
-                ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"], check=False
-            )
+            cmd = ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"]
+        planned_cmds.append(cmd)
+
+    if dry_run:
+        typer.echo("Dry run: no changes will be made")
+        typer.echo("Action: sync pull")
+        typer.echo(f"Project root: {project_root}")
+        typer.echo(f"Analysis: {analysis_rel}")
+        typer.echo(f"Target: {target_name}")
+        typer.echo(f"Transport: {target_cfg.transport}")
+        typer.echo(f"Mode: tagged ({'include remote-only tags' if remote else 'local-existing tags only'})")
+        if planned_cmds:
+            for cmd in planned_cmds:
+                typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in cmd)}")
+        else:
+            typer.echo("No tagged paths selected for pull")
+        if skipped:
+            typer.echo("Would skip tagged paths:")
+            for item in skipped:
+                typer.echo(f"- {item}")
+        return
+
+    for cmd in planned_cmds:
+        proc = _run_cmd(cmd, check=False)
         if proc.returncode == 0:
-            pulled.append(clean_tag)
+            clean_tag = cmd[-2].split("/./", 1)[-1] if "/./" in cmd[-2] else ""
+            if clean_tag:
+                pulled.append(clean_tag)
         else:
-            skipped.append(clean_tag)
+            clean_tag = cmd[-2].split("/./", 1)[-1] if "/./" in cmd[-2] else ""
+            if clean_tag:
+                skipped.append(clean_tag)
+
+    record_path = _write_sync_event(
+        project_root,
+        {
+            "action": "pull",
+            "mode": "tagged",
+            "target": target_name,
+            "analysis": cfg.active_analysis,
+            "scheduler": target_cfg.scheduler,
+            "transport": target_cfg.transport,
+            "source": remote_analysis_root,
+            "destination": str(analysis_dir.resolve()),
+            "include_remote_only_tags": remote,
+            "pulled": pulled,
+            "skipped": skipped,
+            "ignore_file": None,
+            "ignore_used": False,
+        },
+    )
 
     if pulled:
         typer.echo("Pulled tagged paths:")
@@ -3672,6 +3838,37 @@ def pull(
         typer.echo("Skipped tagged paths:")
         for item in skipped:
             typer.echo(f"- {item}")
+    typer.echo(f"Recorded sync event: {record_path}")
+
+
+@sync_app.command("push")
+def sync_push(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview sync actions without any modifications"),
+) -> None:
+    """Push active analysis directory to the active target."""
+    _sync_push(dry_run=dry_run)
+
+
+@sync_app.command("pull")
+def sync_pull(
+    remote: bool = typer.Option(
+        False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
+    ),
+    all_paths: bool = typer.Option(False, "--all", help="Pull the full active analysis directory"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview sync actions without any modifications"),
+) -> None:
+    """Pull active analysis data from the active target."""
+    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run)
+
+
+@analysis_app.command("pull")
+def pull(
+    remote: bool = typer.Option(
+        False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
+    ),
+) -> None:
+    """Pull all tagged paths into the active analysis directory."""
+    _sync_pull(remote=remote, all_paths=False, dry_run=False)
 
 
 if __name__ == "__main__":
