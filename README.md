@@ -1,98 +1,99 @@
 # cluster-dispatch
 
-`cluster-dispatch` is a Python CLI for running analysis jobs on remote SSH compute targets (SGE, Univa, PBS Pro, Slurm, LSF, or no scheduler), while keeping your local analysis directory as the source of truth.
+`cluster-dispatch` (`cdp`) is a Python CLI for dispatching and tracking analysis jobs across local and remote compute targets.
 
-It is designed for workflows where you:
-- keep multiple analyses under one project,
-- run jobs across multiple clusters/servers,
-- track job status from your laptop,
-- pull only tagged outputs back to local.
+It supports:
+- `none` (local execution)
+- `sge`
+- `univa`
+- `pbs`
+- `slurm`
+- `lsf`
 
-## Why this exists
+It is designed around an active analysis directory, explicit sync/pull behavior, and persistent local provenance records.
 
-HPC workflows often become hard to manage when commands, job scripts, paths, and output pulls are done ad hoc across many servers.
+## Status
 
-`cluster-dispatch` gives you a repeatable interface:
-- one project-level config,
-- explicit target definitions,
-- analysis-level tagging for pull,
-- scheduler template rendering with runtime/default resources.
+Pre-production, but already feature-rich and tested.
 
-## Core concepts
+## Install
 
-- `Project root`: directory where `cdp init` is run.
-- `Target`: named remote execution profile (host + scheduler + remote root + default resources + template).
-- `Active analysis`: local directory selected by `cdp analysis use`.
-- `Tagged paths`: paths inside active analysis selected by `cdp analysis tag`; `cdp analysis pull` only pulls these.
-- `Remote analysis root`: `<remote_root>/<active_analysis_path>`
+Requirements:
+- Python `>=3.10`
+- `rsync`
+- `ssh` (only for SSH targets)
 
-No timestamped run directories are used. Remote structure mirrors local analysis path.
-
-Local mode note: when target is `scheduler=none` with `host=localhost`/`127.0.0.1`, execution is local (no SSH).
-
-## Current status behavior
-
-`cdp status` is context-aware:
-- inside active analysis directory: shows latest job status,
-- outside active analysis directory: shows global status across targets.
-
-You can always force target-specific status:
-- `cdp status --target <target_name>`
-
-## Requirements
-
-- Python 3.10+
-- `ssh` installed and configured
-- `rsync` installed
-- reachable remote hosts (directly or via SSH config aliases)
-
-Recommended:
-- configure host aliases in `~/.ssh/config`
-
-## Installation
-
-### From source (recommended currently)
+From source:
 
 ```bash
-git clone https://github.com/koustav-pal/cluster-dispatch.git
-cd cluster-dispatch
+git clone https://github.com/koustav-pal/project-control.git
+cd project-control
 pip install -e .
 ```
 
-### Verify
+Verify:
 
 ```bash
 cdp --help
 ```
 
-### Optional shell completion
+Shell completion:
 
 ```bash
 cdp --install-completion
 ```
 
-## Migration notes
+## Core model
 
-If you used earlier internal naming:
-- command `pc` is now `cdp`
-- metadata directory `.project_control` is now `.cluster_dispatch`
-- ignore file `.pcignore` is now `.cdpignore`
+- Project metadata lives in `.cluster_dispatch/`
+- Sync excludes come from `.cdpignore` at project root
+- One active target (`cdp target set`)
+- One active analysis (`cdp analysis use`)
+- Runs/sweeps write job records in `.cluster_dispatch/jobs/*.json`
+- Sweeps also persist parent manifests in `.cluster_dispatch/sweeps/*.json`
 
-## Quick start
+Identity fields:
+- `run_id`: deterministic run-definition identity
+- `job_id`: scheduler/local execution identity
+- `sweep_id`: parent sweep identity (sweep jobs only)
 
-### 1. Create a scheduler template
+Schema contract:
+- [`docs/JOB_RECORD_SCHEMA.md`](docs/JOB_RECORD_SCHEMA.md)
 
-Example SGE template (`my_sge_template.tmpl`):
+## Quickstart (local first)
+
+Initialize project:
 
 ```bash
-#$ -N {job_name}
-#$ -o {stdout}.out
-#$ -e {stderr}.err
-#$ -l h_vmem={memory}
-#$ -l h_rt={time}
-#$ -pe {parallel_environment} {cpus}
-#$ -q {queue}
+mkdir myproj && cd myproj
+cdp init
 ```
+
+Create and activate analysis:
+
+```bash
+mkdir -p analyses/demo
+cdp analysis use analyses/demo
+```
+
+Run locally (`target=local`, `scheduler=none` by default):
+
+```bash
+cdp analysis run python -c "print('hello from cdp')"
+```
+
+Watch and inspect:
+
+```bash
+cdp watch --max-polls 20 --interval 2
+cdp logs
+cdp status
+cdp history
+```
+
+## Remote target setup
+
+Create a scheduler template file (user-supplied; placeholders required by your scheduler integration).
 
 Required placeholders:
 - `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`, `{working_dir}`
@@ -100,510 +101,220 @@ Required placeholders:
 Optional placeholders:
 - `{queue}`, `{node}`, `{parallel_environment}`
 
-`{stdout}` and `{stderr}` default to the resolved `job_name`.
-`{working_dir}` resolves to the target `remote_root`.
-
-### 2. Initialize the project
+Add target:
 
 ```bash
-cdp init
-cdp init myproj
-cdp init myproj --with-git
+cdp target add cluster-a \
+  --transport ssh \
+  --host user@cluster.example \
+  --scheduler slurm \
+  --remote-root /scratch/user/myproj \
+  --template-file slurm_header.tmpl
 ```
 
-What this does:
-- creates `.cluster_dispatch/config.yml`
-- creates local state dirs under `.cluster_dispatch/`
-- creates `.cdpignore` at project root (if missing)
-- creates default target `local` (`scheduler=none`, `host=localhost`, `remote_root=<project_root>`)
-- with `--with-git`:
-  - initializes Git if no repository is detected
-  - does not reinitialize if already inside a Git repository
-  - creates `.gitignore` if missing (does not overwrite existing file)
-
-Then add remote targets explicitly with `cdp target add`.
-
-### 3. Set analysis and tags
+Switch target:
 
 ```bash
-cdp analysis use analyses/run_001
+cdp target set cluster-a
+```
+
+## Sync model
+
+Push active analysis to active target:
+
+```bash
+cdp sync push
+cdp sync push --dry-run
+```
+
+Tag outputs for pull:
+
+```bash
 cdp analysis tag results
 cdp analysis tag reports/figures
-cdp analysis tag --remote remote_only_outputs
-cdp analysis list
-cdp analysis list --all
-cdp analysis list --remote
-cdp analysis list --remote --all
 ```
 
-### 4. Run job
+Pull tagged outputs:
 
-Using target defaults only:
+```bash
+cdp analysis pull
+cdp analysis pull --remote
+```
+
+Or full pull:
+
+```bash
+cdp sync pull --all
+```
+
+Inspect sync history:
+
+```bash
+cdp sync status
+cdp sync status --target cluster-a --action push --limit 10
+cdp sync status --json
+```
+
+## Runs and sweeps
+
+Single run:
 
 ```bash
 cdp analysis run python train.py --epochs 20
-```
-
-Preview without making changes:
-
-```bash
 cdp analysis run --dry-run python train.py --epochs 20
 ```
 
-Override resources at runtime:
+Retry a previous normal run:
 
 ```bash
-cdp analysis run \
-  --profile small \
-  --cpus 8 \
-  --memory 32G \
-  --time 04:00:00 \
-  --queue normal \
-  --parallel-environment smp \
-  --job-name run001 \
-  python train.py --epochs 20
+cdp retry --job-id 12345
+cdp retry --job-name run001 --dry-run
 ```
 
-### 4b. Sweep jobs
+Sweep run:
 
 ```bash
 cdp analysis sweep run --config sweep.yml \
   python train.py --lr {lr} --batch-size {batch_size}
 ```
 
-Run one block only:
+Sweep controls:
 
 ```bash
-cdp analysis sweep run --config sweep.yml --job job1 \
+cdp analysis sweep list
+cdp analysis sweep show <sweep_id>
+cdp analysis sweep resume <sweep_id>
+cdp analysis sweep cancel <sweep_id>
+```
+
+## Validation and diagnostics
+
+Project/target preflight:
+
+```bash
+cdp doctor
+cdp target test local
+cdp target test cluster-a --json
+```
+
+Run/sweep validation without submission:
+
+```bash
+cdp run validate python train.py --epochs 20
+cdp run validate --json python train.py --epochs 20
+
+cdp sweep validate --config sweep.yml \
   python train.py --lr {lr} --batch-size {batch_size}
 ```
 
-### 5. Monitor and pull
+## Monitoring and control
 
 ```bash
 cdp status
-cdp status --job-id 123456
-cdp status --job-name run001
 cdp status --target cluster-a
-cdp history
-cdp history --analysis analyses/run_001 --limit 20
-cdp logs
-cdp logs --job-id 123456 --tail 100
-cdp logs --job-name run001 --head 50
-cdp logs --follow
-cdp cancel --job-id 123456
-cdp cancel --job-name run001 --target cluster-a
-cdp target test local
-cdp target test cluster-a --json
-cdp retry --job-id 123456
-cdp retry --job-name run001 --dry-run
-cdp stats --job-id 123456
-cdp stats --job-name run001
-cdp collect --job-id 123456
-cdp collect --job-name run001
-cdp doctor
-cdp doctor --target cluster-a
-cdp doctor --no-remote
-cdp analysis sweep run --config sweep.yml --mode single python train.py --lr {lr} --batch-size {batch_size}
-cdp analysis sweep run --config sweep.yml --mode local python train.py --lr {lr} --batch-size {batch_size}
-cdp profile list
-cdp analysis sweep list
-cdp analysis sweep show sweep-20260101010101-abc123
-cdp analysis sweep resume sweep-20260101010101-abc123
-cdp analysis sweep cancel sweep-20260101010101-abc123
-cdp status list --analysis analyses/run_001
+cdp status list
 cdp status global
-cdp sync push
-cdp sync pull
-cdp sync pull --all
-cdp sync status
-cdp sync status --target cluster-a --action push --limit 10
+
+cdp logs --job-id 12345
+cdp watch --job-id 12345 --interval 10
+
+cdp cancel --job-id 12345
+cdp collect --job-id 12345
+cdp stats --job-id 12345
+```
+
+## Provenance, reporting, cleanup
+
+Config/context snapshot:
+
+```bash
 cdp config show
+cdp config export --format json
 cdp config export --format yaml
-cdp cleanup records --dry-run --older-than-days 30 --keep-last 200
-cdp cleanup records --apply --jobs --sync --target cluster-a
+```
+
+Operational summary:
+
+```bash
 cdp report
 cdp report --target cluster-a --days 7 --json
+```
+
+Metadata cleanup:
+
+```bash
+cdp cleanup records --dry-run --older-than-days 30 --keep-last 200
+cdp cleanup records --apply --jobs --sync
+```
+
+## Export / import metadata
+
+Export project metadata bundle:
+
+```bash
 cdp export --output backup.tar.gz --jobs --sync --sweeps
+cdp export --redact-hosts --output redacted.tar.gz
+```
+
+Import bundle:
+
+```bash
+cdp import backup.tar.gz
 cdp import backup.tar.gz --overwrite
-cdp watch --job-id 123456
-cdp watch --job-name run001 --interval 10 --no-log-tail
-cdp run validate python train.py --epochs 20
-cdp sweep validate --config sweep.yml python train.py --lr {lr} --batch-size {batch_size}
-cdp analysis pull
 ```
 
-## Multi-target workflow
-
-Add another target:
-
-```bash
-cdp target add cluster-b \
-  --transport ssh \
-  --host cluster-b \
-  --scheduler pbs \
-  --remote-root /scratch/me/projects
-```
-
-Switch active target:
-
-```bash
-cdp target set cluster-b
-```
-
-List targets:
-
-```bash
-cdp target list
-```
-
-## Resource resolution order
-
-For each run resource (`cpus`, `memory`, `time`, `node`, `queue`, `parallel_environment`):
-1. runtime flag (if provided),
-2. selected profile values (if `--profile` is set),
-3. target default from config.
-
-If template contains `{queue}` or `{parallel_environment}`, those values must resolve non-empty (runtime or default), otherwise run fails fast.
-
-## Command reference
-
-### `cdp init`
-Initializes cluster-dispatch in current directory or an optional project path.
-
-Creates `.cluster_dispatch/config.yml`, state directories, and a default `local` target.
-
-Examples:
-
-```bash
-cdp init
-cdp init myproj
-cdp init myproj --with-git
-```
-
-### `cdp target add <name>`
-Adds/updates a target by name.
-
-Key options:
-- `--transport` (`ssh|local`)
-- `--host`
-- `--scheduler`
-- `--remote-root`
-- `--template-file`
-- resource defaults:
-  - `--cpus`
-  - `--memory`
-  - `--time`
-  - `--node`
-  - `--queue`
-  - `--parallel-environment`
-
-### `cdp target set <name>`
-Sets active default target.
-
-### `cdp target remove <name> [--force] [--fallback-target <name>] [--prune-records]`
-Removes a target configuration.
-- `local` cannot be removed
-- refuses removal when records reference the target unless `--force` is used
-- when removing current default target, uses fallback target (`local` by default) and requires `--force`
-- `--prune-records` deletes local job/sync records referencing the removed target
-
-### `cdp target test <name> [--remote/--no-remote] [--create-root] [--json]`
-Runs focused connectivity and scheduler checks for one target.
-- validates scheduler, remote_root, and scheduler template placeholders
-- with `--remote` (default): probes connectivity/root/scheduler commands
-- `--create-root` attempts to create missing target root
-- `--json` outputs machine-readable results
-
-### `cdp ignore list`
-Lists ignore patterns from `.cdpignore`.
-
-### `cdp ignore add <pattern>`
-Adds an rsync exclude pattern to `.cdpignore`.
-
-### `cdp ignore remove <pattern>`
-Removes an exact pattern from `.cdpignore`.
-
-### `cdp analysis use <path>`
-Sets active analysis directory (must be under project root).
-
-### `cdp analysis tag <path>`
-Tags a path inside active analysis for pull.
-- default: validates path exists locally under active analysis
-- `--remote`: validates path exists on remote analysis directory (for remote-only paths)
-
-### `cdp analysis list [--remote]`
-Lists subdirectories inside active analysis.
-- default: local active analysis directory
-- `--remote`: corresponding remote analysis directory on active target
-- `--all`: include files too (not only directories)
-
-### `cdp analysis run <command...>`
-Syncs active analysis to remote, renders template, submits job.
-- supports `--profile <name>` for built-in or user-defined profiles
-- assigns a deterministic `run_id` from command + target + analysis + resolved resources (stored in state + job records)
-- stores `pc_submit.sh`, `run.log`, and scheduler stdout/stderr under `<remote_analysis_root>/<run_id>/`
-- `--dry-run` validates configuration and previews sync/submission steps with no file sync, no submission, and no state/job-record updates
-
-### `cdp analysis sweep run --config <yaml> [--job <name>] [--mode single|array|local] <command...>`
-Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
-- command must include placeholders for sweep variables, e.g. `{lr}`, `{batch_size}`
-- deterministic `run_id` per run from block name + params + command template
-- manifests stored in `.cluster_dispatch/sweeps/<sweep_id>.json`
-- `single`: submit each run independently
-- `single` enforces a submission delay via `--submit-delay-ms` (default 5000, minimum 5000)
-- `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
-- `local`: execute each run locally (no scheduler submission)
-- supports same runtime resource override flags as `cdp analysis run`
-- supports `--profile <name>` for built-in or user-defined profiles
-
-### `cdp profile list`
-Lists resource profiles. Built-ins: `small`, `long`, `highmem`.
-
-### `cdp profile show <name>`
-Shows one profile by name.
-
-### `cdp profile set <name> [--cpus ... --memory ... --time ... --node ... --queue ... --parallel-environment ...]`
-Creates or updates a user-defined profile.
-
-### `cdp profile delete <name>`
-Deletes a user-defined profile.
-
-### `cdp doctor`
-Runs preflight checks for local setup and targets.
-- checks config, template validity, local binaries, active analysis path
-- checks targets (scheduler, remote root, template)
-- with remote checks enabled (default): SSH connectivity, remote root presence, scheduler command availability
-- filters: `--target <name>`
-- disable remote probes: `--no-remote`
-
-### `cdp analysis sweep list`
-Lists existing sweep manifests.
-
-### `cdp analysis sweep show <sweep_id>`
-Shows one sweep manifest and run states.
-
-### `cdp analysis sweep resume <sweep_id>`
-Submits pending runs from a sweep manifest.
-
-### `cdp analysis sweep cancel <sweep_id>`
-Cancels submitted runs from a sweep manifest.
-
-### `cdp status`
-Context-aware status (last job in active analysis context, otherwise global).
-- `cdp status --job-id <id>`: query exact scheduler job id from remembered launches
-- `cdp status --job-name <name>`: query exact job name from remembered launches
-- `cdp status --target <name>` can be combined with `--job-id`/`--job-name`
-- record-first: if a job record is already terminal (not running), `cdp status` reports that stored state without re-querying live queue
-- if queue lookup returns `NOT_FOUND`, `cdp status` checks scheduler accounting and persists recovered terminal state into job history
-
-### `cdp logs`
-Shows remote log for selected job.
-- default: uses last job in state
-- filters: `--job-id`, `--job-name`, `--target`, `--analysis`
-- views: `--head N`, `--tail N` (default tail 50), `--follow`
-
-### `cdp cancel`
-Cancels jobs using stored launch records.
-- required: `--job-id` or `--job-name`
-- optional filters: `--target`, `--analysis`
-- scheduler-specific cancel command is used for each matched record
-
-### `cdp stats`
-Collects resource usage for a recorded job.
-- required: `--job-id` or `--job-name`
-- optional filters: `--target`, `--analysis`
-- uses scheduler-specific accounting/stat commands on selected target
-- normalizes walltime/cpu-time and memory fields into human-readable units where possible
-
-### `cdp collect`
-Collects tagged outputs for a recorded job.
-- required: `--job-id` or `--job-name`
-- optional filters: `--target`, `--analysis`
-- uses selected record's `analysis_tags` and `remote_run_dir`
-
-### `cdp history`
-Shows remembered launch records without querying scheduler status.
-- optional filters: `--target`, `--analysis`, `--job-id`, `--job-name`
-- optional `--limit` (default 50)
-
-Subcommands:
-- `cdp status list [--analysis ...] [--limit ...]`
-- `cdp status global [--limit ...]`
-
-Option:
-- `cdp status --target <name>` for target-scoped status from any context.
-
-### `cdp retry [--job-id ... | --job-name ...] [--target ...] [--analysis ...] [--dry-run]`
-Retries a previous normal (non-sweep) run from recorded provenance.
-- default (no filters): retries the most recent normal run record
-- with filters: retries the most recent matching normal run
-- reuses recorded command/resources/target/analysis
-- `--dry-run` previews retry without side effects
-
-### `cdp analysis pull [--remote]`
-Pulls only tagged paths for active analysis from remote run directory.
-- default: pulls tagged paths that already exist locally
-- `--remote`: also pulls tagged paths that are remote-only (not present locally)
-
-### `cdp sync push [--dry-run]`
-Pushes active analysis to the active target explicitly.
-- respects `.cdpignore` if present
-- `--dry-run` previews sync commands with no side effects
-- writes sync events under `.cluster_dispatch/sync/` for non-dry-run runs
-
-### `cdp sync pull [--remote] [--all] [--dry-run]`
-Pulls active analysis data from the active target.
-- default: pulls tagged paths only
-- `--remote`: include remote-only tagged paths
-- `--all`: pull full active analysis directory
-- `--dry-run` previews sync commands with no side effects
-- writes sync events under `.cluster_dispatch/sync/` for non-dry-run runs
-
-### `cdp sync status [--target ...] [--analysis ...] [--action push|pull] [--limit N] [--json]`
-Lists recorded sync events from `.cluster_dispatch/sync/*.json`.
-
-### `cdp config show`
-Shows resolved project context (project root, active/default target, active analysis, paths, and targets).
-
-### `cdp config export [--format json|yaml]`
-Exports full configuration snapshot for automation/debugging.
-
-### `cdp cleanup records [options]`
-Cleans local metadata with retention/filter controls.
-- categories: `--jobs/--no-jobs`, `--sync/--no-sync`, `--sweeps/--no-sweeps`
-- retention: `--older-than-days`, `--keep-last`
-- filters: `--target`, `--analysis`
-- mode: default `--dry-run`; use `--apply` to delete
-- reporting: `--json` for machine-readable summary
-
-### `cdp report [--target ...] [--analysis ...] [--days N] [--json]`
-Builds an operational summary from local job and sync records.
-- job counts by state/scheduler/target
-- recent failures
-- sync activity summary
-- lightweight resource usage summary from recorded request fields
-
-### `cdp export [--output <tar.gz>] [--jobs] [--sync] [--sweeps] [--redact-hosts]`
-Exports project metadata into a tar.gz bundle.
-
-### `cdp import <bundle.tar.gz> [--overwrite] [--jobs/--no-jobs] [--sync/--no-sync] [--sweeps/--no-sweeps]`
-Imports project metadata bundle into current directory.
-
-### `cdp watch [selectors] [--interval N] [--max-polls N] [--log-tail/--no-log-tail]`
-Polls status until selected job reaches terminal state, optionally showing log tail.
-- exits non-zero for failure states or timeout
-
-### `cdp run validate <command...> [resource/profile options] [--json]`
-Validates single-run command/config/template/resource resolution with no sync or submission.
-
-### `cdp sweep validate --config <yaml> <command...> [options] [--json]`
-Validates sweep config expansion, mode/target compatibility, and template/resource requirements without submitting jobs.
-
-## Files and state
-
-All metadata is under project root `.cluster_dispatch/`:
-
-- `.cluster_dispatch/config.yml`:
-  targets, active analysis, analysis tags
-- `.cluster_dispatch/state.json`:
-  last submitted job
-- `.cluster_dispatch/jobs/*.json`:
-  canonical per-job provenance records (all launches are preserved).
-  Normal runs and sweep child runs both write here.
-  Common fields include identity, command, resources, paths, sync metadata, environment, and optional Git metadata.
-  Identity semantics:
-  - `run_id`: deterministic run-definition identity
-  - `job_id`: scheduler/local execution identity
-  - `sweep_id`: parent sweep identity (sweep jobs only)
-  Schema contract: `docs/JOB_RECORD_SCHEMA.md`
-- `.cluster_dispatch/templates/scheduler_header.tmpl`:
-  active scheduler template
-
-Ignore files:
-- `.gitignore`:
-  Git version-control exclusions
-- `.cdpignore`:
-  cluster sync exclusions used by `cdp` transfers
-
-Recommended workflow:
-- Track scripts, templates, and configs with Git
-- Keep large datasets outside Git
-- Use `.cdpignore` to exclude heavy local content from cluster synchronization
-
-Planned Git-aware extensions (future):
-- record Git commit metadata in run records
-- `cdp git status`
-- reproducibility guardrails such as `--require-git-clean`
-
-## Example template (PBS Pro)
-
-```bash
-#PBS -N {job_name}
-#PBS -o {stdout}.out
-#PBS -e {stderr}.err
-#PBS -l select={node}:ncpus={cpus}:mem={memory}
-#PBS -l walltime={time}
-#PBS -q {queue}
-```
+## Command map
+
+Top-level command groups and commands:
+- `analysis`: `use`, `tag`, `list`, `run`, `pull`, `sweep ...`
+- `target`: `add`, `set`, `list`, `remove`, `test`
+- `profile`: `list`, `show`, `set`, `delete`
+- `ignore`: `list`, `add`, `remove`
+- `status`: (default), `list`, `global`
+- `sync`: `push`, `pull`, `status`
+- `config`: `show`, `export`
+- `cleanup`: `records`
+- `run`: `validate`
+- `sweep`: `validate`
+- standalone: `init`, `doctor`, `logs`, `watch`, `history`, `report`, `retry`, `cancel`, `collect`, `stats`, `export`, `import`
+
+## Migration notes
+
+If you used earlier internal naming:
+- command `pc` -> `cdp`
+- `.project_control/` -> `.cluster_dispatch/`
+- `.pcignore` -> `.cdpignore`
 
 ## Troubleshooting
 
-### `No active analysis set`
-Run:
+`No active analysis set`:
 
 ```bash
 cdp analysis use <path>
 ```
 
-### `Template missing required placeholders`
-Ensure your template includes:
-- `{cpus}`, `{memory}`, `{time}`, `{job_name}`, `{stdout}`, `{stderr}`, `{working_dir}`
-
-### `--queue is required ...`
-Your template references `{queue}` but neither:
-- `cdp analysis run --queue ...`, nor
-- target `default_queue`
-is set.
-
-### `Target '<name>' not found`
-Run:
+Target not found:
 
 ```bash
 cdp target list
-```
-
-and set one:
-
-```bash
 cdp target set <name>
 ```
 
-### `cdp analysis pull` says no tags found
-Tag paths first:
+Template placeholder errors:
+- ensure required placeholders exist
+- set `--queue` / `--parallel-environment` if template references them
 
-```bash
-cdp analysis tag <path-inside-active-analysis>
-```
+Local install smoke test in restricted network environments:
+- CI/packaging may require build backend dependencies (`setuptools`, `wheel`) available in your environment.
 
 ## Security notes
 
-- This tool executes remote commands via SSH.
-- Review templates and commands before running on shared systems.
-- Prefer least-privilege SSH keys and explicit host aliases.
-
-## Roadmap ideas
-
-- required-file preflight checks before run
-- richer status filtering (`--job-id`, `--state`)
-- retention policies for `.cluster_dispatch/jobs`
-- optional dry-run mode for sync and submit
+- Commands and scripts are executed locally or remotely via SSH.
+- Review templates and command strings before submission.
+- Use least-privilege credentials and hardened SSH config.
 
 ## Contributing
 
-Issues and PRs are welcome.
-
-If you propose behavior changes, include:
-- expected CLI UX,
-- compatibility impact,
-- migration behavior for existing config/state.
+- Open an issue/PR with expected CLI behavior and compatibility impact.
+- Release process checklist:
+  - [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md)
