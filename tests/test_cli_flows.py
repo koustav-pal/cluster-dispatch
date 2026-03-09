@@ -336,6 +336,20 @@ class TestClusterDispatchFlows(TestCase):
         self.assertFalse((jobs_dir / "fake_remote.json").exists())
         self.assertFalse((sync_dir / "fake_remote.json").exists())
 
+    def test_target_test_local(self) -> None:
+        result = _invoke(self.runner, self.project, ["target", "test", "local"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Summary:", result.output)
+        self.assertIn("[PASS] scheduler:", result.output)
+
+    def test_target_test_json_output(self) -> None:
+        result = _invoke(self.runner, self.project, ["target", "test", "local", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["summary"]["target"], "local")
+        self.assertIn("checks", payload)
+        self.assertTrue(payload["checks"])
+
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
         self.assertEqual(first.exit_code, 0, first.output)

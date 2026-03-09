@@ -1022,6 +1022,151 @@ def target_remove(
         typer.echo(f"Pruned records: jobs={pruned_jobs} sync={pruned_sync}")
 
 
+@target_app.command("test")
+def target_test(
+    name: str = typer.Argument(..., help="Target name", autocompletion=_complete_target_names),
+    remote: bool = typer.Option(True, "--remote/--no-remote", help="Include connectivity/scheduler probes"),
+    create_root: bool = typer.Option(
+        False, "--create-root", help="Create target remote_root if missing/inaccessible"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Render check results as JSON"),
+) -> None:
+    """Run focused connectivity and scheduler checks for one target."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if name not in cfg.targets:
+        raise typer.BadParameter(f"Target '{name}' not found")
+    tcfg = cfg.targets[name]
+
+    checks: list[dict[str, str]] = []
+
+    def _add(status: str, check: str, detail: str) -> None:
+        checks.append({"status": status, "check": check, "detail": detail})
+        if not as_json:
+            typer.echo(f"[{status}] {check}: {detail}")
+
+    scheduler_cmds: dict[str, list[str]] = {
+        "sge": ["qsub", "qstat", "qacct"],
+        "univa": ["qsub", "qstat", "qacct"],
+        "pbs": ["qsub", "qstat"],
+        "slurm": ["sbatch", "squeue", "sacct"],
+        "lsf": ["bsub", "bjobs", "bkill"],
+        "none": ["bash"],
+    }
+
+    if tcfg.scheduler not in {"sge", "univa", "pbs", "slurm", "lsf", "none"}:
+        _add("FAIL", "scheduler", f"Unsupported scheduler '{tcfg.scheduler}'")
+    else:
+        _add("PASS", "scheduler", tcfg.scheduler)
+
+    if not tcfg.remote_root:
+        _add("FAIL", "remote_root", "Missing remote_root")
+    elif not Path(tcfg.remote_root).is_absolute():
+        _add("FAIL", "remote_root", f"Not absolute: {tcfg.remote_root}")
+    else:
+        _add("PASS", "remote_root", tcfg.remote_root)
+
+    if tcfg.scheduler == "none" and not tcfg.template_header.strip():
+        _add("PASS", "template", "Skipped for scheduler=none with empty template")
+    else:
+        try:
+            _validate_template_variables(tcfg.template_header)
+            _add("PASS", "template", "Template placeholders valid")
+        except Exception as exc:
+            _add("FAIL", "template", str(exc))
+
+    if remote:
+        if _uses_local_transport(tcfg):
+            _add("PASS", "connectivity", "Skipped (local target mode)")
+            root_path = Path(tcfg.remote_root)
+            if root_path.is_dir():
+                _add("PASS", "remote_root_exists", tcfg.remote_root)
+            elif create_root:
+                try:
+                    root_path.mkdir(parents=True, exist_ok=True)
+                    _add("PASS", "remote_root_create", f"Created: {tcfg.remote_root}")
+                except Exception as exc:
+                    _add("FAIL", "remote_root_create", str(exc))
+            else:
+                _add("WARN", "remote_root_exists", f"Local root missing/inaccessible: {tcfg.remote_root}")
+
+            required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
+            if required_cmds:
+                missing = [c for c in required_cmds if shutil.which(c) is None]
+                if not missing:
+                    _add("PASS", "scheduler_cmds", ", ".join(required_cmds))
+                else:
+                    _add("WARN", "scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
+        else:
+            ssh_probe = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if ssh_probe.returncode == 0 and "cdp-ok" in ssh_probe.stdout:
+                _add("PASS", "connectivity", f"Connected to {tcfg.host}")
+            else:
+                _add("FAIL", "connectivity", ssh_probe.stderr.strip() or ssh_probe.stdout.strip() or "SSH failed")
+
+            if ssh_probe.returncode == 0 and "cdp-ok" in ssh_probe.stdout:
+                root_probe = subprocess.run(
+                    [
+                        "ssh",
+                        tcfg.host,
+                        "bash",
+                        "-lc",
+                        f"if [ -d {shlex.quote(tcfg.remote_root)} ]; then echo OK; else echo MISSING; fi",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if root_probe.returncode == 0 and root_probe.stdout.strip() == "OK":
+                    _add("PASS", "remote_root_exists", tcfg.remote_root)
+                elif create_root:
+                    create_probe = subprocess.run(
+                        ["ssh", tcfg.host, "mkdir", "-p", tcfg.remote_root],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if create_probe.returncode == 0:
+                        _add("PASS", "remote_root_create", f"Created: {tcfg.remote_root}")
+                    else:
+                        _add(
+                            "FAIL",
+                            "remote_root_create",
+                            create_probe.stderr.strip() or create_probe.stdout.strip() or "Failed to create remote root",
+                        )
+                else:
+                    _add("WARN", "remote_root_exists", f"Remote root missing/inaccessible: {tcfg.remote_root}")
+
+                required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
+                if required_cmds:
+                    cmd_probe = subprocess.run(
+                        ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if cmd_probe.returncode == 0:
+                        _add("PASS", "scheduler_cmds", ", ".join(required_cmds))
+                    else:
+                        _add("WARN", "scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
+
+    pass_count = len([c for c in checks if c["status"] == "PASS"])
+    warn_count = len([c for c in checks if c["status"] == "WARN"])
+    fail_count = len([c for c in checks if c["status"] == "FAIL"])
+    summary = {"target": name, "pass": pass_count, "warn": warn_count, "fail": fail_count}
+    if as_json:
+        typer.echo(json.dumps({"summary": summary, "checks": checks}, indent=2))
+    else:
+        typer.echo(f"Summary: PASS={pass_count} WARN={warn_count} FAIL={fail_count}")
+    if fail_count:
+        raise typer.Exit(code=1)
+
+
 @ignore_app.command("list")
 def ignore_list() -> None:
     """List .cdpignore patterns."""

@@ -180,6 +180,8 @@ cdp logs --job-name run001 --head 50
 cdp logs --follow
 cdp cancel --job-id 123456
 cdp cancel --job-name run001 --target cluster-a
+cdp target test local
+cdp target test cluster-a --json
 cdp retry --job-id 123456
 cdp retry --job-name run001 --dry-run
 cdp stats --job-id 123456
@@ -280,6 +282,13 @@ Removes a target configuration.
 - refuses removal when records reference the target unless `--force` is used
 - when removing current default target, uses fallback target (`local` by default) and requires `--force`
 - `--prune-records` deletes local job/sync records referencing the removed target
+
+### `cdp target test <name> [--remote/--no-remote] [--create-root] [--json]`
+Runs focused connectivity and scheduler checks for one target.
+- validates scheduler, remote_root, and scheduler template placeholders
+- with `--remote` (default): probes connectivity/root/scheduler commands
+- `--create-root` attempts to create missing target root
+- `--json` outputs machine-readable results
 
 ### `cdp ignore list`
 Lists ignore patterns from `.cdpignore`.
