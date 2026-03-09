@@ -9,6 +9,7 @@ import itertools
 import hashlib
 import base64
 import shutil
+import time
 from string import Formatter
 from datetime import datetime
 from pathlib import Path
@@ -1127,6 +1128,7 @@ def _submit_sweep_single(
     run_indexes: list[int],
     resources: dict[str, Any],
     base_job_name: str,
+    submit_delay_ms: int,
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
     local_target_mode = _uses_local_transport(target)
@@ -1137,7 +1139,7 @@ def _submit_sweep_single(
     adapter = get_adapter(target.scheduler)
     submitted_count = 0
 
-    for idx in run_indexes:
+    for offset, idx in enumerate(run_indexes):
         run = manifest["runs"][idx]
         run_slug = _slug_component(str(run["sweep_job"]))
         run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
@@ -1198,6 +1200,8 @@ def _submit_sweep_single(
             submitted_at=submitted_at,
         )
         submitted_count += 1
+        if offset < len(run_indexes) - 1:
+            time.sleep(submit_delay_ms / 1000.0)
     return submitted_count
 
 
@@ -1443,11 +1447,19 @@ def sweep_run(
     parallel_environment: Optional[str] = typer.Option(
         None, "--parallel-environment", help="Parallel environment (defaults to target setting if template needs it)"
     ),
+    submit_delay_ms: int = typer.Option(
+        5000,
+        "--submit-delay-ms",
+        min=5000,
+        help="Delay between submissions in single mode (minimum 5000 ms).",
+    ),
 ) -> None:
     """Run a sweep and persist manifest in .cluster_dispatch/sweeps."""
     mode_lc = mode.lower()
     if mode_lc not in {"single", "array", "local"}:
         raise typer.BadParameter("--mode must be one of: single, array, local")
+    if submit_delay_ms < 5000:
+        raise typer.BadParameter("--submit-delay-ms must be at least 5000")
     if not ctx.args:
         raise typer.BadParameter(
             "Provide a command template, e.g. cdp analysis sweep run --config sweep.yml python train.py --lr {lr}"
@@ -1526,6 +1538,7 @@ def sweep_run(
         "parallel_environment": resolved_pe or "",
     }
     manifest["resources"] = resources
+    manifest["submit_delay_ms"] = submit_delay_ms
     base_job_name = _slug_component(job_name or sweep_id)
     run_indexes = list(range(len(manifest["runs"])))
     if mode_lc == "single":
@@ -1538,6 +1551,7 @@ def sweep_run(
             run_indexes=run_indexes,
             resources=resources,
             base_job_name=base_job_name,
+            submit_delay_ms=submit_delay_ms,
         )
     elif mode_lc == "local":
         submitted = _submit_sweep_local(
@@ -1674,6 +1688,7 @@ def sweep_resume(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
             run_indexes=pending,
             resources=resources,
             base_job_name=base_job_name,
+            submit_delay_ms=max(5000, int(manifest.get("submit_delay_ms", 5000))),
         )
     elif mode == "local":
         submitted = _submit_sweep_local(

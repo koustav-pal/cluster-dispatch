@@ -282,6 +282,7 @@ Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.
 - deterministic `run_id` per run from block name + params + command template
 - manifests stored in `.cluster_dispatch/sweeps/<sweep_id>.json`
 - `single`: submit each run independently
+- `single` enforces a submission delay via `--submit-delay-ms` (default 5000, minimum 5000)
 - `array`: submit one scheduler array job (sge/univa/pbs/slurm/lsf) using TSV mapping + wrapper script
 - `local`: execute each run locally (no scheduler submission)
 - supports same runtime resource override flags as `cdp analysis run`
