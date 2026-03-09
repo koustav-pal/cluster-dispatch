@@ -473,6 +473,34 @@ class TestClusterDispatchFlows(TestCase):
         self.assertTrue((imported_dir / ".cluster_dispatch" / "config.yml").exists())
         self.assertTrue((imported_dir / ".cluster_dispatch" / "jobs").exists())
 
+    def test_watch_exits_on_terminal_state(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(9)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+
+        watch_result = _invoke(
+            self.runner,
+            self.project,
+            ["watch", "--interval", "1", "--max-polls", "20", "--no-log-tail"],
+        )
+        self.assertEqual(watch_result.exit_code, 0, watch_result.output)
+        self.assertIn("state=", watch_result.output)
+
+    def test_watch_timeout_returns_nonzero(self) -> None:
+        run_result = _invoke(
+            self.runner,
+            self.project,
+            ["analysis", "run", "python", "-c", "import time; time.sleep(3)"],
+        )
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+
+        watch_result = _invoke(
+            self.runner,
+            self.project,
+            ["watch", "--interval", "1", "--max-polls", "1", "--no-log-tail"],
+        )
+        self.assertNotEqual(watch_result.exit_code, 0)
+        self.assertIn("Watch timed out", watch_result.output)
+
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
         self.assertEqual(first.exit_code, 0, first.output)

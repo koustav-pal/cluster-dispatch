@@ -2868,6 +2868,48 @@ def _show_local_log(log_file: Path, follow: bool, head: Optional[int], tail: Opt
     typer.echo("\n".join(selected))
 
 
+def _fetch_log_tail(selected: dict[str, Any], cfg: ProjectConfig, project_root: Path, tail_lines: int) -> str:
+    selected_target = str(selected.get("target", ""))
+    remote_log_file = str(selected.get("remote_log_file", "")).strip()
+    if not remote_log_file:
+        return ""
+
+    submission_mode = str(selected.get("submission_mode", "")).strip().lower()
+    if submission_mode == "local" or (selected_target in cfg.targets and _uses_local_transport(cfg.targets[selected_target])):
+        local_log_path = Path(remote_log_file).expanduser()
+        if not local_log_path.is_absolute():
+            local_log_path = (project_root / local_log_path).resolve()
+        if not local_log_path.exists():
+            return ""
+        lines = local_log_path.read_text(errors="replace").splitlines()
+        if not lines:
+            return ""
+        return "\n".join(lines[-tail_lines:])
+
+    if selected_target not in cfg.targets:
+        return ""
+    host = cfg.targets[selected_target].host
+    proc = subprocess.run(
+        ["ssh", host, f"if [ -f {shlex.quote(remote_log_file)} ]; then tail -n {tail_lines} {shlex.quote(remote_log_file)}; fi"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.rstrip()
+
+
+def _is_failed_state(state: str) -> bool:
+    normalized = state.strip().upper()
+    if not normalized:
+        return False
+    failure_tokens = ("FAIL", "ERROR", "CANCEL", "TIMEOUT", "OOM", "NODE_FAIL", "PREEMPT")
+    if any(token in normalized for token in failure_tokens):
+        return True
+    return normalized in {"EXIT", "FAILED"}
+
+
 def _cancel_command_for_scheduler(scheduler: str, job_id: str) -> str:
     scheduler_lc = scheduler.lower()
     quoted_job_id = shlex.quote(job_id)
@@ -3077,6 +3119,93 @@ def logs(
         typer.echo(f"No log output found at {remote_log_file}")
         return
     typer.echo(proc.stdout.rstrip())
+
+
+@app.command("watch")
+def watch(
+    interval: int = typer.Option(15, "--interval", min=1, help="Polling interval in seconds"),
+    max_polls: int = typer.Option(0, "--max-polls", min=0, help="Maximum polls before timeout (0 = unlimited)"),
+    show_log_tail: bool = typer.Option(True, "--log-tail/--no-log-tail", help="Show log tail on each poll"),
+    tail_lines: int = typer.Option(20, "--tail-lines", min=1, help="Number of log lines to display"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by target name", autocompletion=_complete_target_names
+    ),
+    job_id: Optional[str] = typer.Option(None, "--job-id", help="Filter by exact job id", autocompletion=_complete_job_ids),
+    job_name: Optional[str] = typer.Option(
+        None, "--job-name", help="Filter by exact job name", autocompletion=_complete_job_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by exact analysis path", autocompletion=_complete_record_analyses
+    ),
+) -> None:
+    """Poll status (and optional log tail) until selected job reaches a terminal state."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if target and target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{target}' not found")
+
+    selected = _resolve_log_job(
+        project_root=project_root,
+        cfg=cfg,
+        target=target,
+        job_id=job_id,
+        job_name=job_name,
+        analysis=analysis,
+    )
+
+    selected_target = str(selected.get("target", "")).strip()
+    selected_scheduler = str(selected.get("scheduler", "")).strip()
+    selected_job_id = str(selected.get("job_id", "")).strip()
+    if not selected_target or not selected_scheduler or not selected_job_id:
+        raise typer.BadParameter("Selected job record is missing target/scheduler/job_id metadata")
+    if selected_target not in cfg.targets:
+        raise typer.BadParameter(f"Target '{selected_target}' from selected job is not configured")
+    target_cfg = cfg.targets[selected_target]
+
+    record_file = Path(str(selected.get("_record_file", ""))) if selected.get("_record_file") else None
+    polls = 0
+    while True:
+        polls += 1
+        current_state = ""
+        if record_file and record_file.exists():
+            try:
+                payload = json.loads(record_file.read_text())
+            except json.JSONDecodeError:
+                payload = dict(selected)
+            current_state = _resolve_and_persist_job_state(
+                cfg=cfg,
+                job_file=record_file,
+                payload=payload,
+                job_id=selected_job_id,
+                target_name=selected_target,
+                scheduler=selected_scheduler,
+            )
+            selected = payload
+        else:
+            adapter = get_adapter(selected_scheduler)
+            current_state = adapter.status(target_cfg.host, selected_job_id, transport=target_cfg.transport).state
+
+        now = datetime.now().isoformat(timespec="seconds")
+        typer.echo(
+            f"[{now}] job_id={selected_job_id} job_name={selected.get('job_name', '')} "
+            f"target={selected_target} state={current_state}"
+        )
+
+        if show_log_tail:
+            tail_blob = _fetch_log_tail(selected, cfg, project_root, tail_lines=tail_lines)
+            if tail_blob:
+                typer.echo("--- log tail ---")
+                typer.echo(tail_blob)
+
+        if not _is_running_state(current_state):
+            if _is_failed_state(current_state):
+                raise typer.Exit(code=1)
+            return
+
+        if max_polls and polls >= max_polls:
+            typer.echo("Watch timed out before reaching a terminal state")
+            raise typer.Exit(code=1)
+        time.sleep(interval)
 
 
 @app.command("history")

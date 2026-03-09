@@ -213,6 +213,8 @@ cdp report
 cdp report --target cluster-a --days 7 --json
 cdp export --output backup.tar.gz --jobs --sync --sweeps
 cdp import backup.tar.gz --overwrite
+cdp watch --job-id 123456
+cdp watch --job-name run001 --interval 10 --no-log-tail
 cdp analysis pull
 ```
 
@@ -472,6 +474,10 @@ Exports project metadata into a tar.gz bundle.
 
 ### `cdp import <bundle.tar.gz> [--overwrite] [--jobs/--no-jobs] [--sync/--no-sync] [--sweeps/--no-sweeps]`
 Imports project metadata bundle into current directory.
+
+### `cdp watch [selectors] [--interval N] [--max-polls N] [--log-tail/--no-log-tail]`
+Polls status until selected job reaches terminal state, optionally showing log tail.
+- exits non-zero for failure states or timeout
 
 ## Files and state
 
