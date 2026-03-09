@@ -131,6 +131,12 @@ Using target defaults only:
 cdp analysis run python train.py --epochs 20
 ```
 
+Preview without making changes:
+
+```bash
+cdp analysis run --dry-run python train.py --epochs 20
+```
+
 Override resources at runtime:
 
 ```bash
@@ -289,6 +295,7 @@ Syncs active analysis to remote, renders template, submits job.
 - supports `--profile <name>` for built-in or user-defined profiles
 - assigns a deterministic `run_id` from command + target + analysis + resolved resources (stored in state + job records)
 - stores `pc_submit.sh`, `run.log`, and scheduler stdout/stderr under `<remote_analysis_root>/<run_id>/`
+- `--dry-run` validates configuration and previews sync/submission steps with no file sync, no submission, and no state/job-record updates
 
 ### `cdp analysis sweep run --config <yaml> [--job <name>] [--mode single|array|local] <command...>`
 Submits cartesian sweep jobs from YAML `params` blocks with persisted manifests.

@@ -2059,6 +2059,11 @@ def analysis_list(
 @analysis_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
     ctx: typer.Context,
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Validate configuration and print planned execution without syncing/submitting/writing state",
+    ),
     profile: Optional[str] = typer.Option(
         None,
         "--profile",
@@ -2152,23 +2157,6 @@ def run(
     resolved_stdout = f"{remote_run_dir}/stdout"
     resolved_stderr = f"{remote_run_dir}/stderr"
 
-    project_ignore = _ignore_file(project_root)
-    local_target_mode = _uses_local_transport(target)
-    if local_target_mode:
-        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
-        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
-
-    rsync_cmd = ["rsync", "-az", "--delete"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    if local_target_mode:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
-    else:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
-    _run_cmd(rsync_cmd)
-
     submit_script = _build_submit_script(
         header=_render_scheduler_header(
             target.template_header,
@@ -2187,6 +2175,50 @@ def run(
         working_dir=resolved_working_dir,
         remote_log_file=remote_log_file,
     )
+
+    project_ignore = _ignore_file(project_root)
+    local_target_mode = _uses_local_transport(target)
+    if dry_run:
+        typer.echo("Dry run: no changes will be made")
+        typer.echo("")
+        typer.echo(f"Project root: {project_root}")
+        typer.echo(f"Analysis: {analysis_rel}")
+        typer.echo(f"Target: {target_name}")
+        typer.echo(f"Scheduler: {target.scheduler}")
+        typer.echo(f"Remote path: {remote_analysis_root}")
+        if project_ignore.exists():
+            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} detected")
+        else:
+            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} not found")
+        typer.echo(f"Command: {command}")
+        typer.echo("")
+        typer.echo("Planned actions:")
+        typer.echo("1. Sync analysis directory to remote target")
+        typer.echo("2. Prepare scheduler submission")
+        typer.echo("3. Submit job to scheduler")
+        typer.echo("4. Record job metadata locally")
+        typer.echo("")
+        typer.echo("Submission script preview:")
+        for line in submit_script.splitlines()[:16]:
+            typer.echo(line)
+        if len(submit_script.splitlines()) > 16:
+            typer.echo("...")
+        return
+
+    if local_target_mode:
+        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
+        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
+
+    rsync_cmd = ["rsync", "-az", "--delete"]
+    if project_ignore.exists():
+        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
+    if local_target_mode:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
+    else:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
+    _run_cmd(rsync_cmd)
 
     if local_target_mode:
         submit_path = Path(remote_submit_script)
