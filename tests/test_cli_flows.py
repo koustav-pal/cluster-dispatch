@@ -211,3 +211,104 @@ class TestClusterDispatchFlows(TestCase):
         self.assertEqual(payload.get("target"), "local")
         self.assertIn("source", payload)
         self.assertIn("destination", payload)
+
+    def test_target_remove_default_requires_force(self) -> None:
+        template = self.project / "none.tmpl"
+        template.write_text(
+            "# job={job_name}\n"
+            "# out={stdout}\n"
+            "# err={stderr}\n"
+            "# cpus={cpus}\n"
+            "# mem={memory}\n"
+            "# time={time}\n"
+            "# wd={working_dir}\n"
+            "# node={node}\n"
+        )
+
+        add_result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target",
+                "add",
+                "remote-a",
+                "--transport",
+                "ssh",
+                "--host",
+                "example.org",
+                "--scheduler",
+                "none",
+                "--remote-root",
+                "/tmp/remote-a",
+                "--template-file",
+                str(template),
+            ],
+        )
+        self.assertEqual(add_result.exit_code, 0, add_result.output)
+        set_result = _invoke(self.runner, self.project, ["target", "set", "remote-a"])
+        self.assertEqual(set_result.exit_code, 0, set_result.output)
+
+        blocked = _invoke(self.runner, self.project, ["target", "remove", "remote-a"])
+        self.assertNotEqual(blocked.exit_code, 0)
+        self.assertIn("currently the default target", blocked.output)
+
+        forced = _invoke(self.runner, self.project, ["target", "remove", "remote-a", "--force"])
+        self.assertEqual(forced.exit_code, 0, forced.output)
+        self.assertIn("Removed target 'remote-a'", forced.output)
+
+    def test_target_remove_prune_records(self) -> None:
+        template = self.project / "none2.tmpl"
+        template.write_text(
+            "# job={job_name}\n"
+            "# out={stdout}\n"
+            "# err={stderr}\n"
+            "# cpus={cpus}\n"
+            "# mem={memory}\n"
+            "# time={time}\n"
+            "# wd={working_dir}\n"
+            "# node={node}\n"
+        )
+        add_result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target",
+                "add",
+                "remote-b",
+                "--transport",
+                "ssh",
+                "--host",
+                "example.org",
+                "--scheduler",
+                "none",
+                "--remote-root",
+                "/tmp/remote-b",
+                "--template-file",
+                str(template),
+            ],
+        )
+        self.assertEqual(add_result.exit_code, 0, add_result.output)
+
+        jobs_dir = self.project / ".cluster_dispatch" / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        (jobs_dir / "fake_remote.json").write_text(
+            json.dumps({"target": "remote-b", "job_id": "x1", "job_name": "n1"}, indent=2)
+        )
+        sync_dir = self.project / ".cluster_dispatch" / "sync"
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        (sync_dir / "fake_remote.json").write_text(
+            json.dumps({"target": "remote-b", "action": "push"}, indent=2)
+        )
+
+        blocked = _invoke(self.runner, self.project, ["target", "remove", "remote-b"])
+        self.assertNotEqual(blocked.exit_code, 0)
+        self.assertIn("Use --force to remove", blocked.output)
+
+        removed = _invoke(
+            self.runner,
+            self.project,
+            ["target", "remove", "remote-b", "--force", "--prune-records"],
+        )
+        self.assertEqual(removed.exit_code, 0, removed.output)
+        self.assertFalse((jobs_dir / "fake_remote.json").exists())
+        self.assertFalse((sync_dir / "fake_remote.json").exists())

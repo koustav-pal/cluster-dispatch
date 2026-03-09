@@ -926,6 +926,87 @@ def target_list() -> None:
         typer.echo(f"{marker} {name}: host={t.host} transport={t.transport} scheduler={t.scheduler}")
 
 
+@target_app.command("remove")
+def target_remove(
+    name: str = typer.Argument(..., help="Target name", autocompletion=_complete_target_names),
+    force: bool = typer.Option(False, "--force", help="Force removal even if records reference this target"),
+    fallback_target: Optional[str] = typer.Option(
+        None, "--fallback-target", help="Target to become default if removing the current default target"
+    ),
+    prune_records: bool = typer.Option(
+        False, "--prune-records", help="Delete local job/sync records that reference the removed target"
+    ),
+) -> None:
+    """Remove a target configuration."""
+    if name.strip().lower() == "local":
+        raise typer.BadParameter("Target 'local' is managed by cdp init and cannot be removed")
+
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    if name not in cfg.targets:
+        raise typer.BadParameter(f"Target '{name}' not found")
+
+    jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
+    job_files_to_prune: list[Path] = []
+    if jobs_dir.exists():
+        for job_file in jobs_dir.glob("*.json"):
+            try:
+                payload = json.loads(job_file.read_text())
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("target", "")) == name:
+                job_files_to_prune.append(job_file)
+
+    sync_dir = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
+    sync_files_to_prune: list[Path] = []
+    if sync_dir.exists():
+        for sync_file in sync_dir.glob("*.json"):
+            try:
+                payload = json.loads(sync_file.read_text())
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("target", "")) == name:
+                sync_files_to_prune.append(sync_file)
+
+    if (job_files_to_prune or sync_files_to_prune) and not force:
+        raise typer.BadParameter(
+            f"Target '{name}' is referenced by {len(job_files_to_prune)} job record(s) and "
+            f"{len(sync_files_to_prune)} sync record(s). Use --force to remove."
+        )
+
+    if cfg.default_target == name:
+        chosen_fallback = fallback_target or "local"
+        if chosen_fallback == name:
+            raise typer.BadParameter("--fallback-target cannot be the same as the removed target")
+        if chosen_fallback not in cfg.targets:
+            raise typer.BadParameter(f"Fallback target '{chosen_fallback}' not found")
+        if not force:
+            raise typer.BadParameter(
+                f"Target '{name}' is currently the default target. Use --force to remove it. "
+                f"Fallback target would be '{chosen_fallback}'."
+            )
+        cfg.default_target = chosen_fallback
+
+    del cfg.targets[name]
+    save_config(project_root, cfg)
+
+    pruned_jobs = 0
+    pruned_sync = 0
+    if prune_records:
+        for path in job_files_to_prune:
+            path.unlink(missing_ok=True)
+            pruned_jobs += 1
+        for path in sync_files_to_prune:
+            path.unlink(missing_ok=True)
+            pruned_sync += 1
+
+    typer.echo(f"Removed target '{name}'")
+    if cfg.default_target:
+        typer.echo(f"Default target: {cfg.default_target}")
+    if prune_records:
+        typer.echo(f"Pruned records: jobs={pruned_jobs} sync={pruned_sync}")
+
+
 @ignore_app.command("list")
 def ignore_list() -> None:
     """List .cdpignore patterns."""

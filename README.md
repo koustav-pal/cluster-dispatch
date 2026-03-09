@@ -270,6 +270,13 @@ Key options:
 ### `cdp target set <name>`
 Sets active default target.
 
+### `cdp target remove <name> [--force] [--fallback-target <name>] [--prune-records]`
+Removes a target configuration.
+- `local` cannot be removed
+- refuses removal when records reference the target unless `--force` is used
+- when removing current default target, uses fallback target (`local` by default) and requires `--force`
+- `--prune-records` deletes local job/sync records referencing the removed target
+
 ### `cdp ignore list`
 Lists ignore patterns from `.cdpignore`.
 
