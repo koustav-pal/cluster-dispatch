@@ -327,7 +327,8 @@ class TestClusterDispatchFlows(TestCase):
 
         blocked = _invoke(self.runner, self.project, ["target", "remove", "remote-b"])
         self.assertNotEqual(blocked.exit_code, 0)
-        self.assertIn("Use --force to remove", blocked.output)
+        self.assertIn("referenced by", blocked.output)
+        self.assertIn("force", blocked.output)
 
         removed = _invoke(
             self.runner,
