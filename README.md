@@ -400,7 +400,13 @@ All metadata is under project root `.cluster_dispatch/`:
 - `.cluster_dispatch/state.json`:
   last submitted job
 - `.cluster_dispatch/jobs/*.json`:
-  per-run job records (all launches are preserved)
+  canonical per-job provenance records (all launches are preserved).
+  Normal runs and sweep child runs both write here.
+  Common fields include identity, command, resources, paths, sync metadata, environment, and optional Git metadata.
+  Identity semantics:
+  - `run_id`: deterministic run-definition identity
+  - `job_id`: scheduler/local execution identity
+  - `sweep_id`: parent sweep identity (sweep jobs only)
 - `.cluster_dispatch/templates/scheduler_header.tmpl`:
   active scheduler template
 

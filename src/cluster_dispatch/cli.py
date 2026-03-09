@@ -5,11 +5,14 @@ import secrets
 import subprocess
 import json
 import re
+import sys
+import socket
 import itertools
 import hashlib
 import base64
 import shutil
 import time
+from importlib.metadata import PackageNotFoundError, version
 from string import Formatter
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +152,116 @@ def get_git_info(project_root: Path) -> Optional[dict[str, Any]]:
         "head": head_proc.stdout.strip() if head_proc.returncode == 0 else "",
         "dirty": bool(dirty_proc.stdout.strip()) if dirty_proc.returncode == 0 else False,
     }
+
+
+def _cluster_dispatch_version() -> Optional[str]:
+    try:
+        return version("cluster-dispatch")
+    except PackageNotFoundError:
+        return None
+
+
+def _build_job_record(
+    *,
+    project_root: Path,
+    submitted_at: str,
+    analysis: Optional[str],
+    analysis_tags: list[str],
+    target_name: str,
+    scheduler: str,
+    job_id: str,
+    run_id: str,
+    job_name: str,
+    state: str,
+    command: str,
+    remote_run_dir: str,
+    remote_log_file: str,
+    working_dir: str,
+    cpus: Optional[int],
+    memory: Optional[str],
+    walltime: Optional[str],
+    node: Optional[str],
+    queue: Optional[str],
+    parallel_environment: Optional[str],
+    profile_name: Optional[str],
+    submit_script_path: Optional[str],
+    submission_mode: str,
+    sync_source: Optional[str],
+    sync_destination: Optional[str],
+    ignore_file_path: Optional[str],
+    ignore_used: bool,
+    sweep_fields: Optional[dict[str, Any]] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "submitted_at": submitted_at,
+        "analysis": analysis,
+        "analysis_tags": analysis_tags,
+        "target": target_name,
+        "scheduler": scheduler,
+        "job_id": job_id,
+        "run_id": run_id,
+        "job_name": job_name,
+        "state": state,
+        "stdout": job_name,
+        "stderr": job_name,
+        "working_dir": working_dir,
+        "cpus": cpus,
+        "memory": memory,
+        "time": walltime,
+        "queue": queue,
+        "parallel_environment": parallel_environment,
+        "node": node,
+        "command": command,
+        "command_resolved": command,
+        "remote_run_dir": remote_run_dir,
+        "remote_log_file": remote_log_file,
+        "submission_mode": submission_mode,
+        "record_version": 2,
+        "resources": {
+            "profile": profile_name,
+            "cpus": cpus,
+            "memory": memory,
+            "time": walltime,
+            "node": node,
+            "queue": queue,
+            "parallel_environment": parallel_environment,
+        },
+        "paths": {
+            "project_root": str(project_root),
+            "analysis_local_path": sync_source,
+            "analysis_remote_path": sync_destination,
+            "remote_run_dir": remote_run_dir,
+            "remote_log_file": remote_log_file,
+            "submit_script": submit_script_path,
+            "working_dir": working_dir,
+        },
+        "sync": {
+            "ignore_file": ignore_file_path,
+            "ignore_detected": bool(ignore_file_path),
+            "ignore_used": ignore_used,
+            "source": sync_source,
+            "destination": sync_destination,
+        },
+        "environment": {
+            "cluster_dispatch_version": _cluster_dispatch_version(),
+            "python_version": sys.version.split()[0],
+            "hostname": socket.gethostname(),
+        },
+    }
+    git_info = get_git_info(project_root)
+    if git_info is not None:
+        record["git"] = {
+            "repo_root": git_info.get("repo_root"),
+            "branch": git_info.get("branch"),
+            "commit": git_info.get("head"),
+            "dirty": git_info.get("dirty"),
+        }
+    if sweep_fields:
+        record.update(sweep_fields)
+    if extra:
+        record.update(extra)
+    return record
 
 
 def _require_active_analysis(cfg: ProjectConfig, project_root: Path) -> Path:
@@ -1157,6 +1270,12 @@ def _append_sweep_job_record(
     run: dict[str, Any],
     remote_sweep_dir: str,
     remote_log_file: str,
+    submit_script_path: Optional[str],
+    sync_source: Optional[str],
+    sync_destination: Optional[str],
+    ignore_file_path: Optional[str],
+    ignore_used: bool,
+    profile_name: Optional[str],
     submitted_at: str,
     scheduler_override: Optional[str] = None,
     state_override: Optional[str] = None,
@@ -1165,34 +1284,41 @@ def _append_sweep_job_record(
     state_value = state_override or "RUNNING_OR_QUEUED"
     append_job_record(
         project_root,
-        {
-            "submitted_at": submitted_at,
-            "analysis": cfg.active_analysis,
-            "analysis_tags": cfg.analysis_tags.get(cfg.active_analysis or "", []),
-            "target": target_name,
-            "scheduler": scheduler_value,
-            "job_id": run.get("job_id", ""),
-            "job_name": run.get("job_name", ""),
-            "state": state_value,
-            "stdout": run.get("job_name", ""),
-            "stderr": run.get("job_name", ""),
-            "working_dir": target.remote_root,
-            "cpus": run.get("resources", {}).get("cpus"),
-            "memory": run.get("resources", {}).get("memory"),
-            "time": run.get("resources", {}).get("time"),
-            "queue": run.get("resources", {}).get("queue"),
-            "parallel_environment": run.get("resources", {}).get("parallel_environment"),
-            "node": run.get("resources", {}).get("node"),
-            "command": run.get("command", ""),
-            "remote_run_dir": remote_sweep_dir,
-            "remote_log_file": remote_log_file,
-            "sweep_id": sweep_id,
-            "run_id": run.get("run_id", ""),
-            "sweep_job": run.get("sweep_job", ""),
-            "sweep_index": run.get("sweep_index"),
-            "sweep_params": run.get("sweep_params", {}),
-            "submission_mode": submission_mode,
-        },
+        _build_job_record(
+            project_root=project_root,
+            submitted_at=submitted_at,
+            analysis=cfg.active_analysis,
+            analysis_tags=cfg.analysis_tags.get(cfg.active_analysis or "", []),
+            target_name=target_name,
+            scheduler=scheduler_value,
+            job_id=str(run.get("job_id", "")),
+            run_id=str(run.get("run_id", "")),
+            job_name=str(run.get("job_name", "")),
+            state=state_value,
+            command=str(run.get("command", "")),
+            remote_run_dir=remote_sweep_dir,
+            remote_log_file=remote_log_file,
+            working_dir=target.remote_root,
+            cpus=run.get("resources", {}).get("cpus"),
+            memory=run.get("resources", {}).get("memory"),
+            walltime=run.get("resources", {}).get("time"),
+            node=run.get("resources", {}).get("node"),
+            queue=run.get("resources", {}).get("queue"),
+            parallel_environment=run.get("resources", {}).get("parallel_environment"),
+            profile_name=profile_name,
+            submit_script_path=submit_script_path,
+            submission_mode=submission_mode,
+            sync_source=sync_source,
+            sync_destination=sync_destination,
+            ignore_file_path=ignore_file_path,
+            ignore_used=ignore_used,
+            sweep_fields={
+                "sweep_id": sweep_id,
+                "sweep_job": run.get("sweep_job", ""),
+                "sweep_index": run.get("sweep_index"),
+                "sweep_params": run.get("sweep_params", {}),
+            },
+        ),
     )
 
 
@@ -1221,6 +1347,13 @@ def _submit_sweep_single(
     submit_delay_ms: int,
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
+    analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
+    sync_destination = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
+    ignore_path = _ignore_file(project_root)
+    ignore_file_path = str(ignore_path) if ignore_path.exists() else None
+    ignore_used = bool(ignore_file_path)
+    profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
     local_target_mode = _uses_local_transport(target)
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
@@ -1287,6 +1420,12 @@ def _submit_sweep_single(
             run=run,
             remote_sweep_dir=remote_sweep_dir,
             remote_log_file=remote_log_file,
+            submit_script_path=remote_submit_script,
+            sync_source=sync_source,
+            sync_destination=sync_destination,
+            ignore_file_path=ignore_file_path,
+            ignore_used=ignore_used,
+            profile_name=profile_name,
             submitted_at=submitted_at,
         )
         submitted_count += 1
@@ -1328,6 +1467,13 @@ def _submit_sweep_array(
         return 0
 
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
+    analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
+    sync_destination = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
+    ignore_path = _ignore_file(project_root)
+    ignore_file_path = str(ignore_path) if ignore_path.exists() else None
+    ignore_used = bool(ignore_file_path)
+    profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
     local_target_mode = _uses_local_transport(target)
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
@@ -1448,6 +1594,12 @@ def _submit_sweep_array(
             run=run,
             remote_sweep_dir=remote_sweep_dir,
             remote_log_file=remote_log_file,
+            submit_script_path=remote_array_submit,
+            sync_source=sync_source,
+            sync_destination=sync_destination,
+            ignore_file_path=ignore_file_path,
+            ignore_used=ignore_used,
+            profile_name=profile_name,
             submitted_at=submitted_at,
         )
     return len(run_indexes)
@@ -1464,6 +1616,13 @@ def _submit_sweep_local(
     base_job_name: str,
 ) -> int:
     local_sweep_dir = _sweeps_dir(project_root) / str(manifest["sweep_id"])
+    analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
+    sync_destination = str((project_root / analysis_rel).resolve()) if analysis_rel else str(project_root)
+    ignore_path = _ignore_file(project_root)
+    ignore_file_path = str(ignore_path) if ignore_path.exists() else None
+    ignore_used = False
+    profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
     local_sweep_dir.mkdir(parents=True, exist_ok=True)
     submitted_count = 0
 
@@ -1504,6 +1663,12 @@ def _submit_sweep_local(
             run=run,
             remote_sweep_dir=str(local_sweep_dir),
             remote_log_file=str(local_log_file),
+            submit_script_path=None,
+            sync_source=sync_source,
+            sync_destination=sync_destination,
+            ignore_file_path=ignore_file_path,
+            ignore_used=ignore_used,
+            profile_name=profile_name,
             submitted_at=submitted_at,
             scheduler_override="none",
             state_override=run["status"],
@@ -1620,6 +1785,7 @@ def sweep_run(
     _save_sweep_manifest(project_root, manifest)
 
     resources = {
+        "profile": profile,
         "cpus": resolved_cpus,
         "memory": resolved_memory,
         "time": resolved_time,
@@ -2197,6 +2363,7 @@ def run(
         typer.echo("2. Prepare scheduler submission")
         typer.echo("3. Submit job to scheduler")
         typer.echo("4. Record job metadata locally")
+        typer.echo("Record preview: includes identity, resources, paths, sync, environment, and optional git metadata")
         typer.echo("")
         typer.echo("Submission script preview:")
         for line in submit_script.splitlines()[:16]:
@@ -2256,29 +2423,39 @@ def run(
 
     append_job_record(
         project_root,
-        {
-            "submitted_at": now,
-            "analysis": cfg.active_analysis,
-            "analysis_tags": cfg.analysis_tags.get(cfg.active_analysis or "", []),
-            "target": target_name,
-            "scheduler": target.scheduler,
-            "job_id": job_id,
-            "run_id": run_id,
-            "job_name": resolved_job_name,
-            "state": ("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
-            "stdout": resolved_stdout,
-            "stderr": resolved_stderr,
-            "working_dir": resolved_working_dir,
-            "cpus": resolved_cpus,
-            "memory": resolved_memory,
-            "time": resolved_time,
-            "queue": resolved_queue,
-            "parallel_environment": resolved_parallel_environment,
-            "node": resolved_node,
-            "command": command,
-            "remote_run_dir": remote_run_dir,
-            "remote_log_file": remote_log_file,
-        },
+        _build_job_record(
+            project_root=project_root,
+            submitted_at=now,
+            analysis=cfg.active_analysis,
+            analysis_tags=cfg.analysis_tags.get(cfg.active_analysis or "", []),
+            target_name=target_name,
+            scheduler=target.scheduler,
+            job_id=job_id,
+            run_id=run_id,
+            job_name=resolved_job_name,
+            state=("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
+            command=command,
+            remote_run_dir=remote_run_dir,
+            remote_log_file=remote_log_file,
+            working_dir=resolved_working_dir,
+            cpus=resolved_cpus,
+            memory=resolved_memory,
+            walltime=resolved_time,
+            node=resolved_node,
+            queue=resolved_queue,
+            parallel_environment=resolved_parallel_environment,
+            profile_name=profile,
+            submit_script_path=remote_submit_script,
+            submission_mode="single",
+            sync_source=str(analysis_dir.resolve()),
+            sync_destination=remote_analysis_root,
+            ignore_file_path=(str(project_ignore) if project_ignore.exists() else None),
+            ignore_used=project_ignore.exists(),
+            extra={
+                "stdout": resolved_stdout,
+                "stderr": resolved_stderr,
+            },
+        ),
     )
 
     typer.echo(f"Submitted job_id={job_id} target={target_name}")
