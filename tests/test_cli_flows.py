@@ -408,6 +408,29 @@ class TestClusterDispatchFlows(TestCase):
         self.assertFalse(old_sync.exists())
         self.assertTrue(new_job.exists())
 
+    def test_report_text_output(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(2)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        sync_result = _invoke(self.runner, self.project, ["sync", "push"])
+        self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+
+        report_result = _invoke(self.runner, self.project, ["report"])
+        self.assertEqual(report_result.exit_code, 0, report_result.output)
+        self.assertIn("Run report:", report_result.output)
+        self.assertIn("Jobs:", report_result.output)
+        self.assertIn("Sync events:", report_result.output)
+
+    def test_report_json_output(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(3)"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        report_result = _invoke(self.runner, self.project, ["report", "--json"])
+        self.assertEqual(report_result.exit_code, 0, report_result.output)
+        payload = json.loads(report_result.output)
+        self.assertIn("jobs_total", payload)
+        self.assertIn("sync_total", payload)
+        self.assertIn("jobs_by_state", payload)
+        self.assertIn("resources", payload)
+
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
         self.assertEqual(first.exit_code, 0, first.output)

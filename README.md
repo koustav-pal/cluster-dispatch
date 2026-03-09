@@ -209,6 +209,8 @@ cdp config show
 cdp config export --format yaml
 cdp cleanup records --dry-run --older-than-days 30 --keep-last 200
 cdp cleanup records --apply --jobs --sync --target cluster-a
+cdp report
+cdp report --target cluster-a --days 7 --json
 cdp analysis pull
 ```
 
@@ -455,6 +457,13 @@ Cleans local metadata with retention/filter controls.
 - filters: `--target`, `--analysis`
 - mode: default `--dry-run`; use `--apply` to delete
 - reporting: `--json` for machine-readable summary
+
+### `cdp report [--target ...] [--analysis ...] [--days N] [--json]`
+Builds an operational summary from local job and sync records.
+- job counts by state/scheduler/target
+- recent failures
+- sync activity summary
+- lightweight resource usage summary from recorded request fields
 
 ## Files and state
 

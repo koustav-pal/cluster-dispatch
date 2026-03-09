@@ -3106,6 +3106,155 @@ def history(
         )
 
 
+@app.command("report")
+def report(
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Filter by target name", autocompletion=_complete_target_names
+    ),
+    analysis: Optional[str] = typer.Option(
+        None, "--analysis", help="Filter by analysis path", autocompletion=_complete_record_analyses
+    ),
+    days: Optional[int] = typer.Option(None, "--days", min=0, help="Include only records from last N days"),
+    as_json: bool = typer.Option(False, "--json", help="Render report as JSON"),
+) -> None:
+    """Summarize recent run and sync activity from local records."""
+    project_root = _project_root()
+    job_records = _load_job_records(project_root)
+    sync_events = _load_sync_events(project_root)
+    cutoff = datetime.now() - timedelta(days=days) if days is not None else None
+
+    def _job_match(rec: dict[str, Any]) -> bool:
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        if cutoff is not None:
+            ts = _parse_iso_ts(rec.get("submitted_at"))
+            if ts is None or ts < cutoff:
+                return False
+        return True
+
+    def _sync_match(rec: dict[str, Any]) -> bool:
+        if target and str(rec.get("target", "")) != target:
+            return False
+        if analysis and str(rec.get("analysis", "")) != analysis:
+            return False
+        if cutoff is not None:
+            ts = _parse_iso_ts(rec.get("recorded_at"))
+            if ts is None or ts < cutoff:
+                return False
+        return True
+
+    jobs = [rec for rec in job_records if _job_match(rec)]
+    syncs = [rec for rec in sync_events if _sync_match(rec)]
+
+    by_state: dict[str, int] = {}
+    by_scheduler: dict[str, int] = {}
+    by_target: dict[str, int] = {}
+    for rec in jobs:
+        state = str(rec.get("state", "UNKNOWN")) or "UNKNOWN"
+        scheduler = str(rec.get("scheduler", "UNKNOWN")) or "UNKNOWN"
+        tname = str(rec.get("target", "UNKNOWN")) or "UNKNOWN"
+        by_state[state] = by_state.get(state, 0) + 1
+        by_scheduler[scheduler] = by_scheduler.get(scheduler, 0) + 1
+        by_target[tname] = by_target.get(tname, 0) + 1
+
+    failures = []
+    for rec in jobs:
+        state = str(rec.get("state", "")).upper()
+        if "FAIL" in state or state in {"EXIT", "FAILED"}:
+            failures.append(
+                {
+                    "submitted_at": rec.get("submitted_at"),
+                    "job_id": rec.get("job_id"),
+                    "job_name": rec.get("job_name"),
+                    "target": rec.get("target"),
+                    "analysis": rec.get("analysis"),
+                    "state": rec.get("state"),
+                }
+            )
+    failures = failures[:10]
+
+    sync_by_action: dict[str, int] = {}
+    for event in syncs:
+        action = str(event.get("action", "unknown")) or "unknown"
+        sync_by_action[action] = sync_by_action.get(action, 0) + 1
+
+    memory_top: dict[str, int] = {}
+    walltime_top: dict[str, int] = {}
+    cpus_values: list[int] = []
+    for rec in jobs:
+        resources = rec.get("resources", {})
+        cpus_raw = rec.get("cpus")
+        memory_raw = rec.get("memory")
+        time_raw = rec.get("time")
+        if isinstance(resources, dict):
+            cpus_raw = resources.get("cpus", cpus_raw)
+            memory_raw = resources.get("memory", memory_raw)
+            time_raw = resources.get("time", time_raw)
+        try:
+            if cpus_raw is not None:
+                cpus_values.append(int(cpus_raw))
+        except Exception:
+            pass
+        if memory_raw:
+            key = str(memory_raw)
+            memory_top[key] = memory_top.get(key, 0) + 1
+        if time_raw:
+            key = str(time_raw)
+            walltime_top[key] = walltime_top.get(key, 0) + 1
+
+    avg_cpus = round(sum(cpus_values) / len(cpus_values), 2) if cpus_values else None
+    top_memory = sorted(memory_top.items(), key=lambda x: (-x[1], x[0]))[:5]
+    top_walltime = sorted(walltime_top.items(), key=lambda x: (-x[1], x[0]))[:5]
+
+    payload = {
+        "filters": {"target": target, "analysis": analysis, "days": days},
+        "jobs_total": len(jobs),
+        "sync_total": len(syncs),
+        "jobs_by_state": by_state,
+        "jobs_by_scheduler": by_scheduler,
+        "jobs_by_target": by_target,
+        "recent_failures": failures,
+        "sync_by_action": sync_by_action,
+        "resources": {
+            "avg_cpus": avg_cpus,
+            "top_memory": [{"value": k, "count": v} for k, v in top_memory],
+            "top_walltime": [{"value": k, "count": v} for k, v in top_walltime],
+        },
+    }
+
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    typer.echo("Run report:")
+    typer.echo(f"Filters: target={target or '*'} analysis={analysis or '*'} days={days if days is not None else '*'}")
+    typer.echo(f"Jobs: {len(jobs)}")
+    typer.echo(f"Sync events: {len(syncs)}")
+    if by_state:
+        typer.echo("Jobs by state:")
+        for key in sorted(by_state.keys()):
+            typer.echo(f"- {key}: {by_state[key]}")
+    if by_scheduler:
+        typer.echo("Jobs by scheduler:")
+        for key in sorted(by_scheduler.keys()):
+            typer.echo(f"- {key}: {by_scheduler[key]}")
+    if sync_by_action:
+        typer.echo("Sync by action:")
+        for key in sorted(sync_by_action.keys()):
+            typer.echo(f"- {key}: {sync_by_action[key]}")
+    if failures:
+        typer.echo("Recent failures:")
+        for item in failures:
+            typer.echo(
+                f"- {item.get('submitted_at')} job_id={item.get('job_id')} job_name={item.get('job_name')} "
+                f"state={item.get('state')} target={item.get('target')} analysis={item.get('analysis')}"
+            )
+    if avg_cpus is not None:
+        typer.echo(f"Average CPUs requested: {avg_cpus}")
+
+
 @app.command("retry")
 def retry(
     job_id: Optional[str] = typer.Option(None, "--job-id", help="Retry from exact job id", autocompletion=_complete_job_ids),
