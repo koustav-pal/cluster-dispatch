@@ -501,6 +501,37 @@ class TestClusterDispatchFlows(TestCase):
         self.assertNotEqual(watch_result.exit_code, 0)
         self.assertIn("Watch timed out", watch_result.output)
 
+    def test_run_validate_success(self) -> None:
+        result = _invoke(self.runner, self.project, ["run", "validate", "python", "-c", "print(1)"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Summary:", result.output)
+        self.assertIn("[PASS] command:", result.output)
+
+    def test_sweep_validate_success(self) -> None:
+        sweep_yaml = self.project / "sweep_validate.yml"
+        sweep_yaml.write_text(
+            "params:\n"
+            "  job1:\n"
+            "    lr: [0.1]\n"
+            "    batch_size: [32]\n"
+        )
+        result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "sweep",
+                "validate",
+                "--config",
+                str(sweep_yaml),
+                "python",
+                "-c",
+                "print({lr},{batch_size})",
+            ],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Summary:", result.output)
+        self.assertIn("runs=", result.output)
+
     def test_retry_replays_most_recent_normal_run(self) -> None:
         first = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(10)"])
         self.assertEqual(first.exit_code, 0, first.output)

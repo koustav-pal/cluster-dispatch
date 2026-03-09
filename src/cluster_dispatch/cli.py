@@ -45,6 +45,8 @@ app = typer.Typer(help="Cluster Dispatch CLI for remote SSH compute targets")
 target_app = typer.Typer(help="Manage compute targets")
 analysis_app = typer.Typer(help="Manage active analysis directory")
 sweep_app = typer.Typer(help="Manage sweep orchestration")
+run_ops_app = typer.Typer(help="Run-related utilities")
+sweep_ops_app = typer.Typer(help="Sweep-related utilities")
 profile_app = typer.Typer(help="Manage resource profiles")
 status_app = typer.Typer(help="Show job status", invoke_without_command=True)
 ignore_app = typer.Typer(help="Manage .cdpignore patterns")
@@ -54,6 +56,8 @@ cleanup_app = typer.Typer(help="Clean up local metadata and manifests")
 app.add_typer(target_app, name="target")
 app.add_typer(analysis_app, name="analysis")
 analysis_app.add_typer(sweep_app, name="sweep")
+app.add_typer(run_ops_app, name="run")
+app.add_typer(sweep_ops_app, name="sweep")
 app.add_typer(profile_app, name="profile")
 app.add_typer(status_app, name="status")
 app.add_typer(ignore_app, name="ignore")
@@ -635,6 +639,13 @@ def _export_manifest_payload(
         "include_sweeps": include_sweeps,
         "redact_hosts": redact_hosts,
     }
+
+
+def _validation_summary(checks: list[dict[str, str]]) -> tuple[int, int, int]:
+    pass_count = len([c for c in checks if c["status"] == "PASS"])
+    warn_count = len([c for c in checks if c["status"] == "WARN"])
+    fail_count = len([c for c in checks if c["status"] == "FAIL"])
+    return pass_count, warn_count, fail_count
 
 
 def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
@@ -3401,6 +3412,309 @@ def report(
             )
     if avg_cpus is not None:
         typer.echo(f"Average CPUs requested: {avg_cpus}")
+
+
+@run_ops_app.command("validate", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run_validate(
+    ctx: typer.Context,
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Resource profile name (built-in or user-defined)",
+        autocompletion=_complete_profile_names,
+    ),
+    cpus: Optional[int] = typer.Option(None, help="CPU cores for scheduler template"),
+    memory: Optional[str] = typer.Option(None, help="Memory for scheduler template"),
+    job_time: Optional[str] = typer.Option(None, "--time", help="Walltime for scheduler template"),
+    job_name: Optional[str] = typer.Option(None, help="Scheduler job name"),
+    queue: Optional[str] = typer.Option(None, help="Queue for scheduler template"),
+    node: Optional[str] = typer.Option(None, help="Node for scheduler template"),
+    parallel_environment: Optional[str] = typer.Option(None, help="Parallel environment for scheduler template"),
+    as_json: bool = typer.Option(False, "--json", help="Render validation summary as JSON"),
+) -> None:
+    """Validate run configuration and command without syncing or submitting."""
+    checks: list[dict[str, str]] = []
+
+    def _add(status: str, check: str, detail: str) -> None:
+        checks.append({"status": status, "check": check, "detail": detail})
+        if not as_json:
+            typer.echo(f"[{status}] {check}: {detail}")
+
+    command = " ".join(shlex.quote(arg) for arg in ctx.args) if ctx.args else ""
+    if command:
+        _add("PASS", "command", command)
+    else:
+        _add("FAIL", "command", "Missing command. Example: cdp run validate python main.py")
+
+    cfg: Optional[ProjectConfig] = None
+    project_root: Optional[Path] = None
+    analysis_dir: Optional[Path] = None
+    target_name = ""
+    target: Optional[TargetConfig] = None
+    analysis_rel = ""
+
+    try:
+        project_root = _project_root()
+        _add("PASS", "project_root", str(project_root))
+        cfg = load_config(project_root)
+        _add("PASS", "config", str(config_path(project_root)))
+    except Exception as exc:
+        _add("FAIL", "config", str(exc))
+
+    if cfg is not None and project_root is not None:
+        try:
+            analysis_dir = _require_active_analysis(cfg, project_root)
+            analysis_rel = (cfg.active_analysis or "").strip("/")
+            _add("PASS", "active_analysis", str(analysis_dir))
+        except Exception as exc:
+            _add("FAIL", "active_analysis", str(exc))
+
+        try:
+            target_name, target = _active_target(cfg)
+            _add("PASS", "target", target_name)
+        except Exception as exc:
+            _add("FAIL", "target", str(exc))
+
+    resolved_cpus = None
+    resolved_memory = None
+    resolved_time = None
+    resolved_node = None
+    resolved_queue = None
+    resolved_pe = None
+    resolved_job_name = None
+
+    if cfg is not None and target is not None:
+        if not target.remote_root:
+            _add("FAIL", "remote_root", "Target remote_root is missing")
+        else:
+            _add("PASS", "remote_root", target.remote_root)
+        profile_values: dict[str, str | int] = {}
+        try:
+            profile_values = _resolve_resource_profile(profile, cfg)
+            _add("PASS", "profile", profile or "<none>")
+        except Exception as exc:
+            _add("FAIL", "profile", str(exc))
+
+        resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
+        resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
+        resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
+        resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
+        resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
+        resolved_pe = (
+            parallel_environment
+            if parallel_environment is not None
+            else str(profile_values.get("parallel_environment", target.default_parallel_environment))
+        )
+        resolved_job_name = job_name or f"cdp-{secrets.token_hex(4)}"
+        _add(
+            "PASS",
+            "resources",
+            f"cpus={resolved_cpus} memory={resolved_memory} time={resolved_time} "
+            f"node={resolved_node} queue={resolved_queue} parallel_environment={resolved_pe} job_name={resolved_job_name}",
+        )
+
+        requires_queue = "{queue}" in target.template_header
+        requires_pe = "{parallel_environment}" in target.template_header
+        if requires_queue and not resolved_queue:
+            _add("FAIL", "template_queue", "Template requires queue but no value resolved")
+        else:
+            _add("PASS", "template_queue", "Queue requirement satisfied")
+        if requires_pe and not resolved_pe:
+            _add("FAIL", "template_parallel_environment", "Template requires parallel_environment but no value resolved")
+        else:
+            _add("PASS", "template_parallel_environment", "Parallel environment requirement satisfied")
+
+        if target.scheduler == "none" and not target.template_header.strip():
+            _add("PASS", "template", "Skipped for scheduler=none with empty template")
+        else:
+            try:
+                _validate_template_variables(target.template_header)
+                _render_scheduler_header(
+                    target.template_header,
+                    cpus=int(resolved_cpus),
+                    memory=str(resolved_memory),
+                    walltime=str(resolved_time),
+                    job_name=str(resolved_job_name),
+                    stdout=str(resolved_job_name),
+                    stderr=str(resolved_job_name),
+                    working_dir=target.remote_root,
+                    queue=str(resolved_queue or ""),
+                    node=str(resolved_node),
+                    parallel_environment=str(resolved_pe or ""),
+                )
+                _add("PASS", "template", "Template render check passed")
+            except Exception as exc:
+                _add("FAIL", "template", str(exc))
+
+    if cfg is not None and analysis_rel:
+        tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
+        if tags:
+            _add("PASS", "analysis_tags", f"{len(tags)} tag(s)")
+        else:
+            _add("WARN", "analysis_tags", "No analysis tags configured")
+
+    pass_count, warn_count, fail_count = _validation_summary(checks)
+    payload = {
+        "checks": checks,
+        "summary": {"pass": pass_count, "warn": warn_count, "fail": fail_count},
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        typer.echo(f"Summary: PASS={pass_count} WARN={warn_count} FAIL={fail_count}")
+    if fail_count:
+        raise typer.Exit(code=1)
+
+
+@sweep_ops_app.command("validate", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def sweep_validate(
+    ctx: typer.Context,
+    config_file: Path = typer.Option(..., "--config", help="Sweep YAML config with top-level params mapping"),
+    mode: str = typer.Option("single", "--mode", help="Execution mode: single|array|local"),
+    sweep_job: Optional[str] = typer.Option(None, "--job", help="Validate only one params.<job> block from config"),
+    target: Optional[str] = typer.Option(
+        None, "--target", help="Target name (defaults to active target)", autocompletion=_complete_target_names
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Resource profile name (built-in or user-defined)",
+        autocompletion=_complete_profile_names,
+    ),
+    cpus: Optional[int] = typer.Option(None, help="CPU cores"),
+    memory: Optional[str] = typer.Option(None, help="Memory"),
+    job_time: Optional[str] = typer.Option(None, "--time", help="Walltime"),
+    queue: Optional[str] = typer.Option(None, help="Queue"),
+    node: Optional[str] = typer.Option(None, help="Node"),
+    parallel_environment: Optional[str] = typer.Option(None, "--parallel-environment", help="Parallel environment"),
+    as_json: bool = typer.Option(False, "--json", help="Render validation summary as JSON"),
+) -> None:
+    """Validate sweep config/template/resources without submitting jobs."""
+    checks: list[dict[str, str]] = []
+
+    def _add(status: str, check: str, detail: str) -> None:
+        checks.append({"status": status, "check": check, "detail": detail})
+        if not as_json:
+            typer.echo(f"[{status}] {check}: {detail}")
+
+    mode_lc = mode.lower()
+    if mode_lc not in {"single", "array", "local"}:
+        _add("FAIL", "mode", "--mode must be one of: single, array, local")
+    else:
+        _add("PASS", "mode", mode_lc)
+
+    command_template = " ".join(shlex.quote(arg) for arg in ctx.args) if ctx.args else ""
+    if not command_template:
+        _add("FAIL", "command_template", "Missing command template")
+    else:
+        _add("PASS", "command_template", command_template)
+
+    payload: dict[str, Any] = {}
+    if not config_file.exists() or not config_file.is_file():
+        _add("FAIL", "config_file", f"Sweep config file not found: {config_file}")
+    else:
+        _add("PASS", "config_file", str(config_file))
+        try:
+            parsed = yaml.safe_load(config_file.read_text()) or {}
+            if not isinstance(parsed, dict):
+                raise ValueError("Sweep config must be a YAML mapping")
+            payload = parsed
+            _add("PASS", "config_parse", "YAML parse ok")
+        except Exception as exc:
+            _add("FAIL", "config_parse", str(exc))
+
+    runs: list[dict[str, Any]] = []
+    if command_template and payload:
+        try:
+            runs = _expand_sweep_runs(payload, command_template, sweep_job)
+            _add("PASS", "sweep_expand", f"Generated {len(runs)} run(s)")
+        except Exception as exc:
+            _add("FAIL", "sweep_expand", str(exc))
+
+    cfg: Optional[ProjectConfig] = None
+    project_root: Optional[Path] = None
+    target_cfg: Optional[TargetConfig] = None
+    if True:
+        try:
+            project_root = _project_root()
+            cfg = load_config(project_root)
+            _add("PASS", "project_config", str(config_path(project_root)))
+            _require_active_analysis(cfg, project_root)
+            _add("PASS", "active_analysis", str((cfg.active_analysis or "").strip("/")))
+        except Exception as exc:
+            _add("FAIL", "project_config", str(exc))
+
+    if cfg is not None:
+        try:
+            if target:
+                if target not in cfg.targets:
+                    raise typer.BadParameter(f"Target '{target}' not found")
+                target_cfg = cfg.targets[target]
+                _add("PASS", "target", target)
+            else:
+                tname, target_cfg = _active_target(cfg)
+                _add("PASS", "target", tname)
+        except Exception as exc:
+            _add("FAIL", "target", str(exc))
+
+    if target_cfg is not None and mode_lc == "array" and target_cfg.scheduler.lower() == "none":
+        _add("FAIL", "mode_scheduler", "Array mode is not supported for scheduler 'none'")
+
+    if cfg is not None and target_cfg is not None:
+        profile_values: dict[str, str | int] = {}
+        try:
+            profile_values = _resolve_resource_profile(profile, cfg)
+            _add("PASS", "profile", profile or "<none>")
+        except Exception as exc:
+            _add("FAIL", "profile", str(exc))
+
+        resolved_queue = queue if queue is not None else str(profile_values.get("queue", target_cfg.default_queue))
+        resolved_pe = (
+            parallel_environment
+            if parallel_environment is not None
+            else str(profile_values.get("parallel_environment", target_cfg.default_parallel_environment))
+        )
+        if "{queue}" in target_cfg.template_header and not resolved_queue:
+            _add("FAIL", "template_queue", "Template requires queue but no value resolved")
+        else:
+            _add("PASS", "template_queue", "Queue requirement satisfied")
+        if "{parallel_environment}" in target_cfg.template_header and not resolved_pe:
+            _add("FAIL", "template_parallel_environment", "Template requires parallel_environment but no value resolved")
+        else:
+            _add("PASS", "template_parallel_environment", "Parallel environment requirement satisfied")
+
+        if target_cfg.scheduler == "none" and not target_cfg.template_header.strip():
+            _add("PASS", "template", "Skipped for scheduler=none with empty template")
+        else:
+            try:
+                _validate_template_variables(target_cfg.template_header)
+                _add("PASS", "template", "Template placeholders valid")
+            except Exception as exc:
+                _add("FAIL", "template", str(exc))
+
+        resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target_cfg.default_cpus))
+        resolved_memory = memory if memory is not None else str(profile_values.get("memory", target_cfg.default_memory))
+        resolved_time = job_time if job_time is not None else str(profile_values.get("time", target_cfg.default_time))
+        resolved_node = node or str(profile_values.get("node", target_cfg.default_node or "1"))
+        _add(
+            "PASS",
+            "resources",
+            f"cpus={resolved_cpus} memory={resolved_memory} time={resolved_time} "
+            f"node={resolved_node} queue={resolved_queue} parallel_environment={resolved_pe}",
+        )
+
+    pass_count, warn_count, fail_count = _validation_summary(checks)
+    payload_out = {
+        "checks": checks,
+        "summary": {"pass": pass_count, "warn": warn_count, "fail": fail_count},
+        "runs_generated": len(runs),
+    }
+    if as_json:
+        typer.echo(json.dumps(payload_out, indent=2))
+    else:
+        typer.echo(f"Summary: PASS={pass_count} WARN={warn_count} FAIL={fail_count} runs={len(runs)}")
+    if fail_count:
+        raise typer.Exit(code=1)
 
 
 @app.command("retry")

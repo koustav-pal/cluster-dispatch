@@ -215,6 +215,8 @@ cdp export --output backup.tar.gz --jobs --sync --sweeps
 cdp import backup.tar.gz --overwrite
 cdp watch --job-id 123456
 cdp watch --job-name run001 --interval 10 --no-log-tail
+cdp run validate python train.py --epochs 20
+cdp sweep validate --config sweep.yml python train.py --lr {lr} --batch-size {batch_size}
 cdp analysis pull
 ```
 
@@ -478,6 +480,12 @@ Imports project metadata bundle into current directory.
 ### `cdp watch [selectors] [--interval N] [--max-polls N] [--log-tail/--no-log-tail]`
 Polls status until selected job reaches terminal state, optionally showing log tail.
 - exits non-zero for failure states or timeout
+
+### `cdp run validate <command...> [resource/profile options] [--json]`
+Validates single-run command/config/template/resource resolution with no sync or submission.
+
+### `cdp sweep validate --config <yaml> <command...> [options] [--json]`
+Validates sweep config expansion, mode/target compatibility, and template/resource requirements without submitting jobs.
 
 ## Files and state
 
