@@ -276,6 +276,110 @@ class TestClusterDispatchFlows(TestCase):
         for item in payload:
             self.assertTrue(Path(str(item.get("manifest_path", ""))).exists())
 
+    def test_analysis_list_remote_uses_index_when_available(self) -> None:
+        (self.project / self.analysis_rel / "alpha").mkdir(parents=True, exist_ok=True)
+        (self.project / self.analysis_rel / "beta").mkdir(parents=True, exist_ok=True)
+
+        index_result = _invoke(self.runner, self.project, ["index"])
+        self.assertEqual(index_result.exit_code, 0, index_result.output)
+
+        # Add new directory after indexing; list --remote should still return indexed view.
+        (self.project / self.analysis_rel / "gamma").mkdir(parents=True, exist_ok=True)
+        listed = _invoke(self.runner, self.project, ["analysis", "list", "--remote"])
+        self.assertEqual(listed.exit_code, 0, listed.output)
+        self.assertIn("(from index)", listed.output)
+        self.assertIn("- alpha", listed.output)
+        self.assertIn("- beta", listed.output)
+        self.assertNotIn("- gamma", listed.output)
+
+    def test_analysis_list_remote_falls_back_to_live_listing_without_index(self) -> None:
+        (self.project / self.analysis_rel / "delta").mkdir(parents=True, exist_ok=True)
+        listed = _invoke(self.runner, self.project, ["analysis", "list", "--remote"])
+        self.assertEqual(listed.exit_code, 0, listed.output)
+        self.assertNotIn("(from index)", listed.output)
+        self.assertIn("- delta", listed.output)
+
+    def test_sync_pull_all_dry_run_shows_index_diff_summary(self) -> None:
+        target_file = self.project / self.analysis_rel / "artifact.txt"
+        target_file.write_text("v1\n")
+        index_result = _invoke(self.runner, self.project, ["index"])
+        self.assertEqual(index_result.exit_code, 0, index_result.output)
+        target_file.write_text("v2-changed\n")
+
+        pull_result = _invoke(self.runner, self.project, ["sync", "pull", "--all", "--dry-run"])
+        self.assertEqual(pull_result.exit_code, 0, pull_result.output)
+        self.assertIn("Index diff summary (preview):", pull_result.output)
+
+    def test_collect_reports_index_transfer_estimate(self) -> None:
+        outputs_dir = self.project / self.analysis_rel / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        (outputs_dir / "file.txt").write_text("hello\n")
+        _invoke(self.runner, self.project, ["index", "outputs"])
+
+        jobs_dir = self.project / ".cluster_dispatch" / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "submitted_at": "2026-01-01T00:00:00",
+            "analysis": str(self.analysis_rel).replace("\\", "/"),
+            "target": "local",
+            "scheduler": "none",
+            "job_id": "collect-1",
+            "job_name": "collect-job",
+            "state": "COMPLETED",
+            "command": "echo done",
+            "remote_run_dir": str((self.project / self.analysis_rel).resolve()),
+            "remote_log_file": str((self.project / self.analysis_rel / "run.log").resolve()),
+            "analysis_tags": ["outputs"],
+        }
+        (jobs_dir / "collect.json").write_text(json.dumps(payload, indent=2))
+
+        collect_result = _invoke(self.runner, self.project, ["collect", "--job-id", "collect-1"])
+        self.assertEqual(collect_result.exit_code, 0, collect_result.output)
+        self.assertIn("Index transfer estimate:", collect_result.output)
+
+    def test_report_json_includes_index_summary(self) -> None:
+        (self.project / self.analysis_rel / "reporting").mkdir(parents=True, exist_ok=True)
+        (self.project / self.analysis_rel / "reporting" / "a.txt").write_text("x\n")
+        _invoke(self.runner, self.project, ["index", "reporting"])
+
+        report_result = _invoke(self.runner, self.project, ["report", "--json"])
+        self.assertEqual(report_result.exit_code, 0, report_result.output)
+        payload = json.loads(report_result.output)
+        self.assertIn("index", payload)
+        self.assertGreaterEqual(int(payload["index"].get("manifests", 0)), 1)
+
+    def test_status_terminal_output_check_uses_index(self) -> None:
+        (self.project / self.analysis_rel / "out").mkdir(parents=True, exist_ok=True)
+        (self.project / self.analysis_rel / "out" / "done.txt").write_text("ok\n")
+        _invoke(self.runner, self.project, ["index"])
+
+        jobs_dir = self.project / ".cluster_dispatch" / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "submitted_at": "2026-01-01T00:00:00",
+            "analysis": str(self.analysis_rel).replace("\\", "/"),
+            "target": "local",
+            "scheduler": "none",
+            "job_id": "status-1",
+            "job_name": "status-job",
+            "state": "COMPLETED",
+            "command": "echo done",
+            "remote_run_dir": str((self.project / self.analysis_rel).resolve()),
+            "remote_log_file": str((self.project / self.analysis_rel / "run.log").resolve()),
+            "analysis_tags": ["out"],
+        }
+        (jobs_dir / "status.json").write_text(json.dumps(payload, indent=2))
+
+        status_result = _invoke(self.runner, self.project, ["status", "--job-id", "status-1"])
+        self.assertEqual(status_result.exit_code, 0, status_result.output)
+        self.assertIn("output=OK", status_result.output)
+
+    def test_doctor_reports_index_checks(self) -> None:
+        (self.project / self.analysis_rel / "doctor").mkdir(parents=True, exist_ok=True)
+        _invoke(self.runner, self.project, ["index", "doctor"])
+        doctor_result = _invoke(self.runner, self.project, ["doctor", "--no-remote"])
+        self.assertIn("index", doctor_result.output)
+
     def test_target_remove_default_requires_force(self) -> None:
         template = self.project / "none.tmpl"
         template.write_text(

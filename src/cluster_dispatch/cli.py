@@ -558,6 +558,234 @@ def _index_manifest_path(project_root: Path, target_name: str, analysis_rel: str
     return analysis_dir / f"{scope_stem}.json"
 
 
+def _index_manifest_candidate(project_root: Path, target_name: str, analysis_rel: str, scope_rel: str) -> Path:
+    safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_name).strip("._-") or "target"
+    safe_analysis = [re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._-") for part in analysis_rel.split("/") if part]
+    analysis_dir = project_root / CONFIG_DIR / INDEX_DIR_NAME / safe_target
+    for part in safe_analysis:
+        analysis_dir = analysis_dir / part
+    clean_scope = scope_rel.strip("/")
+    if clean_scope in {"", "."}:
+        scope_stem = "root"
+    else:
+        scope_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean_scope.replace("/", "__")).strip("._-") or "scope"
+    return analysis_dir / f"{scope_stem}.json"
+
+
+def _load_index_manifest(
+    project_root: Path,
+    target_name: str,
+    analysis_rel: str,
+    scope_rel: str,
+) -> Optional[dict[str, Any]]:
+    manifest_path = _index_manifest_candidate(project_root, target_name, analysis_rel, scope_rel)
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if str(payload.get("target", "")) != target_name:
+        return None
+    if str(payload.get("analysis", "")).strip("/") != analysis_rel.strip("/"):
+        return None
+    payload["_manifest_path"] = str(manifest_path)
+    return payload
+
+
+def _list_names_from_index_manifest(manifest: dict[str, Any], include_files: bool) -> list[str]:
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        return []
+    names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rel_path = str(entry.get("path", "")).strip("/")
+        if rel_path in {"", "."}:
+            continue
+        top_name = rel_path.split("/", 1)[0]
+        if not include_files:
+            if "/" in rel_path:
+                names.add(top_name)
+                continue
+            if str(entry.get("type", "")).lower() == "dir":
+                names.add(top_name)
+            continue
+        names.add(top_name)
+    return sorted(names)
+
+
+def _index_entry_path_exists(manifest: dict[str, Any], rel_path: str) -> bool:
+    clean = rel_path.strip("/")
+    if clean in {"", "."}:
+        return True
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        epath = str(entry.get("path", "")).strip("/")
+        if not epath or epath == ".":
+            continue
+        if epath == clean or epath.startswith(f"{clean}/"):
+            return True
+    return False
+
+
+def _index_file_count_and_bytes(manifest: dict[str, Any]) -> tuple[int, int]:
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        return 0, 0
+    file_count = 0
+    total_bytes = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")).lower() != "file":
+            continue
+        file_count += 1
+        try:
+            total_bytes += int(entry.get("size", 0))
+        except Exception:
+            pass
+    return file_count, total_bytes
+
+
+def _humanize_bytes(num_bytes: int) -> str:
+    value = float(max(0, num_bytes))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{int(num_bytes)} B"
+
+
+def _index_manifest_paths(project_root: Path) -> list[Path]:
+    root = project_root / CONFIG_DIR / INDEX_DIR_NAME
+    if not root.exists():
+        return []
+    return sorted(root.rglob("*.json"))
+
+
+def _load_all_index_manifests(project_root: Path) -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    for path in _index_manifest_paths(project_root):
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        payload["_manifest_path"] = str(path)
+        manifests.append(payload)
+    return manifests
+
+
+def _write_index_manifest_for_scope(
+    project_root: Path,
+    analysis_rel: str,
+    target_name: str,
+    target_cfg: TargetConfig,
+    scope_rel: str,
+    scope_remote: str,
+) -> dict[str, Any]:
+    if _uses_local_transport(target_cfg):
+        entries = _index_local_scope(Path(scope_remote))
+    else:
+        entries = _index_remote_scope(target_cfg.host, scope_remote)
+    manifest = {
+        "indexed_at": datetime.now().isoformat(timespec="seconds"),
+        "project_root": str(project_root),
+        "analysis": analysis_rel,
+        "target": target_name,
+        "transport": target_cfg.transport,
+        "scheduler": target_cfg.scheduler,
+        "scope": scope_rel,
+        "remote_scope": scope_remote,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    manifest_path = _index_manifest_path(project_root, target_name, analysis_rel, scope_rel)
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest["_manifest_path"] = str(manifest_path)
+    return manifest
+
+
+def _summarize_index_vs_local(local_scope_root: Path, index_manifest: dict[str, Any]) -> dict[str, int]:
+    local_entries = _index_local_scope(local_scope_root) if local_scope_root.exists() else []
+    local_map = {str(e.get("path", "")).strip("/"): e for e in local_entries if isinstance(e, dict)}
+    remote_entries = index_manifest.get("entries", [])
+    remote_map = {
+        str(e.get("path", "")).strip("/"): e for e in remote_entries if isinstance(e, dict) and str(e.get("path", "")).strip("/")
+    } if isinstance(remote_entries, list) else {}
+
+    remote_only = len([k for k in remote_map.keys() if k not in local_map])
+    local_only = len([k for k in local_map.keys() if k not in remote_map])
+    changed = 0
+    for key in set(local_map.keys()).intersection(remote_map.keys()):
+        lval = local_map[key]
+        rval = remote_map[key]
+        if str(lval.get("type", "")) != str(rval.get("type", "")):
+            changed += 1
+            continue
+        if str(lval.get("type", "")) == "file":
+            if int(lval.get("size", 0) or 0) != int(rval.get("size", 0) or 0):
+                changed += 1
+                continue
+    return {"remote_only": remote_only, "local_only": local_only, "changed": changed}
+
+
+def _complete_index_remote_paths(incomplete: str) -> list[str]:
+    project_root = _safe_project_root()
+    if not project_root:
+        return []
+    try:
+        cfg = load_config(project_root)
+        target_name, _ = _active_target(cfg)
+        analysis_rel = (cfg.active_analysis or "").strip("/")
+        if not analysis_rel:
+            return []
+        manifest = _load_index_manifest(project_root, target_name, analysis_rel, ".")
+        if manifest is None:
+            return []
+    except Exception:
+        return []
+
+    entries = manifest.get("entries", [])
+    if not isinstance(entries, list):
+        return []
+    values: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rel = str(entry.get("path", "")).strip("/")
+        if not rel or rel == ".":
+            continue
+        values.add(rel)
+        if "/" in rel:
+            values.add(rel.rsplit("/", 1)[0])
+    return _prefix_filter(sorted(values), incomplete)
+
+
+def _auto_index_active_root(project_root: Path, cfg: ProjectConfig, target_name: str, target_cfg: TargetConfig) -> Optional[str]:
+    analysis_rel = (cfg.active_analysis or "").strip("/")
+    if not analysis_rel:
+        return None
+    remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
+    manifest = _write_index_manifest_for_scope(
+        project_root=project_root,
+        analysis_rel=analysis_rel,
+        target_name=target_name,
+        target_cfg=target_cfg,
+        scope_rel=".",
+        scope_remote=remote_analysis_root,
+    )
+    return str(manifest.get("_manifest_path", ""))
+
+
 def _iso_from_epoch(value: float) -> str:
     return datetime.fromtimestamp(value).isoformat(timespec="seconds")
 
@@ -1552,6 +1780,31 @@ def doctor(
     else:
         _add("WARN", "active_analysis", "No active analysis set")
 
+    index_paths = _index_manifest_paths(project_root)
+    corrupt_indexes = 0
+    newest_index_ts: Optional[datetime] = None
+    for path in index_paths:
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            corrupt_indexes += 1
+            continue
+        ts = _parse_iso_ts(payload.get("indexed_at"))
+        if ts is not None and (newest_index_ts is None or ts > newest_index_ts):
+            newest_index_ts = ts
+    if not index_paths:
+        _add("WARN", "index", f"No index manifests found under {project_root / CONFIG_DIR / INDEX_DIR_NAME}")
+    else:
+        _add("PASS", "index", f"Found {len(index_paths)} manifest(s)")
+    if corrupt_indexes:
+        _add("FAIL", "index_corrupt", f"{corrupt_indexes} manifest(s) could not be parsed")
+    if newest_index_ts is not None:
+        age_hours = (datetime.now() - newest_index_ts).total_seconds() / 3600.0
+        if age_hours > 24.0:
+            _add("WARN", "index_freshness", f"Latest index is stale ({age_hours:.1f}h old)")
+        else:
+            _add("PASS", "index_freshness", f"Latest index age {age_hours:.1f}h")
+
     # Target checks.
     selected_targets: dict[str, TargetConfig]
     if target:
@@ -2237,6 +2490,7 @@ def sweep_run(
         min=5000,
         help="Delay between submissions in single mode (minimum 5000 ms).",
     ),
+    index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful submission"),
 ) -> None:
     """Run a sweep and persist manifest in .cluster_dispatch/sweeps."""
     mode_lc = mode.lower()
@@ -2362,6 +2616,10 @@ def sweep_run(
         )
     _save_sweep_manifest(project_root, manifest)
     typer.echo(f"Submitted sweep_id={sweep_id} mode={mode_lc} target={target_name} runs={submitted}")
+    if index_after:
+        manifest_path = _auto_index_active_root(project_root, cfg, target_name, target_cfg)
+        if manifest_path:
+            typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
 
 
 @sweep_app.command("list")
@@ -2630,19 +2888,23 @@ def analysis_tag(
             raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
         remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
         remote_tag_path = f"{remote_analysis_root}/{tag_value}"
-        if _uses_local_transport(target):
-            if not Path(remote_tag_path).exists():
-                raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+        root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
+        if root_index is not None and _index_entry_path_exists(root_index, tag_value):
+            typer.echo(f"Validated via index: {tag_value}")
         else:
-            remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
-            proc = subprocess.run(
-                ["ssh", target.host, remote_cmd],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if proc.returncode != 0 or proc.stdout.strip() != "OK":
-                raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+            if _uses_local_transport(target):
+                if not Path(remote_tag_path).exists():
+                    raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
+            else:
+                remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
+                proc = subprocess.run(
+                    ["ssh", target.host, remote_cmd],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if proc.returncode != 0 or proc.stdout.strip() != "OK":
+                    raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
 
     analysis_key = cfg.active_analysis or ""
     tags = cfg.analysis_tags.get(analysis_key, [])
@@ -2714,6 +2976,28 @@ def analysis_list(
         if relative_subpath in ("", ".")
         else f"{remote_analysis_root.rstrip('/')}/{relative_subpath}"
     )
+    manifest_scope = "." if relative_subpath in ("", ".") else relative_subpath.strip("/")
+    indexed_manifest = _load_index_manifest(
+        project_root=project_root,
+        target_name=target_name,
+        analysis_rel=active_analysis_rel,
+        scope_rel=manifest_scope,
+    )
+    if indexed_manifest is not None:
+        indexed_names = _list_names_from_index_manifest(indexed_manifest, include_files=all_entries)
+        if not indexed_names:
+            if all_entries:
+                typer.echo(f"No indexed entries found in {remote_list_root}")
+            else:
+                typer.echo(f"No indexed subdirectories found in {remote_list_root}")
+            typer.echo(f"Using index manifest: {indexed_manifest.get('_manifest_path', '<unknown>')}")
+            return
+        label = "entries" if all_entries else "directories"
+        typer.echo(f"Remote {label} in {remote_list_root} (from index):")
+        for name in indexed_names:
+            typer.echo(f"- {name}")
+        typer.echo(f"Index manifest: {indexed_manifest.get('_manifest_path', '<unknown>')}")
+        return
 
     remote_cmd = (
         f"P={shlex.quote(remote_list_root)}; "
@@ -2786,6 +3070,7 @@ def run(
             "(defaults to target setting; required if template uses {parallel_environment})"
         ),
     ),
+    index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful submission"),
 ) -> None:
     """Sync active analysis, submit command, and store job metadata."""
     if not ctx.args:
@@ -2831,6 +3116,7 @@ def run(
         node=resolved_node,
         parallel_environment=resolved_parallel_environment,
         dry_run=dry_run,
+        index_after=index_after,
     )
 
 
@@ -2918,6 +3204,37 @@ def _is_running_state(state: str) -> bool:
         "R",
         "Q",
     }
+
+
+def _is_terminal_state(state: str) -> bool:
+    normalized = state.strip().upper()
+    if not normalized:
+        return False
+    if _is_running_state(normalized):
+        return False
+    return normalized not in {"UNKNOWN", "NOT_FOUND"}
+
+
+def _output_check_from_index(project_root: Path, payload: dict[str, Any]) -> str:
+    analysis_name = str(payload.get("analysis", "")).strip("/")
+    target_name = str(payload.get("target", "")).strip()
+    if not analysis_name or not target_name:
+        return "N/A"
+    tags = payload.get("analysis_tags")
+    if not isinstance(tags, list) or not tags:
+        return "NO_TAGS"
+    root_manifest = _load_index_manifest(project_root, target_name, analysis_name, ".")
+    if root_manifest is None:
+        return "INDEX_MISSING"
+    clean_tags = [str(tag).strip("/") for tag in tags if str(tag).strip("/")]
+    if not clean_tags:
+        return "NO_TAGS"
+    present = len([tag for tag in clean_tags if _index_entry_path_exists(root_manifest, tag)])
+    if present == len(clean_tags):
+        return "OK"
+    if present == 0:
+        return "MISSING"
+    return f"PARTIAL {present}/{len(clean_tags)}"
 
 
 def _resolve_and_persist_job_state(
@@ -3452,6 +3769,7 @@ def report(
     project_root = _project_root()
     job_records = _load_job_records(project_root)
     sync_events = _load_sync_events(project_root)
+    index_manifests = _load_all_index_manifests(project_root)
     cutoff = datetime.now() - timedelta(days=days) if days is not None else None
 
     def _job_match(rec: dict[str, Any]) -> bool:
@@ -3478,6 +3796,17 @@ def report(
 
     jobs = [rec for rec in job_records if _job_match(rec)]
     syncs = [rec for rec in sync_events if _sync_match(rec)]
+    index_filtered: list[dict[str, Any]] = []
+    for rec in index_manifests:
+        if target and str(rec.get("target", "")) != target:
+            continue
+        if analysis and str(rec.get("analysis", "")).strip("/") != analysis.strip("/"):
+            continue
+        if cutoff is not None:
+            ts = _parse_iso_ts(rec.get("indexed_at"))
+            if ts is None or ts < cutoff:
+                continue
+        index_filtered.append(rec)
 
     by_state: dict[str, int] = {}
     by_scheduler: dict[str, int] = {}
@@ -3538,16 +3867,55 @@ def report(
     avg_cpus = round(sum(cpus_values) / len(cpus_values), 2) if cpus_values else None
     top_memory = sorted(memory_top.items(), key=lambda x: (-x[1], x[0]))[:5]
     top_walltime = sorted(walltime_top.items(), key=lambda x: (-x[1], x[0]))[:5]
+    index_entries = 0
+    index_files = 0
+    index_bytes = 0
+    index_by_scope: dict[str, int] = {}
+    index_last_at: Optional[str] = None
+    index_stale_count = 0
+    stale_cutoff = datetime.now() - timedelta(hours=24)
+    for manifest in index_filtered:
+        scope = str(manifest.get("scope", "."))
+        index_by_scope[scope] = index_by_scope.get(scope, 0) + 1
+        entries = manifest.get("entries", [])
+        if isinstance(entries, list):
+            index_entries += len(entries)
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("type", "")).lower() == "file":
+                    index_files += 1
+                    try:
+                        index_bytes += int(entry.get("size", 0))
+                    except Exception:
+                        pass
+        ts = _parse_iso_ts(manifest.get("indexed_at"))
+        if ts is not None:
+            if index_last_at is None or ts > datetime.fromisoformat(index_last_at):
+                index_last_at = ts.isoformat(timespec="seconds")
+            if ts < stale_cutoff:
+                index_stale_count += 1
 
     payload = {
         "filters": {"target": target, "analysis": analysis, "days": days},
         "jobs_total": len(jobs),
         "sync_total": len(syncs),
+        "index_total": len(index_filtered),
         "jobs_by_state": by_state,
         "jobs_by_scheduler": by_scheduler,
         "jobs_by_target": by_target,
         "recent_failures": failures,
         "sync_by_action": sync_by_action,
+        "index": {
+            "manifests": len(index_filtered),
+            "latest_indexed_at": index_last_at,
+            "stale_manifests_24h": index_stale_count,
+            "entries_total": index_entries,
+            "files_total": index_files,
+            "bytes_total": index_bytes,
+            "bytes_human": _humanize_bytes(index_bytes),
+            "by_scope": index_by_scope,
+        },
         "resources": {
             "avg_cpus": avg_cpus,
             "top_memory": [{"value": k, "count": v} for k, v in top_memory],
@@ -3563,6 +3931,11 @@ def report(
     typer.echo(f"Filters: target={target or '*'} analysis={analysis or '*'} days={days if days is not None else '*'}")
     typer.echo(f"Jobs: {len(jobs)}")
     typer.echo(f"Sync events: {len(syncs)}")
+    typer.echo(
+        "Index manifests: "
+        f"{len(index_filtered)} latest={index_last_at or 'n/a'} "
+        f"entries={index_entries} files={index_files} size={_humanize_bytes(index_bytes)} stale_24h={index_stale_count}"
+    )
     if by_state:
         typer.echo("Jobs by state:")
         for key in sorted(by_state.keys()):
@@ -3986,6 +4359,7 @@ def retry(
         node=str(node_value),
         parallel_environment=str(pe_value),
         dry_run=dry_run,
+        index_after=False,
     )
 
 
@@ -4047,6 +4421,39 @@ def collect(
         raise typer.BadParameter("Selected record has no tagged paths to collect")
 
     target_cfg = cfg.targets[selected_target]
+    index_plan_files = 0
+    index_plan_bytes = 0
+    index_missing: list[str] = []
+    for tag_dir in tags:
+        clean_tag = str(tag_dir).strip("/")
+        if not clean_tag:
+            continue
+        tag_manifest = _load_index_manifest(project_root, selected_target, selected_analysis, clean_tag)
+        if tag_manifest is None:
+            root_manifest = _load_index_manifest(project_root, selected_target, selected_analysis, ".")
+            if root_manifest is None or not _index_entry_path_exists(root_manifest, clean_tag):
+                index_missing.append(clean_tag)
+                continue
+            # Root index has the path; estimate by filtering root entries under tag.
+            sub_entries = []
+            entries = root_manifest.get("entries", [])
+            if isinstance(entries, list):
+                prefix = f"{clean_tag}/"
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    rel = str(entry.get("path", "")).strip("/")
+                    if rel == clean_tag or rel.startswith(prefix):
+                        trimmed = dict(entry)
+                        trimmed["path"] = rel.removeprefix(prefix) if rel.startswith(prefix) else "."
+                        sub_entries.append(trimmed)
+            pseudo_manifest = {"entries": sub_entries}
+            file_count, total_bytes = _index_file_count_and_bytes(pseudo_manifest)
+        else:
+            file_count, total_bytes = _index_file_count_and_bytes(tag_manifest)
+        index_plan_files += file_count
+        index_plan_bytes += total_bytes
+
     pulled: list[str] = []
     skipped: list[str] = []
     for tag_dir in tags:
@@ -4070,6 +4477,14 @@ def collect(
         f"Collect source: job_id={str(selected.get('job_id', ''))} job_name={str(selected.get('job_name', ''))} "
         f"target={selected_target} analysis={selected_analysis}"
     )
+    if index_plan_files or index_plan_bytes:
+        typer.echo(
+            f"Index transfer estimate: files={index_plan_files} total_size={_humanize_bytes(index_plan_bytes)}"
+        )
+    if index_missing:
+        typer.echo("Index warnings (no index metadata for tagged paths):")
+        for item in sorted(set(index_missing)):
+            typer.echo(f"- {item}")
     if pulled:
         typer.echo("Collected tagged paths:")
         for item in pulled:
@@ -4467,6 +4882,7 @@ def _collect_status_rows(
                 "scheduler": scheduler,
                 "state": state,
                 "submitted_at": submitted_at,
+                "output_check": (_output_check_from_index(project_root, payload) if _is_terminal_state(state) else "N/A"),
             }
         )
         if len(rows) >= limit:
@@ -4496,7 +4912,7 @@ def _show_global_status(limit: int = 50) -> None:
     for row in rows:
         typer.echo(
             f"{row['job_id']}  analysis={row['analysis']} target={row['target']} "
-            f"scheduler={row['scheduler']} state={row['state']} submitted_at={row['submitted_at']}"
+            f"scheduler={row['scheduler']} state={row['state']} output={row['output_check']} submitted_at={row['submitted_at']}"
         )
 
 
@@ -4523,7 +4939,7 @@ def _show_target_status(target: str, limit: int = 50) -> None:
     for row in rows:
         typer.echo(
             f"{row['job_id']}  job_name={row['job_name']} analysis={row['analysis']} scheduler={row['scheduler']} "
-            f"state={row['state']} submitted_at={row['submitted_at']}"
+            f"state={row['state']} output={row['output_check']} submitted_at={row['submitted_at']}"
         )
 
 
@@ -4571,7 +4987,8 @@ def _show_filtered_status(
     for row in rows:
         typer.echo(
             f"{row['job_id']}  job_name={row['job_name']} analysis={row['analysis']} "
-            f"target={row['target']} scheduler={row['scheduler']} state={row['state']} submitted_at={row['submitted_at']}"
+            f"target={row['target']} scheduler={row['scheduler']} state={row['state']} "
+            f"output={row['output_check']} submitted_at={row['submitted_at']}"
         )
 
 
@@ -4653,7 +5070,7 @@ def status_list(
     for row in rows:
         typer.echo(
             f"{row['job_id']}  job_name={row['job_name']} target={row['target']} scheduler={row['scheduler']} "
-            f"state={row['state']} submitted_at={row['submitted_at']}"
+            f"state={row['state']} output={row['output_check']} submitted_at={row['submitted_at']}"
         )
 
 
@@ -4738,7 +5155,7 @@ def _sync_push(dry_run: bool) -> None:
     typer.echo(f"Recorded sync event: {record_path}")
 
 
-def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
+def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool = False) -> None:
     project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
     local_target_mode = _uses_local_transport(target_cfg)
 
@@ -4750,6 +5167,13 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
             rsync_cmd.extend([f"{target_cfg.host}:{remote_analysis_root}/", f"{analysis_dir}/"])
 
         if dry_run:
+            root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
+            if root_index is not None:
+                delta = _summarize_index_vs_local(analysis_dir, root_index)
+                typer.echo(
+                    "Index diff summary (preview): "
+                    f"remote_only={delta['remote_only']} local_only={delta['local_only']} changed={delta['changed']}"
+                )
             typer.echo("Dry run: no changes will be made")
             typer.echo("Action: sync pull")
             typer.echo(f"Project root: {project_root}")
@@ -4761,6 +5185,13 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
             typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in rsync_cmd)}")
             return
 
+        root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
+        if root_index is not None:
+            delta = _summarize_index_vs_local(analysis_dir, root_index)
+            typer.echo(
+                "Index diff summary (before pull): "
+                f"remote_only={delta['remote_only']} local_only={delta['local_only']} changed={delta['changed']}"
+            )
         _run_cmd(rsync_cmd)
         record_path = _write_sync_event(
             project_root,
@@ -4779,6 +5210,10 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
         )
         typer.echo(f"Pulled full analysis from target '{target_name}': {remote_analysis_root} -> {analysis_dir}")
         typer.echo(f"Recorded sync event: {record_path}")
+        if index_after:
+            manifest_path = _auto_index_active_root(project_root, cfg, target_name, target_cfg)
+            if manifest_path:
+                typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
         return
 
     analysis_tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
@@ -4789,11 +5224,15 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
 
     pulled: list[str] = []
     skipped: list[str] = []
+    missing_in_index: list[str] = []
     planned_cmds: list[list[str]] = []
+    root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
     for tag_dir in analysis_tags:
         clean_tag = tag_dir.strip("/")
         if not clean_tag:
             continue
+        if root_index is not None and not _index_entry_path_exists(root_index, clean_tag):
+            missing_in_index.append(clean_tag)
         if not remote and not (analysis_dir / clean_tag).exists():
             skipped.append(clean_tag)
             continue
@@ -4817,6 +5256,10 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
                 typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in cmd)}")
         else:
             typer.echo("No tagged paths selected for pull")
+        if missing_in_index:
+            typer.echo("Index warnings (not found in latest root index):")
+            for item in sorted(set(missing_in_index)):
+                typer.echo(f"- {item}")
         if skipped:
             typer.echo("Would skip tagged paths:")
             for item in skipped:
@@ -4861,7 +5304,15 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool) -> None:
         typer.echo("Skipped tagged paths:")
         for item in skipped:
             typer.echo(f"- {item}")
+    if missing_in_index:
+        typer.echo("Index warnings (not found in latest root index):")
+        for item in sorted(set(missing_in_index)):
+            typer.echo(f"- {item}")
     typer.echo(f"Recorded sync event: {record_path}")
+    if index_after:
+        manifest_path = _auto_index_active_root(project_root, cfg, target_name, target_cfg)
+        if manifest_path:
+            typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
 
 
 def _submit_or_preview_analysis_run(
@@ -4882,6 +5333,7 @@ def _submit_or_preview_analysis_run(
     node: str,
     parallel_environment: str,
     dry_run: bool,
+    index_after: bool,
 ) -> None:
     if not analysis_rel:
         raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
@@ -5066,6 +5518,10 @@ def _submit_or_preview_analysis_run(
     typer.echo(f"Node: {node}")
     typer.echo(f"Remote run dir: {remote_run_dir}")
     typer.echo(f"Remote log: {remote_log_file}")
+    if index_after:
+        manifest_path = _auto_index_active_root(project_root, cfg, target_name, target)
+        if manifest_path:
+            typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
 
 
 @sync_app.command("push")
@@ -5083,9 +5539,10 @@ def sync_pull(
     ),
     all_paths: bool = typer.Option(False, "--all", help="Pull the full active analysis directory"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview sync actions without any modifications"),
+    index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful pull"),
 ) -> None:
     """Pull active analysis data from the active target."""
-    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run)
+    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run, index_after=index_after)
 
 
 @sync_app.command("status")
@@ -5155,6 +5612,7 @@ def index_remote(
         None,
         "--remote-path",
         help="Remote relative path under the active analysis root to index (can include remote-only directories).",
+        autocompletion=_complete_index_remote_paths,
     ),
     all_tags: bool = typer.Option(False, "--all-tags", help="Index all tagged paths for the active analysis"),
     as_json: bool = typer.Option(False, "--json", help="Print resulting index payload as JSON"),
@@ -5176,25 +5634,15 @@ def index_remote(
     for scope in scopes:
         scope_rel = scope["scope"]
         scope_remote = scope["remote_scope"]
-        if _uses_local_transport(target_cfg):
-            entries = _index_local_scope(Path(scope_remote))
-        else:
-            entries = _index_remote_scope(target_cfg.host, scope_remote)
-        manifest = {
-            "indexed_at": datetime.now().isoformat(timespec="seconds"),
-            "project_root": str(project_root),
-            "analysis": analysis_rel,
-            "target": target_name,
-            "transport": target_cfg.transport,
-            "scheduler": target_cfg.scheduler,
-            "scope": scope_rel,
-            "remote_scope": scope_remote,
-            "entry_count": len(entries),
-            "entries": entries,
-        }
-        manifest_path = _index_manifest_path(project_root, target_name, analysis_rel, scope_rel)
-        manifest_path.write_text(json.dumps(manifest, indent=2))
-        indexed_manifests.append({"scope": scope_rel, "manifest_path": str(manifest_path), **manifest})
+        manifest = _write_index_manifest_for_scope(
+            project_root=project_root,
+            analysis_rel=analysis_rel,
+            target_name=target_name,
+            target_cfg=target_cfg,
+            scope_rel=scope_rel,
+            scope_remote=scope_remote,
+        )
+        indexed_manifests.append({"scope": scope_rel, "manifest_path": str(manifest.get("_manifest_path", "")), **manifest})
 
     if as_json:
         typer.echo(json.dumps(indexed_manifests, indent=2))
@@ -5551,9 +5999,10 @@ def pull(
     remote: bool = typer.Option(
         False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
     ),
+    index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful pull"),
 ) -> None:
     """Pull all tagged paths into the active analysis directory."""
-    _sync_pull(remote=remote, all_paths=False, dry_run=False)
+    _sync_pull(remote=remote, all_paths=False, dry_run=False, index_after=index_after)
 
 
 if __name__ == "__main__":

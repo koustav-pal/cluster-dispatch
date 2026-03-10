@@ -136,6 +136,9 @@ cdp index --remote-path nfcore/multiqc
 cdp index --all-tags --json
 ```
 
+When an index manifest exists for the requested remote scope, `cdp analysis list --remote` uses it automatically and falls back to live listing when no index is available.
+`cdp analysis tag --remote` also uses index data when available for faster path validation.
+
 Tag outputs for pull:
 
 ```bash
@@ -148,12 +151,15 @@ Pull tagged outputs:
 ```bash
 cdp analysis pull
 cdp analysis pull --remote
+cdp analysis pull --index-after
 ```
 
 Or full pull:
 
 ```bash
 cdp sync pull --all
+cdp sync pull --all --dry-run
+cdp sync pull --all --index-after
 ```
 
 Inspect sync history:
@@ -171,6 +177,7 @@ Single run:
 ```bash
 cdp analysis run python train.py --epochs 20
 cdp analysis run --dry-run python train.py --epochs 20
+cdp analysis run --index-after python train.py --epochs 20
 ```
 
 Retry a previous normal run:
@@ -184,6 +191,8 @@ Sweep run:
 
 ```bash
 cdp analysis sweep run --config sweep.yml \
+  python train.py --lr {lr} --batch-size {batch_size}
+cdp analysis sweep run --config sweep.yml --index-after \
   python train.py --lr {lr} --batch-size {batch_size}
 ```
 
@@ -231,6 +240,8 @@ cdp cancel --job-id 12345
 cdp collect --job-id 12345
 cdp stats --job-id 12345
 ```
+
+For terminal jobs, `cdp status` reports `output=...` based on latest index coverage of tagged outputs.
 
 ## Provenance, reporting, cleanup
 
