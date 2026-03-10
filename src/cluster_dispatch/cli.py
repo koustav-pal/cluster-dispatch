@@ -300,6 +300,22 @@ def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
 
 
+def _write_remote_script(host: str, remote_path: str, content: str, executable: bool = True) -> None:
+    command = f"cat > {shlex.quote(remote_path)}"
+    if executable:
+        command += f" && chmod +x {shlex.quote(remote_path)}"
+    proc = subprocess.run(
+        ["ssh", host, command],
+        input=content,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown remote write error").strip()
+        raise typer.BadParameter(f"Failed to write remote script {remote_path}: {detail}")
+
+
 def _is_local_host(host: str) -> bool:
     normalized = host.strip().lower()
     return normalized in {"", "localhost", "127.0.0.1", "::1"}
@@ -2174,15 +2190,7 @@ def _submit_sweep_single(
             submit_path.write_text(submit_script)
             submit_path.chmod(0o755)
         else:
-            _run_cmd(
-                [
-                    "ssh",
-                    target.host,
-                    "bash",
-                    "-lc",
-                    f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-                ]
-            )
+            _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
         submit_result = adapter.submit(target.host, remote_submit_script, transport=target.transport)
         submitted_at = datetime.now().isoformat(timespec="seconds")
         run["job_id"] = submit_result.job_id
@@ -2337,15 +2345,7 @@ def _submit_sweep_array(
         array_submit_path.write_text(array_script)
         array_submit_path.chmod(0o755)
     else:
-        _run_cmd(
-            [
-                "ssh",
-                target.host,
-                "bash",
-                "-lc",
-                f"cat > {shlex.quote(remote_array_submit)} <<'PC_EOF'\n{array_script}PC_EOF\nchmod +x {shlex.quote(remote_array_submit)}",
-            ]
-        )
+        _write_remote_script(target.host, remote_array_submit, array_script, executable=True)
 
     adapter = get_adapter(target.scheduler)
     submit_result = adapter.submit(target.host, remote_array_submit, transport=target.transport)
@@ -5447,15 +5447,7 @@ def _submit_or_preview_analysis_run(
         submit_path.write_text(submit_script)
         submit_path.chmod(0o755)
     else:
-        _run_cmd(
-            [
-                "ssh",
-                target.host,
-                "bash",
-                "-lc",
-                f"cat > {shlex.quote(remote_submit_script)} <<'PC_EOF'\n{submit_script}PC_EOF\nchmod +x {shlex.quote(remote_submit_script)}",
-            ]
-        )
+        _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
 
     adapter = get_adapter(target.scheduler)
     job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
