@@ -237,6 +237,45 @@ class TestClusterDispatchFlows(TestCase):
         self.assertTrue(payload)
         self.assertTrue(all(item.get("action") == "push" for item in payload))
 
+    def test_index_writes_manifest_for_active_analysis_scope(self) -> None:
+        nested = self.project / self.analysis_rel / "results"
+        nested.mkdir(parents=True, exist_ok=True)
+        (nested / "summary.txt").write_text("ok\n")
+
+        result = _invoke(self.runner, self.project, ["index", "results"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Index complete", result.output)
+
+        manifest = self.project / ".cluster_dispatch" / "index" / "local" / "analysis" / "a" / "results.json"
+        self.assertTrue(manifest.exists(), "Expected index manifest to be written")
+        payload = json.loads(manifest.read_text())
+        self.assertEqual(payload.get("target"), "local")
+        self.assertEqual(payload.get("analysis"), str(self.analysis_rel).replace("\\", "/"))
+        self.assertEqual(payload.get("scope"), "results")
+        self.assertTrue(payload.get("entry_count", 0) >= 1)
+        entries = payload.get("entries", [])
+        self.assertTrue(any(item.get("path") == "summary.txt" for item in entries))
+
+    def test_index_all_tags_writes_one_manifest_per_tag(self) -> None:
+        (self.project / self.analysis_rel / "nfcore" / "multiqc").mkdir(parents=True, exist_ok=True)
+        (self.project / self.analysis_rel / "nfcore" / "report.txt").write_text("r\n")
+        (self.project / self.analysis_rel / "logs").mkdir(parents=True, exist_ok=True)
+        (self.project / self.analysis_rel / "logs" / "run.log").write_text("x\n")
+
+        tag_a = _invoke(self.runner, self.project, ["analysis", "tag", "nfcore"])
+        self.assertEqual(tag_a.exit_code, 0, tag_a.output)
+        tag_b = _invoke(self.runner, self.project, ["analysis", "tag", "logs"])
+        self.assertEqual(tag_b.exit_code, 0, tag_b.output)
+
+        result = _invoke(self.runner, self.project, ["index", "--all-tags", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(len(payload), 2)
+        scopes = sorted(item.get("scope") for item in payload)
+        self.assertEqual(scopes, ["logs", "nfcore"])
+        for item in payload:
+            self.assertTrue(Path(str(item.get("manifest_path", ""))).exists())
+
     def test_target_remove_default_requires_force(self) -> None:
         template = self.project / "none.tmpl"
         template.write_text(

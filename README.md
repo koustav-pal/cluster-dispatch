@@ -127,6 +127,15 @@ cdp sync push
 cdp sync push --dry-run
 ```
 
+Index remote metadata without pulling files:
+
+```bash
+cdp index
+cdp index results
+cdp index --remote-path nfcore/multiqc
+cdp index --all-tags --json
+```
+
 Tag outputs for pull:
 
 ```bash
@@ -267,6 +276,7 @@ cdp import backup.tar.gz --overwrite
 
 Top-level command groups and commands:
 - `analysis`: `use`, `tag`, `list`, `run`, `pull`, `sweep ...`
+- `index`: metadata-only remote analysis indexing (writes manifests to `.cluster_dispatch/index/`)
 - `target`: `add`, `set`, `list`, `remove`, `test`
 - `profile`: `list`, `show`, `set`, `delete`
 - `ignore`: `list`, `add`, `remove`

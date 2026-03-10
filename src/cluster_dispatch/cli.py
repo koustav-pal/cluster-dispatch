@@ -70,6 +70,7 @@ TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
 SWEEPS_DIR_NAME = "sweeps"
 SYNC_EVENTS_DIR_NAME = "sync"
+INDEX_DIR_NAME = "index"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
     "small": {
@@ -534,6 +535,177 @@ def _sync_events_dir(project_root: Path) -> Path:
     path = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _index_dir(project_root: Path) -> Path:
+    path = project_root / CONFIG_DIR / INDEX_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _index_manifest_path(project_root: Path, target_name: str, analysis_rel: str, scope_rel: str) -> Path:
+    safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_name).strip("._-") or "target"
+    safe_analysis = [re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._-") for part in analysis_rel.split("/") if part]
+    analysis_dir = _index_dir(project_root) / safe_target
+    for part in safe_analysis:
+        analysis_dir = analysis_dir / part
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    clean_scope = scope_rel.strip("/")
+    if clean_scope in {"", "."}:
+        scope_stem = "root"
+    else:
+        scope_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean_scope.replace("/", "__")).strip("._-") or "scope"
+    return analysis_dir / f"{scope_stem}.json"
+
+
+def _iso_from_epoch(value: float) -> str:
+    return datetime.fromtimestamp(value).isoformat(timespec="seconds")
+
+
+def _index_local_scope(scope_root: Path) -> list[dict[str, Any]]:
+    if not scope_root.exists():
+        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
+
+    entries: list[dict[str, Any]] = []
+    if scope_root.is_file():
+        stats = scope_root.stat()
+        entries.append(
+            {
+                "path": ".",
+                "type": "file",
+                "size": int(stats.st_size),
+                "mtime_epoch": int(stats.st_mtime),
+                "mtime": _iso_from_epoch(stats.st_mtime),
+            }
+        )
+        return entries
+
+    for path in sorted(scope_root.rglob("*")):
+        try:
+            rel = path.relative_to(scope_root).as_posix()
+        except ValueError:
+            continue
+        stats = path.stat()
+        entries.append(
+            {
+                "path": rel,
+                "type": ("dir" if path.is_dir() else "file"),
+                "size": int(stats.st_size),
+                "mtime_epoch": int(stats.st_mtime),
+                "mtime": _iso_from_epoch(stats.st_mtime),
+            }
+        )
+    return entries
+
+
+def _index_remote_scope(host: str, scope_root: str) -> list[dict[str, Any]]:
+    remote_cmd = (
+        f'P={shlex.quote(scope_root)}; '
+        'if [ ! -e "$P" ]; then exit 3; fi; '
+        'if [ -f "$P" ]; then '
+        'stat -c ".\\tf\\t%s\\t%Y" "$P"; '
+        "else "
+        'find "$P" -mindepth 1 -printf "%P\\t%y\\t%s\\t%T@\\n" | sort; '
+        "fi"
+    )
+    proc = subprocess.run(
+        ["ssh", host, remote_cmd],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode == 3:
+        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "unknown remote indexing error").strip()
+        raise typer.BadParameter(f"Failed to index remote scope '{scope_root}': {err}")
+
+    entries: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) != 4:
+            continue
+        rel_path, kind, size_raw, mtime_raw = parts
+        entry_type = "dir" if kind == "d" else "file"
+        try:
+            size_value = int(float(size_raw))
+        except ValueError:
+            size_value = 0
+        try:
+            epoch_value = int(float(mtime_raw))
+        except ValueError:
+            epoch_value = 0
+        entries.append(
+            {
+                "path": rel_path,
+                "type": entry_type,
+                "size": size_value,
+                "mtime_epoch": epoch_value,
+                "mtime": _iso_from_epoch(float(epoch_value)) if epoch_value > 0 else "",
+            }
+        )
+    return entries
+
+
+def _resolve_index_scopes(
+    *,
+    analysis_dir: Path,
+    analysis_rel: str,
+    target_cfg: TargetConfig,
+    remote_analysis_root: str,
+    local_path: str,
+    remote_path: Optional[str],
+    all_tags: bool,
+    analysis_tags: list[str],
+) -> list[dict[str, str]]:
+    scopes: list[str] = []
+    if all_tags:
+        scopes = [tag.strip("/") for tag in analysis_tags if tag.strip("/")]
+        if not scopes:
+            raise typer.BadParameter("No tags found for active analysis. Tag paths with `cdp analysis tag <path>` first.")
+    elif remote_path:
+        normalized = remote_path.strip()
+        if not normalized:
+            raise typer.BadParameter("--remote-path cannot be empty")
+        if normalized.startswith("/"):
+            if normalized != remote_analysis_root and not normalized.startswith(f"{remote_analysis_root.rstrip('/')}/"):
+                raise typer.BadParameter("--remote-path must stay inside the active analysis remote root")
+            normalized = normalized.removeprefix(remote_analysis_root).strip("/")
+        scopes = [normalized]
+    else:
+        candidate = Path(local_path).expanduser()
+        if candidate.is_absolute():
+            raise typer.BadParameter("Path must be relative to the active analysis directory")
+        local_target = (analysis_dir / candidate).resolve()
+        try:
+            rel = local_target.relative_to(analysis_dir).as_posix()
+        except ValueError as exc:
+            raise typer.BadParameter("Path must stay inside the active analysis directory") from exc
+        scopes = ["" if rel == "." else rel]
+
+    resolved: list[dict[str, str]] = []
+    for scope_rel in scopes:
+        clean_scope = scope_rel.strip("/")
+        local_scope = analysis_dir if not clean_scope else (analysis_dir / clean_scope)
+        remote_scope = remote_analysis_root if not clean_scope else f"{remote_analysis_root.rstrip('/')}/{clean_scope}"
+        if _uses_local_transport(target_cfg):
+            local_remote_scope = Path(remote_scope).expanduser()
+            resolved.append(
+                {
+                    "scope": clean_scope or ".",
+                    "local_scope": str(local_scope),
+                    "remote_scope": str(local_remote_scope),
+                }
+            )
+        else:
+            resolved.append(
+                {
+                    "scope": clean_scope or ".",
+                    "local_scope": str(local_scope),
+                    "remote_scope": remote_scope,
+                }
+            )
+    return resolved
 
 
 def _write_sync_event(project_root: Path, payload: dict[str, Any]) -> Path:
@@ -4969,6 +5141,69 @@ def sync_status(
             f"target={str(event.get('target', ''))} analysis={str(event.get('analysis', ''))} "
             f"mode={str(event.get('mode', ''))} source={str(event.get('source', ''))} "
             f"destination={str(event.get('destination', ''))}"
+        )
+
+
+@app.command("index")
+def index_remote(
+    path: str = typer.Argument(
+        ".",
+        help="Nested path inside active analysis directory to index.",
+        autocompletion=_complete_active_analysis_paths,
+    ),
+    remote_path: Optional[str] = typer.Option(
+        None,
+        "--remote-path",
+        help="Remote relative path under the active analysis root to index (can include remote-only directories).",
+    ),
+    all_tags: bool = typer.Option(False, "--all-tags", help="Index all tagged paths for the active analysis"),
+    as_json: bool = typer.Option(False, "--json", help="Print resulting index payload as JSON"),
+) -> None:
+    """Create metadata-only index manifests for remote analysis paths without pulling files."""
+    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
+    scopes = _resolve_index_scopes(
+        analysis_dir=analysis_dir,
+        analysis_rel=analysis_rel,
+        target_cfg=target_cfg,
+        remote_analysis_root=remote_analysis_root,
+        local_path=path,
+        remote_path=remote_path,
+        all_tags=all_tags,
+        analysis_tags=cfg.analysis_tags.get(cfg.active_analysis or "", []),
+    )
+
+    indexed_manifests: list[dict[str, Any]] = []
+    for scope in scopes:
+        scope_rel = scope["scope"]
+        scope_remote = scope["remote_scope"]
+        if _uses_local_transport(target_cfg):
+            entries = _index_local_scope(Path(scope_remote))
+        else:
+            entries = _index_remote_scope(target_cfg.host, scope_remote)
+        manifest = {
+            "indexed_at": datetime.now().isoformat(timespec="seconds"),
+            "project_root": str(project_root),
+            "analysis": analysis_rel,
+            "target": target_name,
+            "transport": target_cfg.transport,
+            "scheduler": target_cfg.scheduler,
+            "scope": scope_rel,
+            "remote_scope": scope_remote,
+            "entry_count": len(entries),
+            "entries": entries,
+        }
+        manifest_path = _index_manifest_path(project_root, target_name, analysis_rel, scope_rel)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        indexed_manifests.append({"scope": scope_rel, "manifest_path": str(manifest_path), **manifest})
+
+    if as_json:
+        typer.echo(json.dumps(indexed_manifests, indent=2))
+        return
+
+    typer.echo("Index complete (metadata only, no file transfer).")
+    for item in indexed_manifests:
+        typer.echo(
+            f"- scope={item['scope']} entries={item['entry_count']} remote={item['remote_scope']} manifest={item['manifest_path']}"
         )
 
 
