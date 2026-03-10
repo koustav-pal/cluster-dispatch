@@ -339,6 +339,9 @@ def _run_direct(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
     log_remote = is_remote and (REMOTE_VERBOSE or VERBOSITY_LEVEL >= 1) and not QUIET_MODE
     if log_remote:
         typer.echo(f"[remote] $ {_render_command(cmd)}", err=True)
+    # Prevent non-interactive remote commands from hanging while waiting on stdin.
+    if is_remote and "input" not in kwargs and kwargs.get("stdin") is None:
+        kwargs["stdin"] = subprocess.DEVNULL
     proc = _SUBPROCESS_RUN(*args, **kwargs)
     if is_remote and not QUIET_MODE and (REMOTE_VERBOSE or VERBOSITY_LEVEL >= 2):
         stdout = getattr(proc, "stdout", None)

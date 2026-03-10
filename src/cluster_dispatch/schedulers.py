@@ -50,7 +50,13 @@ def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = Fa
     if _uses_local_transport(transport, host):
         proc = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
     else:
-        proc = subprocess.run(["ssh", host, "bash", "-lc", command], capture_output=True, text=True, check=check)
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, "bash", "-lc", command],
+            capture_output=True,
+            text=True,
+            check=check,
+            stdin=subprocess.DEVNULL,
+        )
 
     if not is_local and not quiet_mode and (remote_verbose or verbose_level >= 2):
         if proc.stdout.strip():
