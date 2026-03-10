@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import shlex
+import sys
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -37,9 +40,24 @@ def _uses_local_transport(transport: str, host: str) -> bool:
 
 
 def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = False) -> subprocess.CompletedProcess[str]:
+    verbose_level = int(os.environ.get("CDP_VERBOSE_LEVEL", "0") or "0")
+    remote_verbose = os.environ.get("CDP_REMOTE_VERBOSE", "0") == "1"
+    quiet_mode = os.environ.get("CDP_QUIET", "0") == "1"
+    is_local = _uses_local_transport(transport, host)
+    if not is_local and not quiet_mode and (remote_verbose or verbose_level >= 1):
+        print(f"[remote] $ ssh {shlex.quote(host)} bash -lc {shlex.quote(command)}", file=sys.stderr)
+
     if _uses_local_transport(transport, host):
-        return subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
-    return subprocess.run(["ssh", host, "bash", "-lc", command], capture_output=True, text=True, check=check)
+        proc = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
+    else:
+        proc = subprocess.run(["ssh", host, "bash", "-lc", command], capture_output=True, text=True, check=check)
+
+    if not is_local and not quiet_mode and (remote_verbose or verbose_level >= 2):
+        if proc.stdout.strip():
+            print(f"[remote][stdout]\n{proc.stdout.rstrip()}", file=sys.stderr)
+        if proc.stderr.strip():
+            print(f"[remote][stderr]\n{proc.stderr.rstrip()}", file=sys.stderr)
+    return proc
 
 
 class SGEAdapter:

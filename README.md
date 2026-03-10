@@ -37,6 +37,15 @@ Verify:
 cdp --help
 ```
 
+Verbose remote communication:
+
+```bash
+cdp -v analysis run ...
+cdp -vv analysis run ...
+cdp --remote-verbose analysis run ...
+cdp --quiet ...
+```
+
 Shell completion:
 
 ```bash

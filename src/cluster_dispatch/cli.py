@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import secrets
 import subprocess
+import os
 import json
 import re
 import tarfile
@@ -65,6 +66,10 @@ app.add_typer(sync_app, name="sync")
 app.add_typer(config_app, name="config")
 app.add_typer(cleanup_app, name="cleanup")
 
+VERBOSITY_LEVEL = 0
+REMOTE_VERBOSE = False
+QUIET_MODE = False
+
 
 TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
@@ -122,6 +127,22 @@ DEFAULT_GITIGNORE_CONTENT = (
 )
 
 
+@app.callback()
+def _global_options(
+    verbose: int = typer.Option(0, "-v", "--verbose", count=True, help="Increase verbosity (repeat for more detail)"),
+    remote_verbose: bool = typer.Option(False, "--remote-verbose", help="Always print remote SSH/rsync commands and output"),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress non-essential output"),
+) -> None:
+    """Global output controls."""
+    global VERBOSITY_LEVEL, REMOTE_VERBOSE, QUIET_MODE
+    VERBOSITY_LEVEL = int(max(0, verbose))
+    REMOTE_VERBOSE = bool(remote_verbose)
+    QUIET_MODE = bool(quiet)
+    os.environ["CDP_VERBOSE_LEVEL"] = str(VERBOSITY_LEVEL)
+    os.environ["CDP_REMOTE_VERBOSE"] = "1" if REMOTE_VERBOSE else "0"
+    os.environ["CDP_QUIET"] = "1" if QUIET_MODE else "0"
+
+
 def _project_root() -> Path:
     return find_project_root()
 
@@ -131,7 +152,7 @@ def _ignore_file(project_root: Path) -> Path:
 
 
 def get_git_info(project_root: Path) -> Optional[dict[str, Any]]:
-    repo_root_proc = subprocess.run(
+    repo_root_proc = _run_direct(
         ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
         text=True,
         capture_output=True,
@@ -141,19 +162,19 @@ def get_git_info(project_root: Path) -> Optional[dict[str, Any]]:
         return None
 
     repo_root = repo_root_proc.stdout.strip()
-    branch_proc = subprocess.run(
+    branch_proc = _run_direct(
         ["git", "-C", str(project_root), "rev-parse", "--abbrev-ref", "HEAD"],
         text=True,
         capture_output=True,
         check=False,
     )
-    head_proc = subprocess.run(
+    head_proc = _run_direct(
         ["git", "-C", str(project_root), "rev-parse", "HEAD"],
         text=True,
         capture_output=True,
         check=False,
     )
-    dirty_proc = subprocess.run(
+    dirty_proc = _run_direct(
         ["git", "-C", str(project_root), "status", "--porcelain"],
         text=True,
         capture_output=True,
@@ -296,15 +317,48 @@ def _active_target(cfg: ProjectConfig) -> tuple[str, TargetConfig]:
     return name, cfg.targets[name]
 
 
+def _is_remote_command(cmd: Any) -> bool:
+    if isinstance(cmd, list) and cmd:
+        first = str(cmd[0]).strip().lower()
+        return first in {"ssh", "rsync", "scp", "sftp"}
+    return False
+
+
+def _render_command(cmd: Any) -> str:
+    if isinstance(cmd, list):
+        return " ".join(shlex.quote(str(part)) for part in cmd)
+    return str(cmd)
+
+
+_SUBPROCESS_RUN = subprocess.run
+
+
+def _run_direct(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    cmd = args[0] if args else kwargs.get("args")
+    is_remote = _is_remote_command(cmd)
+    log_remote = is_remote and (REMOTE_VERBOSE or VERBOSITY_LEVEL >= 1) and not QUIET_MODE
+    if log_remote:
+        typer.echo(f"[remote] $ {_render_command(cmd)}", err=True)
+    proc = _SUBPROCESS_RUN(*args, **kwargs)
+    if is_remote and not QUIET_MODE and (REMOTE_VERBOSE or VERBOSITY_LEVEL >= 2):
+        stdout = getattr(proc, "stdout", None)
+        stderr = getattr(proc, "stderr", None)
+        if isinstance(stdout, str) and stdout.strip():
+            typer.echo(f"[remote][stdout]\n{stdout.rstrip()}", err=True)
+        if isinstance(stderr, str) and stderr.strip():
+            typer.echo(f"[remote][stderr]\n{stderr.rstrip()}", err=True)
+    return proc
+
+
 def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, check=check)
+    return _run_direct(cmd, text=True, capture_output=True, check=check)
 
 
 def _write_remote_script(host: str, remote_path: str, content: str, executable: bool = True) -> None:
     command = f"cat > {shlex.quote(remote_path)}"
     if executable:
         command += f" && chmod +x {shlex.quote(remote_path)}"
-    proc = subprocess.run(
+    proc = _run_direct(
         ["ssh", host, command],
         input=content,
         text=True,
@@ -852,7 +906,7 @@ def _index_remote_scope(host: str, scope_root: str) -> list[dict[str, Any]]:
         'find "$P" -mindepth 1 -printf "%P\\t%y\\t%s\\t%T@\\n" | sort; '
         "fi"
     )
-    proc = subprocess.run(
+    proc = _run_direct(
         ["ssh", host, remote_cmd],
         text=True,
         capture_output=True,
@@ -1307,7 +1361,7 @@ def init(
 
         git_info = get_git_info(project_root)
         if git_info is None:
-            init_proc = subprocess.run(
+            init_proc = _run_direct(
                 ["git", "init"],
                 cwd=project_root,
                 text=True,
@@ -1604,7 +1658,7 @@ def target_test(
                 else:
                     _add("WARN", "scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
         else:
-            ssh_probe = subprocess.run(
+            ssh_probe = _run_direct(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
                 text=True,
                 capture_output=True,
@@ -1616,7 +1670,7 @@ def target_test(
                 _add("FAIL", "connectivity", ssh_probe.stderr.strip() or ssh_probe.stdout.strip() or "SSH failed")
 
             if ssh_probe.returncode == 0 and "cdp-ok" in ssh_probe.stdout:
-                root_probe = subprocess.run(
+                root_probe = _run_direct(
                     [
                         "ssh",
                         tcfg.host,
@@ -1631,7 +1685,7 @@ def target_test(
                 if root_probe.returncode == 0 and root_probe.stdout.strip() == "OK":
                     _add("PASS", "remote_root_exists", tcfg.remote_root)
                 elif create_root:
-                    create_probe = subprocess.run(
+                    create_probe = _run_direct(
                         ["ssh", tcfg.host, "mkdir", "-p", tcfg.remote_root],
                         text=True,
                         capture_output=True,
@@ -1650,7 +1704,7 @@ def target_test(
 
                 required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
                 if required_cmds:
-                    cmd_probe = subprocess.run(
+                    cmd_probe = _run_direct(
                         ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
                         text=True,
                         capture_output=True,
@@ -1877,7 +1931,7 @@ def doctor(
                     _add("WARN", f"target:{name}:scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
             continue
 
-        ssh_probe = subprocess.run(
+        ssh_probe = _run_direct(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
             text=True,
             capture_output=True,
@@ -1889,7 +1943,7 @@ def doctor(
             _add("FAIL", f"target:{name}:ssh", ssh_probe.stderr.strip() or ssh_probe.stdout.strip() or "SSH failed")
             continue
 
-        root_probe = subprocess.run(
+        root_probe = _run_direct(
             ["ssh", tcfg.host, "bash", "-lc", f"if [ -d {shlex.quote(tcfg.remote_root)} ]; then echo OK; else echo MISSING; fi"],
             text=True,
             capture_output=True,
@@ -1902,7 +1956,7 @@ def doctor(
 
         required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
         if required_cmds:
-            cmd_probe = subprocess.run(
+            cmd_probe = _run_direct(
                 ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
                 text=True,
                 capture_output=True,
@@ -2415,7 +2469,7 @@ def _submit_sweep_local(
         local_log_file = local_sweep_dir / f"run_{run['run_id']}.log"
         submitted_at = datetime.now().isoformat(timespec="seconds")
 
-        proc = subprocess.run(
+        proc = _run_direct(
             str(run["command"]),
             shell=True,
             cwd=project_root,
@@ -2797,9 +2851,9 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
     if mode == "array" and manifest.get("array_job_id"):
         cmd = _cancel_command_for_scheduler(scheduler, str(manifest["array_job_id"]))
         if _uses_local_transport(target_cfg):
-            proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
+            proc = _run_direct(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
         else:
-            proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+            proc = _run_direct(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
         if proc.returncode == 0:
             cancelled += 1
         else:
@@ -2818,9 +2872,9 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
             seen.add(job_id)
             cmd = _cancel_command_for_scheduler(scheduler, job_id)
             if _uses_local_transport(target_cfg):
-                proc = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
+                proc = _run_direct(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
             else:
-                proc = subprocess.run(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+                proc = _run_direct(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
             if proc.returncode == 0:
                 cancelled += 1
                 run["status"] = "CANCEL_REQUESTED"
@@ -2897,7 +2951,7 @@ def analysis_tag(
                     raise typer.BadParameter(f"Tag path not found remotely: {remote_tag_path}")
             else:
                 remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
-                proc = subprocess.run(
+                proc = _run_direct(
                     ["ssh", target.host, remote_cmd],
                     text=True,
                     capture_output=True,
@@ -3006,14 +3060,14 @@ def analysis_list(
         + "fi"
     )
     if _uses_local_transport(target):
-        proc = subprocess.run(
+        proc = _run_direct(
             ["bash", "-lc", remote_cmd],
             text=True,
             capture_output=True,
             check=False,
         )
     else:
-        proc = subprocess.run(
+        proc = _run_direct(
             ["ssh", target.host, remote_cmd],
             text=True,
             capture_output=True,
@@ -3166,7 +3220,7 @@ def _show_last_status(follow: bool = False) -> None:
         if _uses_local_transport(target_cfg):
             _show_local_log(Path(str(last["remote_log_file"])), follow=True, head=None, tail=50)
         else:
-            subprocess.run(
+            _run_direct(
                 ["ssh", "-t", target_cfg.host, "bash", "-lc", f"tail -n 50 -f {shlex.quote(last['remote_log_file'])}"],
                 check=True,
             )
@@ -3177,7 +3231,7 @@ def _show_last_status(follow: bool = False) -> None:
                 typer.echo("--- log tail ---")
                 _show_local_log(log_path, follow=False, head=None, tail=20)
         else:
-            proc = subprocess.run(
+            proc = _run_direct(
                 [
                     "ssh",
                     target_cfg.host,
@@ -3354,7 +3408,7 @@ def _show_local_log(log_file: Path, follow: bool, head: Optional[int], tail: Opt
 
     line_count = tail if tail is not None else 50
     if follow:
-        subprocess.run(["tail", "-n", str(line_count), "-f", str(log_file)], check=True)
+        _run_direct(["tail", "-n", str(line_count), "-f", str(log_file)], check=True)
         return
 
     lines = log_file.read_text(errors="replace").splitlines()
@@ -3389,7 +3443,7 @@ def _fetch_log_tail(selected: dict[str, Any], cfg: ProjectConfig, project_root: 
     if selected_target not in cfg.targets:
         return ""
     host = cfg.targets[selected_target].host
-    proc = subprocess.run(
+    proc = _run_direct(
         ["ssh", host, f"if [ -f {shlex.quote(remote_log_file)} ]; then tail -n {tail_lines} {shlex.quote(remote_log_file)}; fi"],
         text=True,
         capture_output=True,
@@ -3496,14 +3550,14 @@ def cancel(
         cancel_cmd = _cancel_command_for_scheduler(rec_scheduler, rec_job_id)
         target_cfg = cfg.targets[rec_target]
         if _uses_local_transport(target_cfg):
-            proc = subprocess.run(
+            proc = _run_direct(
                 ["bash", "-lc", cancel_cmd],
                 text=True,
                 capture_output=True,
                 check=False,
             )
         else:
-            proc = subprocess.run(
+            proc = _run_direct(
                 ["ssh", target_cfg.host, cancel_cmd],
                 text=True,
                 capture_output=True,
@@ -3608,10 +3662,10 @@ def logs(
             f"Following log for job_id={selected.get('job_id', '')} "
             f"job_name={selected.get('job_name', '')} target={selected_target}: {remote_log_file}"
         )
-        subprocess.run(["ssh", "-t", host, remote_cmd], check=True)
+        _run_direct(["ssh", "-t", host, remote_cmd], check=True)
         return
 
-    proc = subprocess.run(["ssh", host, remote_cmd], text=True, capture_output=True, check=False)
+    proc = _run_direct(["ssh", host, remote_cmd], text=True, capture_output=True, check=False)
     if proc.returncode != 0:
         raise typer.BadParameter(proc.stderr.strip() or "Failed to fetch remote log")
 
@@ -4502,13 +4556,13 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str, transport: str = "s
 
     def _run_stats_cmd(command: str) -> subprocess.CompletedProcess[str]:
         if local_transport:
-            return subprocess.run(
+            return _run_direct(
                 ["bash", "-lc", command],
                 text=True,
                 capture_output=True,
                 check=False,
             )
-        return subprocess.run(
+        return _run_direct(
             ["ssh", host, "bash", "-lc", command],
             text=True,
             capture_output=True,
