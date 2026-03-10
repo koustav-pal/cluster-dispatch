@@ -74,10 +74,24 @@ class TestClusterDispatchFlows(TestCase):
         )
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Dry run: no changes will be made", result.output)
+        expected_remote_analysis = str((self.project / self.analysis_rel).resolve())
+        self.assertIn(f"cd {expected_remote_analysis}", result.output)
 
         after_jobs = list(jobs_dir.glob("*.json"))
         self.assertEqual(after_jobs, [])
         self.assertFalse(state_file.exists())
+
+    def test_analysis_run_dry_run_from_subdir_uses_matching_remote_working_dir(self) -> None:
+        scripts_dir = self.project / self.analysis_rel / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        result = _invoke(
+            self.runner,
+            scripts_dir,
+            ["analysis", "run", "--dry-run", "python", "-c", "print(1)"],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        expected_remote_workdir = f"{(self.project / self.analysis_rel).resolve().as_posix()}/scripts"
+        self.assertIn(f"cd {expected_remote_workdir}", result.output)
 
     def test_build_submit_script_places_scheduler_header_before_commands(self) -> None:
         script = _build_submit_script(

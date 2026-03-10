@@ -2133,6 +2133,7 @@ def _append_sweep_job_record(
     ignore_used: bool,
     profile_name: Optional[str],
     submitted_at: str,
+    working_dir: Optional[str] = None,
     scheduler_override: Optional[str] = None,
     state_override: Optional[str] = None,
 ) -> None:
@@ -2154,7 +2155,7 @@ def _append_sweep_job_record(
             command=str(run.get("command", "")),
             remote_run_dir=remote_sweep_dir,
             remote_log_file=remote_log_file,
-            working_dir=target.remote_root,
+            working_dir=(working_dir if working_dir is not None else target.remote_root),
             cpus=run.get("resources", {}).get("cpus"),
             memory=run.get("resources", {}).get("memory"),
             walltime=run.get("resources", {}).get("time"),
@@ -2204,8 +2205,9 @@ def _submit_sweep_single(
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
     analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
     sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
-    sync_destination = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
+    sync_destination = remote_analysis_root
     ignore_path = _ignore_file(project_root)
     ignore_file_path = str(ignore_path) if ignore_path.exists() else None
     ignore_used = bool(ignore_file_path)
@@ -2233,13 +2235,13 @@ def _submit_sweep_single(
                 job_name=run_name,
                 stdout=run_name,
                 stderr=run_name,
-                working_dir=target.remote_root,
+                working_dir=remote_analysis_root,
                 queue=str(resources["queue"]),
                 node=str(resources["node"]),
                 parallel_environment=str(resources["parallel_environment"]),
             ),
             command=str(run["command"]),
-            working_dir=target.remote_root,
+            working_dir=remote_analysis_root,
             remote_log_file=remote_log_file,
         )
         if local_target_mode:
@@ -2278,6 +2280,7 @@ def _submit_sweep_single(
             ignore_used=ignore_used,
             profile_name=profile_name,
             submitted_at=submitted_at,
+            working_dir=remote_analysis_root,
         )
         submitted_count += 1
         if offset < len(run_indexes) - 1:
@@ -2319,8 +2322,9 @@ def _submit_sweep_array(
 
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
     analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
     sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
-    sync_destination = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
+    sync_destination = remote_analysis_root
     ignore_path = _ignore_file(project_root)
     ignore_file_path = str(ignore_path) if ignore_path.exists() else None
     ignore_used = bool(ignore_file_path)
@@ -2382,7 +2386,7 @@ def _submit_sweep_array(
         job_name=f"{base_job_name}-array",
         stdout=f"{base_job_name}-array",
         stderr=f"{base_job_name}-array",
-        working_dir=target.remote_root,
+        working_dir=remote_analysis_root,
         queue=str(resources["queue"]),
         node=str(resources["node"]),
         parallel_environment=str(resources["parallel_environment"]),
@@ -2397,7 +2401,7 @@ def _submit_sweep_array(
     array_script = _build_submit_script(
         header=array_header,
         command=f"bash {shlex.quote(wrapper_remote)} {shlex.quote(tsv_remote)}",
-        working_dir=target.remote_root,
+        working_dir=remote_analysis_root,
         remote_log_file=remote_log_file,
     )
     if local_target_mode:
@@ -2447,6 +2451,7 @@ def _submit_sweep_array(
             ignore_used=ignore_used,
             profile_name=profile_name,
             submitted_at=submitted_at,
+            working_dir=remote_analysis_root,
         )
     return len(run_indexes)
 
@@ -4146,7 +4151,7 @@ def run_validate(
                     job_name=str(resolved_job_name),
                     stdout=str(resolved_job_name),
                     stderr=str(resolved_job_name),
-                    working_dir=target.remote_root,
+                    working_dir=(f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root),
                     queue=str(resolved_queue or ""),
                     node=str(resolved_node),
                     parallel_environment=str(resolved_pe or ""),
@@ -5417,8 +5422,14 @@ def _submit_or_preview_analysis_run(
             "--parallel-environment is required (or set target default_parallel_environment) because template includes {parallel_environment}."
         )
 
-    resolved_working_dir = target.remote_root
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+    resolved_working_dir = remote_analysis_root
+    try:
+        local_cwd_rel = Path.cwd().resolve().relative_to(analysis_dir.resolve()).as_posix()
+    except ValueError:
+        local_cwd_rel = "."
+    if local_cwd_rel not in {"", "."}:
+        resolved_working_dir = f"{remote_analysis_root.rstrip('/')}/{local_cwd_rel}"
     run_id = _deterministic_analysis_run_id(
         target_name=target_name,
         analysis_rel=analysis_rel,
