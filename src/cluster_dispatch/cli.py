@@ -1229,11 +1229,12 @@ def _build_submit_script(
     working_dir: str,
     remote_log_file: str,
 ) -> str:
-    lines: list[str] = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    lines: list[str] = ["#!/usr/bin/env bash"]
     if header.strip():
         lines.extend(header.strip().splitlines())
     lines.extend(
         [
+            "set -euo pipefail",
             f"cd {shlex.quote(working_dir)}",
             "echo \"[cluster-dispatch] started $(date -Iseconds)\"",
             f"{command} >> {shlex.quote(remote_log_file)} 2>&1",

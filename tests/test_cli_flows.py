@@ -18,7 +18,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from cluster_dispatch.cli import app  # noqa: E402
+from cluster_dispatch.cli import app, _build_submit_script  # noqa: E402
 
 
 @contextmanager
@@ -78,6 +78,22 @@ class TestClusterDispatchFlows(TestCase):
         after_jobs = list(jobs_dir.glob("*.json"))
         self.assertEqual(after_jobs, [])
         self.assertFalse(state_file.exists())
+
+    def test_build_submit_script_places_scheduler_header_before_commands(self) -> None:
+        script = _build_submit_script(
+            header="#PBS -l walltime=01:00:00\n#PBS -N demo",
+            command="echo hello",
+            working_dir="/tmp/work",
+            remote_log_file="/tmp/work/run.log",
+        )
+        lines = script.splitlines()
+        self.assertEqual(lines[0], "#!/usr/bin/env bash")
+        self.assertIn("#PBS -l walltime=01:00:00", lines[1:4])
+        self.assertIn("set -euo pipefail", lines)
+        # Ensure directives appear before first executable shell command.
+        first_exec_idx = lines.index("set -euo pipefail")
+        walltime_idx = lines.index("#PBS -l walltime=01:00:00")
+        self.assertLess(walltime_idx, first_exec_idx)
 
     def test_analysis_run_local_transport_uses_no_ssh(self) -> None:
         ssh_calls: list[list[str]] = []
