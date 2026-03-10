@@ -5427,10 +5427,9 @@ def _submit_or_preview_analysis_run(
         return
 
     if local_target_mode:
-        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
         Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
     else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_analysis_root])
 
     rsync_cmd = ["rsync", "-az", "--delete"]
     if project_ignore.exists():
@@ -5442,11 +5441,13 @@ def _submit_or_preview_analysis_run(
     _run_cmd(rsync_cmd)
 
     if local_target_mode:
+        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
         submit_path = Path(remote_submit_script)
         submit_path.parent.mkdir(parents=True, exist_ok=True)
         submit_path.write_text(submit_script)
         submit_path.chmod(0o755)
     else:
+        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
         _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
 
     adapter = get_adapter(target.scheduler)
