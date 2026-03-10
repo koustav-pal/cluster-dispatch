@@ -2248,7 +2248,10 @@ def _submit_sweep_single(
             submit_path.chmod(0o755)
         else:
             _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
-        submit_result = adapter.submit(target.host, remote_submit_script, transport=target.transport)
+        try:
+            submit_result = adapter.submit(target.host, remote_submit_script, transport=target.transport)
+        except Exception as exc:
+            raise typer.BadParameter(f"Failed to submit sweep run {run.get('run_id', '')}: {exc}") from exc
         submitted_at = datetime.now().isoformat(timespec="seconds")
         run["job_id"] = submit_result.job_id
         run["job_name"] = run_name
@@ -2405,7 +2408,10 @@ def _submit_sweep_array(
         _write_remote_script(target.host, remote_array_submit, array_script, executable=True)
 
     adapter = get_adapter(target.scheduler)
-    submit_result = adapter.submit(target.host, remote_array_submit, transport=target.transport)
+    try:
+        submit_result = adapter.submit(target.host, remote_array_submit, transport=target.transport)
+    except Exception as exc:
+        raise typer.BadParameter(f"Failed to submit sweep array job: {exc}") from exc
     base_job_id = submit_result.job_id
     manifest["array_job_id"] = base_job_id
 
@@ -5508,7 +5514,10 @@ def _submit_or_preview_analysis_run(
         _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
 
     adapter = get_adapter(target.scheduler)
-    job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
+    try:
+        job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
+    except Exception as exc:
+        raise typer.BadParameter(f"Failed to submit job: {exc}") from exc
 
     now = datetime.now().isoformat(timespec="seconds")
     last_job = LastJob(

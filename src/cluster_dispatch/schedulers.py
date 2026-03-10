@@ -68,7 +68,10 @@ def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = Fa
 
 class SGEAdapter:
     def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=True)
+        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
+            raise RuntimeError(f"qsub failed: {detail}")
         output = proc.stdout.strip()
         # Typical format: Your job 1234 ("name") has been submitted
         job_id = output.split()[2] if len(output.split()) >= 3 else output
@@ -109,7 +112,10 @@ class UnivaAdapter(SGEAdapter):
 
 class PBSAdapter:
     def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=True)
+        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
+            raise RuntimeError(f"qsub failed: {detail}")
         output = proc.stdout.strip()
         job_id = output.split()[0] if output else ""
         return SubmitResult(job_id=job_id)
@@ -152,7 +158,10 @@ class PBSAdapter:
 
 class SlurmAdapter:
     def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"sbatch {submit_script}", transport=transport, check=True)
+        proc = _run_shell(host, f"sbatch {submit_script}", transport=transport, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
+            raise RuntimeError(f"sbatch failed: {detail}")
         output = proc.stdout.strip()
         # Typical format: Submitted batch job 12345
         job_id = output.split()[-1] if output else ""
@@ -181,7 +190,10 @@ class SlurmAdapter:
 
 class LSFAdapter:
     def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"bsub < {submit_script}", transport=transport, check=True)
+        proc = _run_shell(host, f"bsub < {submit_script}", transport=transport, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
+            raise RuntimeError(f"bsub failed: {detail}")
         output = proc.stdout.strip()
         # Typical format: Job <12345> is submitted to default queue <normal>.
         job_id = output
@@ -213,7 +225,15 @@ class LSFAdapter:
 
 class LocalAdapter:
     def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!", transport=transport, check=True)
+        proc = _run_shell(
+            host,
+            f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!",
+            transport=transport,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
+            raise RuntimeError(f"local submit failed: {detail}")
         return SubmitResult(job_id=proc.stdout.strip())
 
     def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
