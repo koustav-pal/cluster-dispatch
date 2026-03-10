@@ -45,13 +45,13 @@ def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = Fa
     quiet_mode = os.environ.get("CDP_QUIET", "0") == "1"
     is_local = _uses_local_transport(transport, host)
     if not is_local and not quiet_mode and (remote_verbose or verbose_level >= 1):
-        print(f"[remote] $ ssh {shlex.quote(host)} bash -lc {shlex.quote(command)}", file=sys.stderr)
+        print(f"[remote] $ ssh {shlex.quote(host)} {shlex.quote(command)}", file=sys.stderr)
 
     if _uses_local_transport(transport, host):
         proc = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
     else:
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, "bash", "-lc", command],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, command],
             capture_output=True,
             text=True,
             check=check,
