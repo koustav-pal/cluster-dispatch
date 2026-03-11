@@ -25,9 +25,9 @@ The package still requires you the users to sort out your own dependencies and a
 
 `cluster-dispatch` (`cdp`) is a Python CLI for dispatching and tracking analysis jobs across local and remote compute targets.
 
-It supports:
+It supports the following schedulers:
 - `none` (local execution)
-- `none` (remote)
+- `none` (remote non-scheduler execution)
 - `sge`
 - `univa`
 - `pbs`
