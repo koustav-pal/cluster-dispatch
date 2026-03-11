@@ -76,6 +76,7 @@ TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
 SWEEPS_DIR_NAME = "sweeps"
 SYNC_EVENTS_DIR_NAME = "sync"
 INDEX_DIR_NAME = "index"
+RUNS_DIR_NAME = "runs"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
     "small": {
@@ -5173,7 +5174,7 @@ def _sync_push(dry_run: bool) -> None:
     local_target_mode = _uses_local_transport(target_cfg)
 
     mkdir_cmd = ["mkdir", "-p", remote_analysis_root]
-    rsync_cmd = ["rsync", "-az", "--delete"]
+    rsync_cmd = ["rsync", "-az"]
     if project_ignore.exists():
         rsync_cmd.extend(["--exclude-from", str(project_ignore)])
     if local_target_mode:
@@ -5423,6 +5424,7 @@ def _submit_or_preview_analysis_run(
         )
 
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
+    remote_runs_root = f"{target.remote_root.rstrip('/')}/{CONFIG_DIR}/{RUNS_DIR_NAME}/{analysis_rel}"
     resolved_working_dir = remote_analysis_root
     try:
         local_cwd_rel = Path.cwd().resolve().relative_to(analysis_dir.resolve()).as_posix()
@@ -5446,7 +5448,7 @@ def _submit_or_preview_analysis_run(
         },
     )
     run_id = f"run-{run_id}"
-    remote_run_dir = f"{remote_analysis_root}/{run_id}"
+    remote_run_dir = f"{remote_runs_root}/{run_id}"
     remote_submit_script = f"{remote_run_dir}/pc_submit.sh"
     remote_log_file = f"{remote_run_dir}/run.log"
     resolved_stdout = f"{remote_run_dir}/stdout"
@@ -5480,7 +5482,8 @@ def _submit_or_preview_analysis_run(
         typer.echo(f"Analysis: {analysis_rel}")
         typer.echo(f"Target: {target_name}")
         typer.echo(f"Scheduler: {target.scheduler}")
-        typer.echo(f"Remote path: {remote_analysis_root}")
+        typer.echo(f"Remote analysis path: {remote_analysis_root}")
+        typer.echo(f"Remote run path: {remote_run_dir}")
         if project_ignore.exists():
             typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} detected")
         else:
@@ -5489,7 +5492,7 @@ def _submit_or_preview_analysis_run(
         typer.echo("")
         typer.echo("Planned actions:")
         typer.echo("1. Sync analysis directory to remote target")
-        typer.echo("2. Prepare scheduler submission")
+        typer.echo("2. Prepare scheduler submission in isolated run directory")
         typer.echo("3. Submit job to scheduler")
         typer.echo("4. Record job metadata locally")
         typer.echo("Record preview: includes identity, resources, paths, sync, environment, and optional git metadata")
@@ -5506,7 +5509,7 @@ def _submit_or_preview_analysis_run(
     else:
         _run_cmd(["ssh", target.host, "mkdir", "-p", remote_analysis_root])
 
-    rsync_cmd = ["rsync", "-az", "--delete"]
+    rsync_cmd = ["rsync", "-az"]
     if project_ignore.exists():
         rsync_cmd.extend(["--exclude-from", str(project_ignore)])
     if local_target_mode:
