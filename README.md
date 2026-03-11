@@ -1,9 +1,33 @@
 # cluster-dispatch
 
+## Introduction
+
+### Why?
+
+- When routinely working with HPC systems, user workflows involve many ssh and sync commands to transfer data and scripts back and forth to the cluster.
+- Even when mounts are allowed, these mounts can break down or become unresponsive.
+- Sometimes as is the case with me, we have many decentralised compute resources.
+  - This essentially means that different projects use different compute resources.
+  - This can also mean that moving a project from one compute environment to another means a lot of code refactoring. 
+
+These limited modes of interacting with schedulers can dampen our creativity and dictate our behaviour. 
+For instance, we may not want to get resources on yet another HPC system because that would mean 
+refactoring of existing project scripts and paths for another scheduler. 
+
+This in turn can lead to under-utilisation of resources and ensuing penalisation from admins if such policies are in place.  
+
+But, it doesn't have to be this way. This is my solution to my problem and is helping me to work around a few key problems
+- No mountable interfact to the HPC.
+- Currently 3 soon to be 4 different compute environments with different paths and schedulers.
+
+The package still requires you the users to sort out your own dependencies and availability of input files. 
+
+
 `cluster-dispatch` (`cdp`) is a Python CLI for dispatching and tracking analysis jobs across local and remote compute targets.
 
 It supports:
 - `none` (local execution)
+- `none` (remote)
 - `sge`
 - `univa`
 - `pbs`
@@ -56,10 +80,11 @@ cdp --install-completion
 
 - Project metadata lives in `.cluster_dispatch/`
 - Sync excludes come from `.cdpignore` at project root
-- One active target (`cdp target set`)
-- One active analysis (`cdp analysis use`)
+- One active target (`cdp target set`). This is the location where your data is analysed
+- One active analysis (`cdp analysis use`). This is the analysis specific folder that you are currently working in. 
 - Runs/sweeps write job records in `.cluster_dispatch/jobs/*.json`
 - Sweeps also persist parent manifests in `.cluster_dispatch/sweeps/*.json`
+
 
 Identity fields:
 - `run_id`: deterministic run-definition identity
