@@ -450,7 +450,7 @@ class TestClusterDispatchFlows(TestCase):
         self.assertNotEqual(blocked.exit_code, 0)
         self.assertIn("currently the default target", blocked.output)
 
-        forced = _invoke(self.runner, self.project, ["target", "remove", "remote-a", "--force"])
+        forced = _invoke(self.runner, self.project, ["target", "remove", "remote-a", "--force", "--yes"])
         self.assertEqual(forced.exit_code, 0, forced.output)
         self.assertIn("Removed target 'remote-a'", forced.output)
 
@@ -506,7 +506,7 @@ class TestClusterDispatchFlows(TestCase):
         removed = _invoke(
             self.runner,
             self.project,
-            ["target", "remove", "remote-b", "--force", "--prune-records"],
+            ["target", "remove", "remote-b", "--force", "--prune-records", "--yes"],
         )
         self.assertEqual(removed.exit_code, 0, removed.output)
         self.assertFalse((jobs_dir / "fake_remote.json").exists())
@@ -576,7 +576,7 @@ class TestClusterDispatchFlows(TestCase):
         apply_result = _invoke(
             self.runner,
             self.project,
-            ["cleanup", "records", "--older-than-days", "30", "--apply"],
+            ["cleanup", "records", "--older-than-days", "30", "--apply", "--yes"],
         )
         self.assertEqual(apply_result.exit_code, 0, apply_result.output)
         self.assertFalse(old_job.exists())

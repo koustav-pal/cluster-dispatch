@@ -358,6 +358,11 @@ def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return _run_direct(cmd, text=True, capture_output=True, check=check)
 
 
+def _require_yes(yes: bool, message: str) -> None:
+    if not yes:
+        raise typer.BadParameter(message)
+
+
 def _write_remote_script(host: str, remote_path: str, content: str, executable: bool = True) -> None:
     command = f"cat > {shlex.quote(remote_path)}"
     if executable:
@@ -1516,6 +1521,7 @@ def target_remove(
     prune_records: bool = typer.Option(
         False, "--prune-records", help="Delete local job/sync records that reference the removed target"
     ),
+    yes: bool = typer.Option(False, "--yes", help="Confirm destructive removal/pruning actions"),
 ) -> None:
     """Remove a target configuration."""
     if name.strip().lower() == "local":
@@ -1553,6 +1559,12 @@ def target_remove(
             f"Target '{name}' is referenced by {len(job_files_to_prune)} job record(s) and "
             f"{len(sync_files_to_prune)} sync record(s). Use --force to remove."
         )
+    if force and (job_files_to_prune or sync_files_to_prune):
+        _require_yes(
+            yes,
+            f"Target '{name}' has {len(job_files_to_prune)} job record(s) and {len(sync_files_to_prune)} sync record(s). "
+            "Re-run with --yes to confirm removal.",
+        )
 
     if cfg.default_target == name:
         chosen_fallback = fallback_target or "local"
@@ -1565,6 +1577,11 @@ def target_remove(
                 f"Target '{name}' is currently the default target. Use --force to remove it. "
                 f"Fallback target would be '{chosen_fallback}'."
             )
+        _require_yes(
+            yes,
+            f"Target '{name}' is the default target and will be removed (fallback: '{chosen_fallback}'). "
+            "Re-run with --yes to confirm.",
+        )
         cfg.default_target = chosen_fallback
 
     del cfg.targets[name]
@@ -1573,6 +1590,7 @@ def target_remove(
     pruned_jobs = 0
     pruned_sync = 0
     if prune_records:
+        _require_yes(yes, "Pruning local records is destructive. Re-run with --yes to confirm.")
         for path in job_files_to_prune:
             path.unlink(missing_ok=True)
             pruned_jobs += 1
@@ -3506,6 +3524,7 @@ def cancel(
     analysis: Optional[str] = typer.Option(
         None, "--analysis", help="Restrict cancel to a specific analysis path", autocompletion=_complete_record_analyses
     ),
+    yes: bool = typer.Option(False, "--yes", help="Confirm cancelling multiple matching jobs"),
 ) -> None:
     """Cancel jobs by job-id or job-name using recorded launch metadata."""
     if not job_id and not job_name:
@@ -3548,6 +3567,11 @@ def cancel(
             continue
         seen.add(key)
         unique_matches.append(rec)
+    if len(unique_matches) > 1:
+        _require_yes(
+            yes,
+            f"Filters match {len(unique_matches)} jobs. Re-run with --yes to cancel all matches.",
+        )
 
     cancelled: list[str] = []
     failed: list[str] = []
@@ -5225,11 +5249,16 @@ def _sync_push(dry_run: bool) -> None:
     typer.echo(f"Recorded sync event: {record_path}")
 
 
-def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool = False) -> None:
+def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool = False, yes: bool = False) -> None:
     project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
     local_target_mode = _uses_local_transport(target_cfg)
 
     if all_paths:
+        if not dry_run:
+            _require_yes(
+                yes,
+                "Full analysis pull may overwrite local files. Re-run with --yes to confirm.",
+            )
         rsync_cmd = ["rsync", "-az"]
         if local_target_mode:
             rsync_cmd.extend([f"{remote_analysis_root}/", f"{analysis_dir}/"])
@@ -5614,9 +5643,10 @@ def sync_pull(
     all_paths: bool = typer.Option(False, "--all", help="Pull the full active analysis directory"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview sync actions without any modifications"),
     index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful pull"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm destructive pull operations"),
 ) -> None:
     """Pull active analysis data from the active target."""
-    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run, index_after=index_after)
+    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run, index_after=index_after, yes=yes)
 
 
 @sync_app.command("status")
@@ -5861,6 +5891,7 @@ def import_bundle(
     include_jobs: bool = typer.Option(True, "--jobs/--no-jobs", help="Import jobs records from bundle"),
     include_sync: bool = typer.Option(True, "--sync/--no-sync", help="Import sync records from bundle"),
     include_sweeps: bool = typer.Option(True, "--sweeps/--no-sweeps", help="Import sweeps manifests from bundle"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm overwrite behavior"),
 ) -> None:
     """Import project metadata bundle into current directory."""
     dest_root = Path.cwd().resolve()
@@ -5870,6 +5901,8 @@ def import_bundle(
         SYNC_EVENTS_DIR_NAME: include_sync,
         SWEEPS_DIR_NAME: include_sweeps,
     }
+    if overwrite:
+        _require_yes(yes, "Import with --overwrite is destructive. Re-run with --yes to confirm.")
 
     extracted = 0
     skipped = 0
@@ -5932,12 +5965,15 @@ def cleanup_records(
     ),
     dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview only by default; use --apply to delete"),
     as_json: bool = typer.Option(False, "--json", help="Print cleanup summary as JSON"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm record deletion when using --apply"),
 ) -> None:
     """Clean local metadata records with retention filters."""
     project_root = _project_root()
     cutoff: Optional[datetime] = None
     if older_than_days is not None:
         cutoff = datetime.now() - timedelta(days=older_than_days)
+    if not dry_run:
+        _require_yes(yes, "Cleanup --apply deletes records. Re-run with --yes to confirm.")
 
     summary: dict[str, Any] = {
         "dry_run": dry_run,
@@ -6074,9 +6110,10 @@ def pull(
         False, "--remote", help="Pull tagged paths even when they are not present locally (remote-only tags)"
     ),
     index_after: bool = typer.Option(False, "--index-after", help="Refresh root index manifest after successful pull"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm destructive pull operations"),
 ) -> None:
     """Pull all tagged paths into the active analysis directory."""
-    _sync_pull(remote=remote, all_paths=False, dry_run=False, index_after=index_after)
+    _sync_pull(remote=remote, all_paths=False, dry_run=False, index_after=index_after, yes=yes)
 
 
 if __name__ == "__main__":
