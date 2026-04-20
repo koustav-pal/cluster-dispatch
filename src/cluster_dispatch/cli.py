@@ -3006,6 +3006,41 @@ def analysis_tag(
         typer.echo(f"Already tagged: {tag_value}")
 
 
+@analysis_app.command("untag")
+def analysis_untag(
+    path: Annotated[
+        Path, typer.Argument(help="Tagged path inside active analysis to remove", autocompletion=_complete_active_analysis_paths)
+    ],
+) -> None:
+    """Remove a tagged path from the active analysis."""
+    project_root = _project_root()
+    cfg = load_config(project_root)
+    analysis_dir = _require_active_analysis(cfg, project_root)
+
+    if path.is_absolute():
+        raise typer.BadParameter("Tag path must be relative to the active analysis directory")
+
+    candidate = (analysis_dir / path).resolve()
+    try:
+        relative_to_analysis = candidate.relative_to(analysis_dir)
+    except ValueError as exc:
+        raise typer.BadParameter("Tag path must be inside the active analysis directory") from exc
+
+    tag_value = relative_to_analysis.as_posix()
+    analysis_key = cfg.active_analysis or ""
+    tags = cfg.analysis_tags.get(analysis_key, [])
+    if tag_value not in tags:
+        raise typer.BadParameter(f"Path is not tagged: {tag_value}")
+
+    updated_tags = [tag for tag in tags if tag != tag_value]
+    if updated_tags:
+        cfg.analysis_tags[analysis_key] = sorted(updated_tags)
+    else:
+        cfg.analysis_tags.pop(analysis_key, None)
+    save_config(project_root, cfg)
+    typer.echo(f"Removed analysis tag: {tag_value}")
+
+
 @analysis_app.command("list")
 def analysis_list(
     path: str = typer.Argument(

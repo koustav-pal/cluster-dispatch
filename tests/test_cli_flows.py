@@ -19,6 +19,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from cluster_dispatch.cli import app, _build_submit_script  # noqa: E402
+from cluster_dispatch.config import load_config  # noqa: E402
 
 
 @contextmanager
@@ -229,6 +230,38 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("Dry run: no changes will be made", result.output)
         self.assertIn("Action: sync push", result.output)
         self.assertFalse(sync_dir.exists(), "Dry-run must not write sync records")
+
+    def test_analysis_untag_removes_tag(self) -> None:
+        tagged_dir = self.project / self.analysis_rel / "outputs"
+        tagged_dir.mkdir(parents=True, exist_ok=True)
+
+        tag_result = _invoke(self.runner, self.project, ["analysis", "tag", "outputs"])
+        self.assertEqual(tag_result.exit_code, 0, tag_result.output)
+
+        untag_result = _invoke(self.runner, self.project, ["analysis", "untag", "outputs"])
+        self.assertEqual(untag_result.exit_code, 0, untag_result.output)
+        self.assertIn("Removed analysis tag: outputs", untag_result.output)
+
+        cfg = load_config(self.project)
+        self.assertNotIn("outputs", cfg.analysis_tags.get(str(self.analysis_rel), []))
+
+    def test_analysis_untag_fails_for_missing_tag(self) -> None:
+        result = _invoke(self.runner, self.project, ["analysis", "untag", "missing"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Path is not tagged: missing", result.output)
+
+    def test_analysis_untag_removes_empty_analysis_key(self) -> None:
+        tagged_dir = self.project / self.analysis_rel / "results"
+        tagged_dir.mkdir(parents=True, exist_ok=True)
+
+        tag_result = _invoke(self.runner, self.project, ["analysis", "tag", "results"])
+        self.assertEqual(tag_result.exit_code, 0, tag_result.output)
+
+        untag_result = _invoke(self.runner, self.project, ["analysis", "untag", "results"])
+        self.assertEqual(untag_result.exit_code, 0, untag_result.output)
+
+        cfg = load_config(self.project)
+        self.assertNotIn(str(self.analysis_rel), cfg.analysis_tags)
 
     def test_sync_push_writes_sync_event_record(self) -> None:
         result = _invoke(self.runner, self.project, ["sync", "push"])
