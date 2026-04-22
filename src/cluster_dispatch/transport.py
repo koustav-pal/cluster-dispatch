@@ -118,7 +118,6 @@ def ssh_command(
 def rsync_remote_shell(
     project_root: Path,
     cfg: ProjectConfig,
-    target_name: str,
     target_cfg: TargetConfig,
     connect_timeout: Optional[int] = None,
 ) -> str:
@@ -126,7 +125,6 @@ def rsync_remote_shell(
     cmd = ["ssh", "-F", str(config_file)]
     if connect_timeout is not None:
         cmd.extend(["-o", f"ConnectTimeout={int(connect_timeout)}"])
-    cmd.append(target_alias(target_name))
     return shlex.join(cmd)
 
 
@@ -146,7 +144,6 @@ def rsync_command(
         rsync_remote_shell(
             project_root=project_root,
             cfg=cfg,
-            target_name=target_name,
             target_cfg=target_cfg,
             connect_timeout=connect_timeout,
         ),

@@ -209,6 +209,7 @@ class TestClusterDispatchFlows(TestCase):
         rsync_shell = rsync_calls[0][rsync_calls[0].index("-e") + 1]
         self.assertIn("-F", rsync_shell)
         self.assertIn(str(ssh_config), rsync_shell)
+        self.assertNotIn("remote-sync", rsync_shell)
         self.assertIn("remote-sync:/tmp/remote-sync/analysis/a/", rsync_calls[0])
 
     def test_scheduler_submit_uses_multiplexed_ssh(self) -> None:
