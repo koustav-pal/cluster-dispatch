@@ -204,6 +204,7 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("HostName example.org", config_text)
         self.assertIn("ControlMaster auto", config_text)
         self.assertIn("ControlPersist 10m", config_text)
+        self.assertRegex(config_text, r"ControlPath /tmp/cluster-dispatch-ssh/[0-9a-f]{16}\.sock")
         self.assertIn("-e", rsync_calls[0])
         rsync_shell = rsync_calls[0][rsync_calls[0].index("-e") + 1]
         self.assertIn("-F", rsync_shell)
@@ -257,6 +258,7 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("Host local", config_text)
         self.assertIn("HostName example.org", config_text)
         self.assertIn("ControlMaster auto", config_text)
+        self.assertRegex(config_text, r"ControlPath /tmp/cluster-dispatch-ssh/[0-9a-f]{16}\.sock")
 
     def test_history_reads_old_and_new_record_shapes(self) -> None:
         old_payload = {

@@ -10,9 +10,9 @@ from cluster_dispatch.config import CONFIG_DIR, ProjectConfig, TargetConfig
 
 SSH_DIR_NAME = "ssh"
 SSH_CONFIG_NAME = "config"
-SSH_SOCKETS_DIR_NAME = "sockets"
 SSH_CONNECT_TIMEOUT = 20
 SSH_CONTROL_PERSIST = "10m"
+SSH_CONTROL_SOCKET_ROOT = Path("/tmp/cluster-dispatch-ssh")
 
 
 def is_local_transport(transport: str, host: str) -> bool:
@@ -28,15 +28,10 @@ def ssh_config_path(project_root: Path) -> Path:
     return ssh_dir(project_root) / SSH_CONFIG_NAME
 
 
-def ssh_sockets_dir(project_root: Path) -> Path:
-    return ssh_dir(project_root) / SSH_SOCKETS_DIR_NAME
-
-
-def control_socket_path(project_root: Path, host: str) -> str:
+def control_socket_path(host: str) -> str:
     digest = hashlib.sha256(host.strip().encode("utf-8")).hexdigest()[:16]
-    sockets_dir = ssh_sockets_dir(project_root)
-    sockets_dir.mkdir(parents=True, exist_ok=True)
-    return str(sockets_dir / f"{digest}.sock")
+    SSH_CONTROL_SOCKET_ROOT.mkdir(parents=True, exist_ok=True)
+    return str(SSH_CONTROL_SOCKET_ROOT / f"{digest}.sock")
 
 
 def target_alias(target_name: str) -> str:
@@ -58,7 +53,7 @@ def _split_host_components(host: str) -> tuple[Optional[str], str]:
     return None, clean
 
 
-def _render_target_block(project_root: Path, target_name: str, target_cfg: TargetConfig) -> str:
+def _render_target_block(target_name: str, target_cfg: TargetConfig) -> str:
     alias = target_alias(target_name)
     user, host_name = _split_host_components(target_cfg.host)
     lines = [
@@ -72,7 +67,7 @@ def _render_target_block(project_root: Path, target_name: str, target_cfg: Targe
             "    BatchMode yes",
             f"    ConnectTimeout {SSH_CONNECT_TIMEOUT}",
             "    ControlMaster auto",
-            f"    ControlPath {control_socket_path(project_root, target_cfg.host)}",
+            f"    ControlPath {control_socket_path(target_cfg.host)}",
             f"    ControlPersist {SSH_CONTROL_PERSIST}",
         ]
     )
@@ -82,14 +77,14 @@ def _render_target_block(project_root: Path, target_name: str, target_cfg: Targe
 def ensure_ssh_config(project_root: Path, cfg: ProjectConfig) -> Path:
     base_dir = ssh_dir(project_root)
     base_dir.mkdir(parents=True, exist_ok=True)
-    ssh_sockets_dir(project_root).mkdir(parents=True, exist_ok=True)
+    SSH_CONTROL_SOCKET_ROOT.mkdir(parents=True, exist_ok=True)
 
     blocks: list[str] = []
     for target_name in sorted(cfg.targets.keys()):
         target_cfg = cfg.targets[target_name]
         if is_local_transport(target_cfg.transport, target_cfg.host):
             continue
-        blocks.append(_render_target_block(project_root, target_name, target_cfg))
+        blocks.append(_render_target_block(target_name, target_cfg))
 
     config_text = ""
     if blocks:
