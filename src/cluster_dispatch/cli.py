@@ -41,6 +41,12 @@ from cluster_dispatch.config import (
     save_state,
 )
 from cluster_dispatch.schedulers import get_adapter
+from cluster_dispatch.transport import (
+    is_local_transport,
+    remote_spec,
+    rsync_command,
+    ssh_command,
+)
 
 app = typer.Typer(help="Cluster Dispatch CLI for remote SSH compute targets")
 target_app = typer.Typer(help="Manage compute targets")
@@ -363,12 +369,20 @@ def _require_yes(yes: bool, message: str) -> None:
         raise typer.BadParameter(message)
 
 
-def _write_remote_script(host: str, remote_path: str, content: str, executable: bool = True) -> None:
+def _write_remote_script(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target_cfg: TargetConfig,
+    remote_path: str,
+    content: str,
+    executable: bool = True,
+) -> None:
     command = f"cat > {shlex.quote(remote_path)}"
     if executable:
         command += f" && chmod +x {shlex.quote(remote_path)}"
     proc = _run_direct(
-        ["ssh", host, command],
+        ssh_command(project_root, cfg, target_name, target_cfg, command),
         input=content,
         text=True,
         capture_output=True,
@@ -385,7 +399,7 @@ def _is_local_host(host: str) -> bool:
 
 
 def _uses_local_transport(target: TargetConfig) -> bool:
-    return target.transport.strip().lower() == "local"
+    return is_local_transport(target.transport, target.host)
 
 
 def _validate_transport(value: str) -> str:
@@ -774,7 +788,7 @@ def _write_index_manifest_for_scope(
     if _uses_local_transport(target_cfg):
         entries = _index_local_scope(Path(scope_remote))
     else:
-        entries = _index_remote_scope(target_cfg.host, scope_remote)
+        entries = _index_remote_scope(project_root, load_config(project_root), target_name, target_cfg, scope_remote)
     manifest = {
         "indexed_at": datetime.now().isoformat(timespec="seconds"),
         "project_root": str(project_root),
@@ -905,7 +919,13 @@ def _index_local_scope(scope_root: Path) -> list[dict[str, Any]]:
     return entries
 
 
-def _index_remote_scope(host: str, scope_root: str) -> list[dict[str, Any]]:
+def _index_remote_scope(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target_cfg: TargetConfig,
+    scope_root: str,
+) -> list[dict[str, Any]]:
     remote_cmd = (
         f'P={shlex.quote(scope_root)}; '
         'if [ ! -e "$P" ]; then exit 3; fi; '
@@ -916,7 +936,7 @@ def _index_remote_scope(host: str, scope_root: str) -> list[dict[str, Any]]:
         "fi"
     )
     proc = _run_direct(
-        ["ssh", host, remote_cmd],
+        ssh_command(project_root, cfg, target_name, target_cfg, remote_cmd),
         text=True,
         capture_output=True,
         check=False,
@@ -1682,7 +1702,7 @@ def target_test(
                     _add("WARN", "scheduler_cmds", f"Missing one or more: {', '.join(required_cmds)}")
         else:
             ssh_probe = _run_direct(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
+                ssh_command(project_root, cfg, name, tcfg, "echo", "cdp-ok", connect_timeout=10),
                 text=True,
                 capture_output=True,
                 check=False,
@@ -1709,7 +1729,7 @@ def target_test(
                     _add("PASS", "remote_root_exists", tcfg.remote_root)
                 elif create_root:
                     create_probe = _run_direct(
-                        ["ssh", tcfg.host, "mkdir", "-p", tcfg.remote_root],
+                        ssh_command(project_root, cfg, name, tcfg, "mkdir", "-p", tcfg.remote_root),
                         text=True,
                         capture_output=True,
                         check=False,
@@ -1728,7 +1748,15 @@ def target_test(
                 required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
                 if required_cmds:
                     cmd_probe = _run_direct(
-                        ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
+                        ssh_command(
+                            project_root,
+                            cfg,
+                            name,
+                            tcfg,
+                            "bash",
+                            "-lc",
+                            " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds]),
+                        ),
                         text=True,
                         capture_output=True,
                         check=False,
@@ -1955,7 +1983,7 @@ def doctor(
             continue
 
         ssh_probe = _run_direct(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", tcfg.host, "echo", "cdp-ok"],
+            ssh_command(project_root, cfg, name, tcfg, "echo", "cdp-ok", connect_timeout=10),
             text=True,
             capture_output=True,
             check=False,
@@ -1967,7 +1995,15 @@ def doctor(
             continue
 
         root_probe = _run_direct(
-            ["ssh", tcfg.host, "bash", "-lc", f"if [ -d {shlex.quote(tcfg.remote_root)} ]; then echo OK; else echo MISSING; fi"],
+            ssh_command(
+                project_root,
+                cfg,
+                name,
+                tcfg,
+                "bash",
+                "-lc",
+                f"if [ -d {shlex.quote(tcfg.remote_root)} ]; then echo OK; else echo MISSING; fi",
+            ),
             text=True,
             capture_output=True,
             check=False,
@@ -1980,7 +2016,15 @@ def doctor(
         required_cmds = scheduler_cmds.get(tcfg.scheduler, [])
         if required_cmds:
             cmd_probe = _run_direct(
-                ["ssh", tcfg.host, "bash", "-lc", " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds])],
+                ssh_command(
+                    project_root,
+                    cfg,
+                    name,
+                    tcfg,
+                    "bash",
+                    "-lc",
+                    " && ".join([f"command -v {c} >/dev/null 2>&1" for c in required_cmds]),
+                ),
                 text=True,
                 capture_output=True,
                 check=False,
@@ -2235,7 +2279,7 @@ def _submit_sweep_single(
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
     else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_sweep_dir))
     adapter = get_adapter(target.scheduler)
     submitted_count = 0
 
@@ -2269,9 +2313,25 @@ def _submit_sweep_single(
             submit_path.write_text(submit_script)
             submit_path.chmod(0o755)
         else:
-            _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
+            _write_remote_script(
+                project_root,
+                cfg,
+                target_name,
+                target,
+                remote_submit_script,
+                submit_script,
+                executable=True,
+            )
         try:
-            submit_result = adapter.submit(target.host, remote_submit_script, transport=target.transport)
+            submit_result = adapter.submit(
+                target.host,
+                remote_submit_script,
+                transport=target.transport,
+                project_root=project_root,
+                cfg=cfg,
+                target_name=target_name,
+                target_cfg=target,
+            )
         except Exception as exc:
             raise typer.BadParameter(f"Failed to submit sweep run {run.get('run_id', '')}: {exc}") from exc
         submitted_at = datetime.now().isoformat(timespec="seconds")
@@ -2352,7 +2412,7 @@ def _submit_sweep_array(
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
     else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_sweep_dir])
+        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_sweep_dir))
 
     local_sweeps = _sweeps_dir(project_root)
     sweep_id = str(manifest["sweep_id"])
@@ -2393,8 +2453,24 @@ def _submit_sweep_array(
         _run_cmd(["rsync", "-az", str(tsv_local), tsv_remote])
         _run_cmd(["rsync", "-az", str(wrapper_local), wrapper_remote])
     else:
-        _run_cmd(["rsync", "-az", str(tsv_local), f"{target.host}:{tsv_remote}"])
-        _run_cmd(["rsync", "-az", str(wrapper_local), f"{target.host}:{wrapper_remote}"])
+        _run_cmd(
+            rsync_command(
+                ["rsync", "-az", str(tsv_local), remote_spec(target_name, tsv_remote)],
+                project_root,
+                cfg,
+                target_name,
+                target,
+            )
+        )
+        _run_cmd(
+            rsync_command(
+                ["rsync", "-az", str(wrapper_local), remote_spec(target_name, wrapper_remote)],
+                project_root,
+                cfg,
+                target_name,
+                target,
+            )
+        )
 
     array_size = len(run_indexes)
     array_header = _render_scheduler_header(
@@ -2429,11 +2505,27 @@ def _submit_sweep_array(
         array_submit_path.write_text(array_script)
         array_submit_path.chmod(0o755)
     else:
-        _write_remote_script(target.host, remote_array_submit, array_script, executable=True)
+        _write_remote_script(
+            project_root,
+            cfg,
+            target_name,
+            target,
+            remote_array_submit,
+            array_script,
+            executable=True,
+        )
 
     adapter = get_adapter(target.scheduler)
     try:
-        submit_result = adapter.submit(target.host, remote_array_submit, transport=target.transport)
+        submit_result = adapter.submit(
+            target.host,
+            remote_array_submit,
+            transport=target.transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target,
+        )
     except Exception as exc:
         raise typer.BadParameter(f"Failed to submit sweep array job: {exc}") from exc
     base_job_id = submit_result.job_id
@@ -2887,7 +2979,12 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
         if _uses_local_transport(target_cfg):
             proc = _run_direct(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
         else:
-            proc = _run_direct(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+            proc = _run_direct(
+                ssh_command(project_root, cfg, target_name, target_cfg, cmd),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         if proc.returncode == 0:
             cancelled += 1
         else:
@@ -2908,7 +3005,12 @@ def sweep_cancel(sweep_id: str = typer.Argument(..., help="Sweep id", autocomple
             if _uses_local_transport(target_cfg):
                 proc = _run_direct(["bash", "-lc", cmd], text=True, capture_output=True, check=False)
             else:
-                proc = _run_direct(["ssh", target_cfg.host, cmd], text=True, capture_output=True, check=False)
+                proc = _run_direct(
+                    ssh_command(project_root, cfg, target_name, target_cfg, cmd),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
             if proc.returncode == 0:
                 cancelled += 1
                 run["status"] = "CANCEL_REQUESTED"
@@ -2986,7 +3088,7 @@ def analysis_tag(
             else:
                 remote_cmd = f"if [ -e {shlex.quote(remote_tag_path)} ]; then echo OK; else echo MISSING; fi"
                 proc = _run_direct(
-                    ["ssh", target.host, remote_cmd],
+                    ssh_command(project_root, cfg, target_name, target, remote_cmd),
                     text=True,
                     capture_output=True,
                     check=False,
@@ -3137,7 +3239,7 @@ def analysis_list(
         )
     else:
         proc = _run_direct(
-            ["ssh", target.host, remote_cmd],
+            ssh_command(project_root, cfg, target_name, target, remote_cmd),
             text=True,
             capture_output=True,
             check=False,
@@ -3280,7 +3382,15 @@ def _show_last_status(follow: bool = False) -> None:
                 break
     if state == "UNKNOWN":
         adapter = get_adapter(last["scheduler"])
-        result = adapter.status(target_cfg.host, job_id, transport=target_cfg.transport)
+        result = adapter.status(
+            target_cfg.host,
+            job_id,
+            transport=target_cfg.transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target,
+            target_cfg=target_cfg,
+        )
         state = result.state
     typer.echo(f"job_id={job_id} target={target} state={state}")
 
@@ -3290,7 +3400,16 @@ def _show_last_status(follow: bool = False) -> None:
             _show_local_log(Path(str(last["remote_log_file"])), follow=True, head=None, tail=50)
         else:
             _run_direct(
-                ["ssh", "-t", target_cfg.host, "bash", "-lc", f"tail -n 50 -f {shlex.quote(last['remote_log_file'])}"],
+                ssh_command(
+                    project_root,
+                    cfg,
+                    target,
+                    target_cfg,
+                    "bash",
+                    "-lc",
+                    f"tail -n 50 -f {shlex.quote(last['remote_log_file'])}",
+                    tty=True,
+                ),
                 check=True,
             )
     else:
@@ -3301,13 +3420,15 @@ def _show_last_status(follow: bool = False) -> None:
                 _show_local_log(log_path, follow=False, head=None, tail=20)
         else:
             proc = _run_direct(
-                [
-                    "ssh",
-                    target_cfg.host,
+                ssh_command(
+                    project_root,
+                    cfg,
+                    target,
+                    target_cfg,
                     "bash",
                     "-lc",
                     f"if [ -f {shlex.quote(last['remote_log_file'])} ]; then tail -n 20 {shlex.quote(last['remote_log_file'])}; fi",
-                ],
+                ),
                 text=True,
                 capture_output=True,
                 check=False,
@@ -3382,14 +3503,30 @@ def _resolve_and_persist_job_state(
 
     adapter = get_adapter(scheduler)
     target_cfg = cfg.targets[target_name]
-    status_result = adapter.status(target_cfg.host, job_id, transport=target_cfg.transport)
+    status_result = adapter.status(
+        target_cfg.host,
+        job_id,
+        transport=target_cfg.transport,
+        project_root=_project_root(),
+        cfg=cfg,
+        target_name=target_name,
+        target_cfg=target_cfg,
+    )
     state = status_result.state
     if state == "NOT_FOUND":
         stored_final_state = str(payload.get("final_state", "")).strip()
         if stored_final_state:
             state = stored_final_state
         else:
-            accounting_result = adapter.accounting_status(target_cfg.host, job_id, transport=target_cfg.transport)
+            accounting_result = adapter.accounting_status(
+                target_cfg.host,
+                job_id,
+                transport=target_cfg.transport,
+                project_root=_project_root(),
+                cfg=cfg,
+                target_name=target_name,
+                target_cfg=target_cfg,
+            )
             if accounting_result.state != "NOT_FOUND":
                 state = accounting_result.state
                 payload["final_state"] = accounting_result.state
@@ -3513,7 +3650,13 @@ def _fetch_log_tail(selected: dict[str, Any], cfg: ProjectConfig, project_root: 
         return ""
     host = cfg.targets[selected_target].host
     proc = _run_direct(
-        ["ssh", host, f"if [ -f {shlex.quote(remote_log_file)} ]; then tail -n {tail_lines} {shlex.quote(remote_log_file)}; fi"],
+        ssh_command(
+            project_root,
+            cfg,
+            selected_target,
+            cfg.targets[selected_target],
+            f"if [ -f {shlex.quote(remote_log_file)} ]; then tail -n {tail_lines} {shlex.quote(remote_log_file)}; fi",
+        ),
         text=True,
         capture_output=True,
         check=False,
@@ -3633,7 +3776,7 @@ def cancel(
             )
         else:
             proc = _run_direct(
-                ["ssh", target_cfg.host, cancel_cmd],
+                ssh_command(project_root, cfg, rec_target, target_cfg, cancel_cmd),
                 text=True,
                 capture_output=True,
                 check=False,
@@ -3737,10 +3880,18 @@ def logs(
             f"Following log for job_id={selected.get('job_id', '')} "
             f"job_name={selected.get('job_name', '')} target={selected_target}: {remote_log_file}"
         )
-        _run_direct(["ssh", "-t", host, remote_cmd], check=True)
+        _run_direct(
+            ssh_command(project_root, cfg, selected_target, cfg.targets[selected_target], remote_cmd, tty=True),
+            check=True,
+        )
         return
 
-    proc = _run_direct(["ssh", host, remote_cmd], text=True, capture_output=True, check=False)
+    proc = _run_direct(
+        ssh_command(project_root, cfg, selected_target, cfg.targets[selected_target], remote_cmd),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     if proc.returncode != 0:
         raise typer.BadParameter(proc.stderr.strip() or "Failed to fetch remote log")
 
@@ -3812,7 +3963,15 @@ def watch(
             selected = payload
         else:
             adapter = get_adapter(selected_scheduler)
-            current_state = adapter.status(target_cfg.host, selected_job_id, transport=target_cfg.transport).state
+            current_state = adapter.status(
+                target_cfg.host,
+                selected_job_id,
+                transport=target_cfg.transport,
+                project_root=project_root,
+                cfg=cfg,
+                target_name=selected_target,
+                target_cfg=target_cfg,
+            ).state
 
         now = datetime.now().isoformat(timespec="seconds")
         typer.echo(
@@ -4594,7 +4753,13 @@ def collect(
             proc = _run_cmd(["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"], check=False)
         else:
             proc = _run_cmd(
-                ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"],
+                rsync_command(
+                    ["rsync", "-az", "--relative", remote_spec(selected_target, tagged_remote), f"{analysis_dir}/"],
+                    project_root,
+                    cfg,
+                    selected_target,
+                    target_cfg,
+                ),
                 check=False,
             )
         if proc.returncode == 0:
@@ -4624,10 +4789,17 @@ def collect(
             typer.echo(f"- {item}")
 
 
-def _fetch_job_stats(host: str, scheduler: str, job_id: str, transport: str = "ssh") -> tuple[dict[str, str], str]:
+def _fetch_job_stats(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target_cfg: TargetConfig,
+    scheduler: str,
+    job_id: str,
+) -> tuple[dict[str, str], str]:
     scheduler_lc = scheduler.lower()
     quoted_job_id = shlex.quote(job_id)
-    local_transport = transport.strip().lower() == "local" or _is_local_host(host)
+    local_transport = _uses_local_transport(target_cfg)
 
     def _run_stats_cmd(command: str) -> subprocess.CompletedProcess[str]:
         if local_transport:
@@ -4638,7 +4810,7 @@ def _fetch_job_stats(host: str, scheduler: str, job_id: str, transport: str = "s
                 check=False,
             )
         return _run_direct(
-            ["ssh", host, "bash", "-lc", command],
+            ssh_command(project_root, cfg, target_name, target_cfg, "bash", "-lc", command),
             text=True,
             capture_output=True,
             check=False,
@@ -4939,10 +5111,12 @@ def stats(
 
     target_cfg = cfg.targets[selected_target]
     usage_stats, _ = _fetch_job_stats(
-        host=target_cfg.host,
+        project_root=project_root,
+        cfg=cfg,
+        target_name=selected_target,
+        target_cfg=target_cfg,
         scheduler=selected_scheduler,
         job_id=selected_job_id,
-        transport=target_cfg.transport,
     )
     display_stats = _normalize_stats_for_display(usage_stats)
     rows = [
@@ -5239,7 +5413,8 @@ def _sync_push(dry_run: bool) -> None:
     if local_target_mode:
         rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
     else:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{target_cfg.host}:{remote_analysis_root}/"])
+        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
+        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target_cfg)
 
     if dry_run:
         typer.echo("Dry run: no changes will be made")
@@ -5263,7 +5438,7 @@ def _sync_push(dry_run: bool) -> None:
     if local_target_mode:
         Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
     else:
-        _run_cmd(["ssh", target_cfg.host, *mkdir_cmd])
+        _run_cmd(ssh_command(project_root, cfg, target_name, target_cfg, *mkdir_cmd))
     _run_cmd(rsync_cmd)
 
     record_path = _write_sync_event(
@@ -5298,7 +5473,8 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool =
         if local_target_mode:
             rsync_cmd.extend([f"{remote_analysis_root}/", f"{analysis_dir}/"])
         else:
-            rsync_cmd.extend([f"{target_cfg.host}:{remote_analysis_root}/", f"{analysis_dir}/"])
+            rsync_cmd.extend([remote_spec(target_name, f"{remote_analysis_root}/"), f"{analysis_dir}/"])
+            rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target_cfg)
 
         if dry_run:
             root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
@@ -5374,7 +5550,13 @@ def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool =
         if local_target_mode:
             cmd = ["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"]
         else:
-            cmd = ["rsync", "-az", "--relative", f"{target_cfg.host}:{tagged_remote}", f"{analysis_dir}/"]
+            cmd = rsync_command(
+                ["rsync", "-az", "--relative", remote_spec(target_name, tagged_remote), f"{analysis_dir}/"],
+                project_root,
+                cfg,
+                target_name,
+                target_cfg,
+            )
         planned_cmds.append(cmd)
 
     if dry_run:
@@ -5571,7 +5753,7 @@ def _submit_or_preview_analysis_run(
     if local_target_mode:
         Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
     else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_analysis_root])
+        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_analysis_root))
 
     rsync_cmd = ["rsync", "-az"]
     if project_ignore.exists():
@@ -5579,7 +5761,8 @@ def _submit_or_preview_analysis_run(
     if local_target_mode:
         rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
     else:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{target.host}:{remote_analysis_root}/"])
+        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
+        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target)
     _run_cmd(rsync_cmd)
 
     if local_target_mode:
@@ -5589,12 +5772,28 @@ def _submit_or_preview_analysis_run(
         submit_path.write_text(submit_script)
         submit_path.chmod(0o755)
     else:
-        _run_cmd(["ssh", target.host, "mkdir", "-p", remote_run_dir])
-        _write_remote_script(target.host, remote_submit_script, submit_script, executable=True)
+        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_run_dir))
+        _write_remote_script(
+            project_root,
+            cfg,
+            target_name,
+            target,
+            remote_submit_script,
+            submit_script,
+            executable=True,
+        )
 
     adapter = get_adapter(target.scheduler)
     try:
-        job_id = adapter.submit(target.host, remote_submit_script, transport=target.transport).job_id
+        job_id = adapter.submit(
+            target.host,
+            remote_submit_script,
+            transport=target.transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target,
+        ).job_id
     except Exception as exc:
         raise typer.BadParameter(f"Failed to submit job: {exc}") from exc
 

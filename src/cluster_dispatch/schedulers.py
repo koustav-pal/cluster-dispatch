@@ -5,7 +5,11 @@ import os
 import shlex
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
+
+from cluster_dispatch.config import ProjectConfig, TargetConfig
+from cluster_dispatch.transport import is_local_transport, ssh_command
 
 
 @dataclass
@@ -20,13 +24,43 @@ class StatusResult:
 
 
 class SchedulerAdapter(Protocol):
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
         ...
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
         ...
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
         ...
 
 
@@ -36,22 +70,34 @@ def _is_local_host(host: str) -> bool:
 
 
 def _uses_local_transport(transport: str, host: str) -> bool:
-    return transport.strip().lower() == "local" or _is_local_host(host)
+    return is_local_transport(transport, host)
 
 
-def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = False) -> subprocess.CompletedProcess[str]:
+def _run_shell(
+    host: str,
+    command: str,
+    transport: str = "ssh",
+    check: bool = False,
+    *,
+    project_root: Path | None = None,
+    cfg: ProjectConfig | None = None,
+    target_name: str | None = None,
+    target_cfg: TargetConfig | None = None,
+) -> subprocess.CompletedProcess[str]:
     verbose_level = int(os.environ.get("CDP_VERBOSE_LEVEL", "0") or "0")
     remote_verbose = os.environ.get("CDP_REMOTE_VERBOSE", "0") == "1"
     quiet_mode = os.environ.get("CDP_QUIET", "0") == "1"
     is_local = _uses_local_transport(transport, host)
-    if not is_local and not quiet_mode and (remote_verbose or verbose_level >= 1):
-        print(f"[remote] $ ssh {shlex.quote(host)} {shlex.quote(command)}", file=sys.stderr)
-
     if _uses_local_transport(transport, host):
         proc = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, check=check)
     else:
+        if project_root is None or cfg is None or target_name is None or target_cfg is None:
+            raise RuntimeError("SSH transport requires project_root, cfg, target_name, and target_cfg")
+        ssh_cmd = ssh_command(project_root, cfg, target_name, target_cfg, command)
+        if not quiet_mode and (remote_verbose or verbose_level >= 1):
+            print(f"[remote] $ {shlex.join(ssh_cmd)}", file=sys.stderr)
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, command],
+            ssh_cmd,
             capture_output=True,
             text=True,
             check=check,
@@ -67,8 +113,27 @@ def _run_shell(host: str, command: str, transport: str = "ssh", check: bool = Fa
 
 
 class SGEAdapter:
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=False)
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
+        proc = _run_shell(
+            host,
+            f"qsub {submit_script}",
+            transport=transport,
+            check=False,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
             raise RuntimeError(f"qsub failed: {detail}")
@@ -77,14 +142,50 @@ class SGEAdapter:
         job_id = output.split()[2] if len(output.split()) >= 3 else output
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"qstat -j {job_id}", transport=transport)
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"qstat -j {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode == 0:
             return StatusResult(state="RUNNING_OR_QUEUED", raw=proc.stdout)
         return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"qacct -j {job_id}", transport=transport)
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"qacct -j {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         exit_status = None
@@ -111,8 +212,27 @@ class UnivaAdapter(SGEAdapter):
 
 
 class PBSAdapter:
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"qsub {submit_script}", transport=transport, check=False)
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
+        proc = _run_shell(
+            host,
+            f"qsub {submit_script}",
+            transport=transport,
+            check=False,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
             raise RuntimeError(f"qsub failed: {detail}")
@@ -120,8 +240,26 @@ class PBSAdapter:
         job_id = output.split()[0] if output else ""
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"qstat -f {job_id}", transport=transport)
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"qstat -f {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -132,8 +270,26 @@ class PBSAdapter:
                 break
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"qstat -xf {job_id}", transport=transport)
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"qstat -xf {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -157,8 +313,27 @@ class PBSAdapter:
 
 
 class SlurmAdapter:
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"sbatch {submit_script}", transport=transport, check=False)
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
+        proc = _run_shell(
+            host,
+            f"sbatch {submit_script}",
+            transport=transport,
+            check=False,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
             raise RuntimeError(f"sbatch failed: {detail}")
@@ -167,8 +342,26 @@ class SlurmAdapter:
         job_id = output.split()[-1] if output else ""
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"squeue -h -j {job_id} -o %T", transport=transport)
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"squeue -h -j {job_id} -o %T",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
@@ -177,8 +370,26 @@ class SlurmAdapter:
             return StatusResult(state="NOT_FOUND", raw=proc.stdout)
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"sacct -j {job_id} -X -n -o State | head -n 1", transport=transport)
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"sacct -j {job_id} -X -n -o State | head -n 1",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         state = proc.stdout.strip().split()[0] if proc.stdout.strip() else ""
@@ -189,8 +400,27 @@ class SlurmAdapter:
 
 
 class LSFAdapter:
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
-        proc = _run_shell(host, f"bsub < {submit_script}", transport=transport, check=False)
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
+        proc = _run_shell(
+            host,
+            f"bsub < {submit_script}",
+            transport=transport,
+            check=False,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
             raise RuntimeError(f"bsub failed: {detail}")
@@ -201,16 +431,52 @@ class LSFAdapter:
             job_id = output.split("<", 1)[1].split(">", 1)[0]
         return SubmitResult(job_id=job_id)
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"bjobs -noheader -o STAT {job_id}", transport=transport)
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"bjobs -noheader -o STAT {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
 
         state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else "UNKNOWN"
         return StatusResult(state=state, raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"bjobs -a -noheader -o STAT {job_id}", transport=transport)
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"bjobs -a -noheader -o STAT {job_id}",
+            transport=transport,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         if proc.returncode != 0:
             return StatusResult(state="NOT_FOUND", raw=proc.stderr or proc.stdout)
         state = proc.stdout.strip().splitlines()[0].strip() if proc.stdout.strip() else ""
@@ -224,23 +490,66 @@ class LSFAdapter:
 
 
 class LocalAdapter:
-    def submit(self, host: str, submit_script: str, transport: str = "ssh") -> SubmitResult:
+    def submit(
+        self,
+        host: str,
+        submit_script: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> SubmitResult:
         proc = _run_shell(
             host,
             f"nohup bash {submit_script} >/dev/null 2>&1 & echo $!",
             transport=transport,
             check=False,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
         )
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()
             raise RuntimeError(f"local submit failed: {detail}")
         return SubmitResult(job_id=proc.stdout.strip())
 
-    def status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
-        proc = _run_shell(host, f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi", transport=transport, check=True)
+    def status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
+        proc = _run_shell(
+            host,
+            f"if kill -0 {job_id} 2>/dev/null; then echo RUNNING; else echo EXITED; fi",
+            transport=transport,
+            check=True,
+            project_root=project_root,
+            cfg=cfg,
+            target_name=target_name,
+            target_cfg=target_cfg,
+        )
         return StatusResult(state=proc.stdout.strip(), raw=proc.stdout)
 
-    def accounting_status(self, host: str, job_id: str, transport: str = "ssh") -> StatusResult:
+    def accounting_status(
+        self,
+        host: str,
+        job_id: str,
+        transport: str = "ssh",
+        *,
+        project_root: Path | None = None,
+        cfg: ProjectConfig | None = None,
+        target_name: str | None = None,
+        target_cfg: TargetConfig | None = None,
+    ) -> StatusResult:
         return StatusResult(state="NOT_FOUND", raw="")
 
 

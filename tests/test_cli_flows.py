@@ -20,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from cluster_dispatch.cli import app, _build_submit_script  # noqa: E402
 from cluster_dispatch.config import load_config  # noqa: E402
+from cluster_dispatch.schedulers import get_adapter  # noqa: E402
 
 
 @contextmanager
@@ -143,6 +144,119 @@ class TestClusterDispatchFlows(TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(remote_log_file.exists(), "Expected local run log file to exist")
+
+    def test_sync_push_remote_transport_uses_multiplexed_ssh_and_rsync(self) -> None:
+        template = self.project / "remote-none.tmpl"
+        template.write_text(
+            "# job={job_name}\n"
+            "# out={stdout}\n"
+            "# err={stderr}\n"
+            "# cpus={cpus}\n"
+            "# mem={memory}\n"
+            "# time={time}\n"
+            "# wd={working_dir}\n"
+            "# node={node}\n"
+        )
+        add_result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target",
+                "add",
+                "remote-sync",
+                "--transport",
+                "ssh",
+                "--host",
+                "example.org",
+                "--scheduler",
+                "none",
+                "--remote-root",
+                "/tmp/remote-sync",
+                "--template-file",
+                str(template),
+            ],
+        )
+        self.assertEqual(add_result.exit_code, 0, add_result.output)
+        set_result = _invoke(self.runner, self.project, ["target", "set", "remote-sync"])
+        self.assertEqual(set_result.exit_code, 0, set_result.output)
+
+        calls: list[list[str]] = []
+
+        def _fake_run(*args, **kwargs):
+            cmd = list(args[0] if args else kwargs.get("args"))
+            calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch("cluster_dispatch.cli._SUBPROCESS_RUN", side_effect=_fake_run):
+            result = _invoke(self.runner, self.project, ["sync", "push"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        ssh_calls = [cmd for cmd in calls if cmd and cmd[0] == "ssh"]
+        rsync_calls = [cmd for cmd in calls if cmd and cmd[0] == "rsync"]
+        self.assertTrue(ssh_calls, f"Expected at least one ssh call: {calls}")
+        self.assertTrue(rsync_calls, f"Expected at least one rsync call: {calls}")
+        self.assertIn("-F", ssh_calls[0])
+        ssh_config = Path(ssh_calls[0][ssh_calls[0].index("-F") + 1])
+        self.assertEqual(ssh_config.resolve(), (self.project / ".cluster_dispatch" / "ssh" / "config").resolve())
+        self.assertTrue(ssh_config.exists())
+        config_text = ssh_config.read_text()
+        self.assertIn("Host remote-sync", config_text)
+        self.assertIn("HostName example.org", config_text)
+        self.assertIn("ControlMaster auto", config_text)
+        self.assertIn("ControlPersist 10m", config_text)
+        self.assertIn("-e", rsync_calls[0])
+        rsync_shell = rsync_calls[0][rsync_calls[0].index("-e") + 1]
+        self.assertIn("-F", rsync_shell)
+        self.assertIn(str(ssh_config), rsync_shell)
+        self.assertIn("remote-sync:/tmp/remote-sync/analysis/a/", rsync_calls[0])
+
+    def test_scheduler_submit_uses_multiplexed_ssh(self) -> None:
+        cfg = load_config(self.project)
+        local_target = cfg.targets["local"]
+        cfg.targets["local"] = type(local_target)(
+            host="example.org",
+            scheduler="pbs",
+            remote_root="/tmp/remote",
+            transport="ssh",
+            template_header=local_target.template_header,
+            default_cpus=local_target.default_cpus,
+            default_memory=local_target.default_memory,
+            default_time=local_target.default_time,
+            default_node=local_target.default_node,
+            default_queue=local_target.default_queue,
+            default_parallel_environment=local_target.default_parallel_environment,
+        )
+        adapter = get_adapter("pbs")
+        calls: list[list[str]] = []
+
+        def _fake_run(*args, **kwargs):
+            cmd = list(args[0] if args else kwargs.get("args"))
+            calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(cmd, 0, stdout="123.server\n", stderr="")
+
+        with mock.patch("cluster_dispatch.schedulers.subprocess.run", side_effect=_fake_run):
+            result = adapter.submit(
+                "example.org",
+                "/tmp/job.sh",
+                transport="ssh",
+                project_root=self.project,
+                cfg=cfg,
+                target_name="local",
+                target_cfg=cfg.targets["local"],
+            )
+
+        self.assertEqual(result.job_id, "123.server")
+        self.assertTrue(calls, "Expected scheduler submit to invoke subprocess.run")
+        ssh_cmd = calls[0]
+        self.assertEqual(ssh_cmd[0], "ssh")
+        self.assertIn("-F", ssh_cmd)
+        ssh_config = Path(ssh_cmd[ssh_cmd.index("-F") + 1])
+        self.assertEqual(ssh_config.resolve(), (self.project / ".cluster_dispatch" / "ssh" / "config").resolve())
+        self.assertTrue(ssh_config.exists())
+        config_text = ssh_config.read_text()
+        self.assertIn("Host local", config_text)
+        self.assertIn("HostName example.org", config_text)
+        self.assertIn("ControlMaster auto", config_text)
 
     def test_history_reads_old_and_new_record_shapes(self) -> None:
         old_payload = {
