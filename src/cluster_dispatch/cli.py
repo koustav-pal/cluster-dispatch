@@ -1320,6 +1320,23 @@ def _render_scheduler_header(
         ) from exc
 
 
+def _insert_scheduler_directive(header: str, directive: str, directive_prefix: str) -> str:
+    lines = header.rstrip().splitlines()
+    if not lines:
+        return directive.rstrip() + "\n"
+
+    insert_at = -1
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith(directive_prefix):
+            insert_at = idx
+
+    if insert_at < 0:
+        return "\n".join([directive.rstrip(), *lines]) + "\n"
+
+    updated = lines[: insert_at + 1] + [directive.rstrip()] + lines[insert_at + 1 :]
+    return "\n".join(updated) + "\n"
+
+
 @app.command()
 def init(
     project_path: Optional[Path] = typer.Argument(
@@ -2383,15 +2400,19 @@ def _submit_sweep_array(
 
     if scheduler_lc == "slurm":
         array_directive_prefix = "#SBATCH --array="
+        scheduler_directive_prefix = "#SBATCH"
         task_var_expr = "${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}"
     elif scheduler_lc in {"sge", "univa"}:
         array_directive_prefix = "#$ -t "
+        scheduler_directive_prefix = "#$"
         task_var_expr = "${SGE_TASK_ID:?SGE_TASK_ID not set}"
     elif scheduler_lc == "pbs":
         array_directive_prefix = "#PBS -J "
+        scheduler_directive_prefix = "#PBS"
         task_var_expr = "${PBS_ARRAY_INDEX:-${PBS_ARRAYID:?PBS_ARRAY_INDEX/PBS_ARRAYID not set}}"
     elif scheduler_lc == "lsf":
         array_directive_prefix = "#BSUB -J "
+        scheduler_directive_prefix = "#BSUB"
         task_var_expr = "${LSB_JOBINDEX:?LSB_JOBINDEX not set}"
     else:
         raise typer.BadParameter(f"Array submission mode not supported for scheduler '{target.scheduler}'")
@@ -2487,9 +2508,17 @@ def _submit_sweep_array(
         parallel_environment=str(resources["parallel_environment"]),
     )
     if scheduler_lc == "lsf":
-        array_header = array_header.rstrip() + f"\n{array_directive_prefix}\"{base_job_name}-array[1-{array_size}]\"\n"
+        array_header = _insert_scheduler_directive(
+            array_header,
+            f'{array_directive_prefix}"{base_job_name}-array[1-{array_size}]"',
+            scheduler_directive_prefix,
+        )
     else:
-        array_header = array_header.rstrip() + f"\n{array_directive_prefix}1-{array_size}\n"
+        array_header = _insert_scheduler_directive(
+            array_header,
+            f"{array_directive_prefix}1-{array_size}",
+            scheduler_directive_prefix,
+        )
 
     remote_array_submit = f"{remote_sweep_dir}/pc_submit_array_{sweep_id}.sh"
     remote_log_file = f"{remote_sweep_dir}/run_array_{sweep_id}.log"
