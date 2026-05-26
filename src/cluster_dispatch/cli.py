@@ -1337,6 +1337,32 @@ def _insert_scheduler_directive(header: str, directive: str, directive_prefix: s
     return "\n".join(updated) + "\n"
 
 
+def _sync_analysis_to_target(
+    project_root: Path,
+    cfg: ProjectConfig,
+    analysis_dir: Path,
+    target_name: str,
+    target: TargetConfig,
+    remote_analysis_root: str,
+) -> None:
+    project_ignore = _ignore_file(project_root)
+    local_target_mode = _uses_local_transport(target)
+    if local_target_mode:
+        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
+    else:
+        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_analysis_root))
+
+    rsync_cmd = ["rsync", "-az"]
+    if project_ignore.exists():
+        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
+    if local_target_mode:
+        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
+    else:
+        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
+        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target)
+    _run_cmd(rsync_cmd)
+
+
 @app.command()
 def init(
     project_path: Optional[Path] = typer.Argument(
@@ -2285,6 +2311,7 @@ def _submit_sweep_single(
 ) -> int:
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
     analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    analysis_dir = (project_root / analysis_rel).resolve()
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
     sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
     sync_destination = remote_analysis_root
@@ -2293,6 +2320,7 @@ def _submit_sweep_single(
     ignore_used = bool(ignore_file_path)
     profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
     local_target_mode = _uses_local_transport(target)
+    _sync_analysis_to_target(project_root, cfg, analysis_dir, target_name, target, remote_analysis_root)
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
     else:
@@ -2422,6 +2450,7 @@ def _submit_sweep_array(
 
     remote_sweep_dir = str(manifest["remote_sweep_dir"])
     analysis_rel = str(manifest.get("analysis", "")).strip("/")
+    analysis_dir = (project_root / analysis_rel).resolve()
     remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
     sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
     sync_destination = remote_analysis_root
@@ -2430,6 +2459,7 @@ def _submit_sweep_array(
     ignore_used = bool(ignore_file_path)
     profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
     local_target_mode = _uses_local_transport(target)
+    _sync_analysis_to_target(project_root, cfg, analysis_dir, target_name, target, remote_analysis_root)
     if local_target_mode:
         Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
     else:

@@ -357,6 +357,88 @@ class TestClusterDispatchFlows(TestCase):
         ]:
             self.assertIn(key, record)
 
+    def test_sweep_remote_single_syncs_analysis_before_submission(self) -> None:
+        sweep_yaml = self.project / "sweep.yml"
+        sweep_yaml.write_text(
+            "params:\n"
+            "  job1:\n"
+            "    lr: [0.1]\n"
+            "    batch_size: [32]\n"
+        )
+        template = self.project / "remote-none.tmpl"
+        template.write_text(
+            "# job={job_name}\n"
+            "# out={stdout}\n"
+            "# err={stderr}\n"
+            "# cpus={cpus}\n"
+            "# mem={memory}\n"
+            "# time={time}\n"
+            "# wd={working_dir}\n"
+            "# node={node}\n"
+        )
+        add_result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target",
+                "add",
+                "remote-sweep",
+                "--transport",
+                "ssh",
+                "--host",
+                "example.org",
+                "--scheduler",
+                "none",
+                "--remote-root",
+                "/tmp/remote-sweep",
+                "--template-file",
+                str(template),
+            ],
+        )
+        self.assertEqual(add_result.exit_code, 0, add_result.output)
+        set_result = _invoke(self.runner, self.project, ["target", "set", "remote-sweep"])
+        self.assertEqual(set_result.exit_code, 0, set_result.output)
+
+        cli_calls: list[list[str]] = []
+        sched_calls: list[list[str]] = []
+
+        def _fake_cli_run(*args, **kwargs):
+            cmd = list(args[0] if args else kwargs.get("args"))
+            cli_calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        def _fake_sched_run(*args, **kwargs):
+            cmd = list(args[0] if args else kwargs.get("args"))
+            sched_calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(cmd, 0, stdout="999\n", stderr="")
+
+        with mock.patch("cluster_dispatch.cli._SUBPROCESS_RUN", side_effect=_fake_cli_run):
+            with mock.patch("cluster_dispatch.schedulers.subprocess.run", side_effect=_fake_sched_run):
+                result = _invoke(
+                    self.runner,
+                    self.project,
+                    [
+                        "analysis",
+                        "sweep",
+                        "run",
+                        "--mode",
+                        "single",
+                        "--config",
+                        str(sweep_yaml),
+                        "python",
+                        "-c",
+                        "print({lr},{batch_size})",
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        rsync_calls = [cmd for cmd in cli_calls if cmd and cmd[0] == "rsync"]
+        self.assertGreaterEqual(len(rsync_calls), 1, f"Expected rsync call during sweep submission: {cli_calls}")
+        analysis_sync_call = rsync_calls[0]
+        self.assertIn(f"{(self.project / self.analysis_rel).resolve()}/", analysis_sync_call)
+        self.assertIn("remote-sweep:/tmp/remote-sweep/analysis/a/", analysis_sync_call)
+        self.assertTrue(sched_calls, "Expected scheduler submit call for remote sweep")
+
     def test_sync_push_dry_run_no_side_effects(self) -> None:
         sync_dir = self.project / ".cluster_dispatch" / "sync"
         self.assertFalse(sync_dir.exists())
