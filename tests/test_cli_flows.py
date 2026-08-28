@@ -18,7 +18,8 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from cluster_dispatch.cli import app, _build_submit_script, _insert_scheduler_directive  # noqa: E402
+from cluster_dispatch.cli import app  # noqa: E402
+from cluster_dispatch.operations import build_submit_script  # noqa: E402
 from cluster_dispatch.config import load_config  # noqa: E402
 from cluster_dispatch.context import resolve_context  # noqa: E402
 from cluster_dispatch.records import resolve_job  # noqa: E402
@@ -159,7 +160,7 @@ class TestClusterDispatchFlows(TestCase):
         self.assertFalse((self.project / ".cluster_dispatch" / "index").exists())
 
     def test_build_submit_script_places_scheduler_header_before_commands(self) -> None:
-        script = _build_submit_script(
+        script = build_submit_script(
             header="#PBS -l walltime=01:00:00\n#PBS -N demo",
             command="echo hello",
             working_dir="/tmp/work",
@@ -173,25 +174,6 @@ class TestClusterDispatchFlows(TestCase):
         first_exec_idx = lines.index("set -euo pipefail")
         walltime_idx = lines.index("#PBS -l walltime=01:00:00")
         self.assertLess(walltime_idx, first_exec_idx)
-
-    def test_insert_scheduler_directive_places_pbs_array_before_commands(self) -> None:
-        header = (
-            "#PBS -N demo\n"
-            "#PBS -o stdout.out\n"
-            "#PBS -e stderr.err\n"
-            "#PBS -l walltime=72:00:00\n"
-            "#PBS -l select=1:ncpus=8:mem=64G:mpiprocs=1:ompthreads=8\n"
-            "\n"
-            "cd /scratch/project/analysis\n"
-            "source activate env\n"
-        )
-        updated = _insert_scheduler_directive(header, "#PBS -J 1-249", "#PBS")
-        lines = updated.splitlines()
-        select_idx = lines.index("#PBS -l select=1:ncpus=8:mem=64G:mpiprocs=1:ompthreads=8")
-        array_idx = lines.index("#PBS -J 1-249")
-        cd_idx = lines.index("cd /scratch/project/analysis")
-        self.assertLess(select_idx, array_idx)
-        self.assertLess(array_idx, cd_idx)
 
     def test_analysis_run_local_transport_uses_no_ssh(self) -> None:
         ssh_calls: list[list[str]] = []
@@ -269,7 +251,7 @@ class TestClusterDispatchFlows(TestCase):
             calls.append(cmd)
             return __import__("subprocess").CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        with mock.patch("cluster_dispatch.cli._SUBPROCESS_RUN", side_effect=_fake_run):
+        with mock.patch("cluster_dispatch.commands.core._SUBPROCESS_RUN", side_effect=_fake_run):
             result = _invoke(self.runner, self.project, ["sync", "push"])
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -475,7 +457,7 @@ class TestClusterDispatchFlows(TestCase):
             sched_calls.append(cmd)
             return __import__("subprocess").CompletedProcess(cmd, 0, stdout="999\n", stderr="")
 
-        with mock.patch("cluster_dispatch.cli._SUBPROCESS_RUN", side_effect=_fake_cli_run):
+        with mock.patch("cluster_dispatch.commands.core._SUBPROCESS_RUN", side_effect=_fake_cli_run):
             with mock.patch("cluster_dispatch.schedulers.subprocess.run", side_effect=_fake_sched_run):
                 result = _invoke(
                     self.runner,

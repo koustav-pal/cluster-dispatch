@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,34 @@ from cluster_dispatch.config import CONFIG_DIR, JOBS_DIR
 
 SYNC_DIR = "sync"
 SWEEPS_DIR = "sweeps"
+
+
+@dataclass(frozen=True)
+class TargetRecordRefs:
+    jobs: list[Path]
+    sync: list[Path]
+
+
+def target_record_refs(project_root: Path, target: str) -> TargetRecordRefs:
+    matches: dict[str, list[Path]] = {"jobs": [], "sync": []}
+    for name, directory in (("jobs", JOBS_DIR), ("sync", SYNC_DIR)):
+        root = project_root / CONFIG_DIR / directory
+        if not root.exists():
+            continue
+        for path in root.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("target", "")) == target:
+                matches[name].append(path)
+    return TargetRecordRefs(matches["jobs"], matches["sync"])
+
+
+def prune_target_records(refs: TargetRecordRefs) -> tuple[int, int]:
+    for path in [*refs.jobs, *refs.sync]:
+        path.unlink(missing_ok=True)
+    return len(refs.jobs), len(refs.sync)
 
 
 def _timestamp(value: object) -> datetime | None:

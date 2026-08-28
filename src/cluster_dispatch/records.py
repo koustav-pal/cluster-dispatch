@@ -261,11 +261,3 @@ def list_sweeps(project_root: Path) -> list[dict[str, Any]]:
         payload["_manifest_file"] = str(path)
         manifests.append(payload)
     return manifests
-
-
-# Compatibility names for callers migrating from pre-v1 internals.
-write_job_record = save_job
-load_job_records = list_jobs
-update_job_record = update_job
-write_sync_record = save_sync
-load_sync_records = list_syncs

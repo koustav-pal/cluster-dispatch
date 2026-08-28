@@ -27,7 +27,7 @@ jobs:
           pip install .
 
       - name: Compile check
-        run: python -m py_compile src/cluster_dispatch/cli.py
+        run: python -m compileall -q src
 
       - name: Run unit tests
-        run: python -m unittest -v tests/test_cli_flows.py
+        run: python -m unittest discover -s tests -v

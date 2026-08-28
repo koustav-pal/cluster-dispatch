@@ -17,7 +17,7 @@ refactoring of existing project scripts and paths for another scheduler.
 This in turn can lead to under-utilisation of resources and ensuing penalisation from admins if such policies are in place.  
 
 But, it doesn't have to be this way. This is my solution to my problem and is helping me to work around a few key problems
-- No mountable interfact to the HPC.
+- No mountable interface to the HPC.
 - Currently 3 soon to be 4 different compute environments with different paths and schedulers.
 
 The package still requires you the users to sort out your own dependencies and availability of input files. 
@@ -26,8 +26,7 @@ The package still requires you the users to sort out your own dependencies and a
 `cluster-dispatch` (`cdp`) is a Python CLI for dispatching and tracking analysis jobs across local and remote compute targets.
 
 It supports the following schedulers:
-- `none` (local execution)
-- `none` (remote non-scheduler execution)
+- `none` (local or remote non-scheduler execution)
 - `sge`
 - `univa`
 - `pbs`
@@ -50,8 +49,8 @@ Requirements:
 From source:
 
 ```bash
-git clone https://github.com/koustav-pal/project-control.git
-cd project-control
+git clone https://github.com/koustav-pal/cluster-dispatch.git
+cd cluster-dispatch
 pip install -e .
 ```
 

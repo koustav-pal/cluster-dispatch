@@ -7,12 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-import typer
-
 from cluster_dispatch.config import CONFIG_DIR, ProjectConfig, TargetConfig, load_config
 from cluster_dispatch.transport import is_local_transport, ssh_command
 
 INDEX_DIR_NAME = "index"
+
+
+class IndexError(ValueError):
+    pass
 
 
 def _index_dir(project_root: Path) -> Path:
@@ -154,7 +156,7 @@ def _iso_from_epoch(value: float) -> str:
 
 def index_local_scope(scope_root: Path) -> list[dict[str, Any]]:
     if not scope_root.exists():
-        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
+        raise IndexError(f"Remote scope not found: {scope_root}")
 
     entries: list[dict[str, Any]] = []
     if scope_root.is_file():
@@ -207,10 +209,10 @@ def index_remote_scope(
         check=False,
     )
     if proc.returncode == 3:
-        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
+        raise IndexError(f"Remote scope not found: {scope_root}")
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "unknown remote indexing error").strip()
-        raise typer.BadParameter(f"Failed to index remote scope '{scope_root}': {err}")
+        raise IndexError(f"Failed to index remote scope '{scope_root}': {err}")
 
     entries: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
@@ -335,25 +337,25 @@ def resolve_index_scopes(
     if all_tags:
         scopes = [tag.strip("/") for tag in analysis_tags if tag.strip("/")]
         if not scopes:
-            raise typer.BadParameter("No tags found for active analysis. Tag paths with `cdp analysis tag <path>` first.")
+            raise IndexError("No tags found for active analysis. Tag paths with `cdp analysis tag <path>` first.")
     elif remote_path:
         normalized = remote_path.strip()
         if not normalized:
-            raise typer.BadParameter("--remote-path cannot be empty")
+            raise IndexError("--remote-path cannot be empty")
         if normalized.startswith("/"):
             if normalized != remote_analysis_root and not normalized.startswith(f"{remote_analysis_root.rstrip('/')}/"):
-                raise typer.BadParameter("--remote-path must stay inside the active analysis remote root")
+                raise IndexError("--remote-path must stay inside the active analysis remote root")
             normalized = normalized.removeprefix(remote_analysis_root).strip("/")
         scopes = [normalized]
     else:
         candidate = Path(local_path).expanduser()
         if candidate.is_absolute():
-            raise typer.BadParameter("Path must be relative to the active analysis directory")
+            raise IndexError("Path must be relative to the active analysis directory")
         local_target = (analysis_dir / candidate).resolve()
         try:
             rel = local_target.relative_to(analysis_dir).as_posix()
         except ValueError as exc:
-            raise typer.BadParameter("Path must stay inside the active analysis directory") from exc
+            raise IndexError("Path must stay inside the active analysis directory") from exc
         scopes = ["" if rel == "." else rel]
 
     resolved: list[dict[str, str]] = []

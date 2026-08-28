@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from cluster_dispatch.config import CONFIG_DIR, LastJob, load_state, save_state
 from cluster_dispatch.context import Context
+from cluster_dispatch.index import IndexError
 from cluster_dispatch.models import (
     IndexRequest,
     PullRequest,
@@ -494,16 +495,19 @@ def prepare_index(
     *,
     resolve_scopes: Callable[..., list[dict[str, str]]],
 ) -> IndexPlan:
-    scopes = resolve_scopes(
-        analysis_dir=context.local_analysis,
-        analysis_rel=context.analysis.as_posix(),
-        target_cfg=context.target,
-        remote_analysis_root=str(context.remote_analysis),
-        local_path=request.local_path,
-        remote_path=request.remote_path,
-        all_tags=request.all_tags,
-        analysis_tags=context.config.analysis_tags.get(context.analysis.as_posix(), []),
-    )
+    try:
+        scopes = resolve_scopes(
+            analysis_dir=context.local_analysis,
+            analysis_rel=context.analysis.as_posix(),
+            target_cfg=context.target,
+            remote_analysis_root=str(context.remote_analysis),
+            local_path=request.local_path,
+            remote_path=request.remote_path,
+            all_tags=request.all_tags,
+            analysis_tags=context.config.analysis_tags.get(context.analysis.as_posix(), []),
+        )
+    except IndexError as exc:
+        raise OperationError(str(exc)) from exc
     return IndexPlan(context=context, request=request, scopes=scopes)
 
 
@@ -537,4 +541,7 @@ def index(
     plan = prepare_index(context, request, resolve_scopes=resolve_scopes)
     if request.dry_run:
         return IndexResult(plan=plan, dry_run=True)
-    return execute_index(plan, write_manifest=write_manifest)
+    try:
+        return execute_index(plan, write_manifest=write_manifest)
+    except IndexError as exc:
+        raise OperationError(str(exc)) from exc
