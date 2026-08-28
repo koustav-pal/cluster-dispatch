@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -128,23 +127,3 @@ def save_state(project_root: Path, state: dict[str, Any]) -> None:
     state_root = ensure_state_dirs(project_root)
     state_file = state_root / STATE_FILE
     state_file.write_text(json.dumps(state, indent=2))
-
-
-def append_job_record(project_root: Path, payload: dict[str, Any]) -> Path:
-    state_root = ensure_state_dirs(project_root)
-    stamp = payload.get("submitted_at", "unknown").replace(":", "-")
-    raw_parts = [
-        stamp,
-        str(payload.get("job_id", "")).strip(),
-        str(payload.get("job_name", "")).strip(),
-        str(payload.get("target", "")).strip(),
-    ]
-    clean_parts = [re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._-") for part in raw_parts if part]
-    stem = "__".join(clean_parts) if clean_parts else "job"
-    path = state_root / JOBS_DIR / f"{stem}.json"
-    counter = 1
-    while path.exists():
-        path = state_root / JOBS_DIR / f"{stem}__{counter}.json"
-        counter += 1
-    path.write_text(json.dumps(payload, indent=2))
-    return path

@@ -20,6 +20,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from cluster_dispatch.cli import app, _build_submit_script, _insert_scheduler_directive  # noqa: E402
 from cluster_dispatch.config import load_config  # noqa: E402
+from cluster_dispatch.context import resolve_context  # noqa: E402
+from cluster_dispatch.records import resolve_job  # noqa: E402
 from cluster_dispatch.schedulers import get_adapter  # noqa: E402
 
 
@@ -94,6 +96,67 @@ class TestClusterDispatchFlows(TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         expected_remote_workdir = f"{(self.project / self.analysis_rel).resolve().as_posix()}/scripts"
         self.assertIn(f"cd {expected_remote_workdir}", result.output)
+
+    def test_resolve_context_centralizes_analysis_and_workdirs(self) -> None:
+        scripts_dir = self.project / self.analysis_rel / "scripts"
+        scripts_dir.mkdir(parents=True)
+
+        context = resolve_context(start=scripts_dir, cwd=scripts_dir)
+
+        self.assertEqual(context.project_root, self.project.resolve())
+        self.assertEqual(context.analysis, self.analysis_rel)
+        self.assertEqual(context.local_analysis, (self.project / self.analysis_rel).resolve())
+        self.assertEqual(context.workdir, scripts_dir.resolve())
+        self.assertEqual(context.remote_workdir, context.remote_analysis / "scripts")
+
+    def test_remote_run_dry_run_does_not_write_ssh_config(self) -> None:
+        template = self.project / "dry-remote.tmpl"
+        template.write_text(
+            "# job={job_name}\n# out={stdout}\n# err={stderr}\n# cpus={cpus}\n"
+            "# mem={memory}\n# time={time}\n# wd={working_dir}\n"
+        )
+        add_result = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target",
+                "add",
+                "dry-remote",
+                "--transport",
+                "ssh",
+                "--host",
+                "example.org",
+                "--scheduler",
+                "none",
+                "--remote-root",
+                "/tmp/dry-remote",
+                "--template-file",
+                str(template),
+            ],
+        )
+        self.assertEqual(add_result.exit_code, 0, add_result.output)
+        set_result = _invoke(self.runner, self.project, ["target", "set", "dry-remote"])
+        self.assertEqual(set_result.exit_code, 0, set_result.output)
+
+        result = _invoke(self.runner, self.project, ["analysis", "run", "--dry-run", "echo", "ok"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse((self.project / ".cluster_dispatch" / "ssh" / "config").exists())
+
+    def test_run_uses_push_without_writing_explicit_sync_record(self) -> None:
+        result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(4)"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse((self.project / ".cluster_dispatch" / "sync").exists())
+
+        record = resolve_job(self.project)
+        self.assertEqual(record["command"], "python -c 'print(4)'")
+
+    def test_index_dry_run_does_not_write_manifest(self) -> None:
+        result = _invoke(self.runner, self.project, ["index", "--dry-run"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Dry run: no changes will be made", result.output)
+        self.assertFalse((self.project / ".cluster_dispatch" / "index").exists())
 
     def test_build_submit_script_places_scheduler_header_before_commands(self) -> None:
         script = _build_submit_script(
@@ -438,6 +501,12 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn(f"{(self.project / self.analysis_rel).resolve()}/", analysis_sync_call)
         self.assertIn("remote-sweep:/tmp/remote-sweep/analysis/a/", analysis_sync_call)
         self.assertTrue(sched_calls, "Expected scheduler submit call for remote sweep")
+        record = _latest_job_record(self.project)
+        self.assertEqual(record["submission_mode"], "single")
+        self.assertIn("sweep_id", record)
+        self.assertIn("resources", record)
+        self.assertIn("paths", record)
+        self.assertIn("sync", record)
 
     def test_sync_push_dry_run_no_side_effects(self) -> None:
         sync_dir = self.project / ".cluster_dispatch" / "sync"

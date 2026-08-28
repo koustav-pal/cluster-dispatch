@@ -31,7 +31,6 @@ from cluster_dispatch.config import (
     LastJob,
     ProjectConfig,
     TargetConfig,
-    append_job_record,
     config_path,
     ensure_state_dirs,
     find_project_root,
@@ -39,6 +38,38 @@ from cluster_dispatch.config import (
     load_state,
     save_config,
     save_state,
+)
+from cluster_dispatch.context import Context, ContextError, resolve_context
+from cluster_dispatch.index import (
+    INDEX_DIR_NAME,
+    auto_index_active_root as _auto_index_active_root_impl,
+    index_entry_path_exists as _index_entry_path_exists,
+    index_file_count_and_bytes as _index_file_count_and_bytes,
+    index_manifest_paths as _index_manifest_paths,
+    list_names_from_index_manifest as _list_names_from_index_manifest,
+    load_all_index_manifests as _load_all_index_manifests,
+    load_index_manifest as _load_index_manifest,
+    output_check_from_index as _output_check_from_index,
+    resolve_index_scopes as _resolve_index_scopes,
+    summarize_index_vs_local as _summarize_index_vs_local,
+    write_index_manifest_for_scope as _write_index_manifest_for_scope_impl,
+)
+from cluster_dispatch.models import IndexRequest, PullRequest, PushRequest, ResourceSpec, RunRequest
+from cluster_dispatch.operations import (
+    OperationError,
+    OperationRuntime,
+    index as execute_index_operation,
+    pull as execute_pull_operation,
+    push as execute_push_operation,
+    run as execute_run_operation,
+)
+from cluster_dispatch.records import (
+    list_jobs,
+    list_syncs,
+    load_sweep,
+    resolve_job,
+    save_job as append_job_record,
+    save_sweep,
 )
 from cluster_dispatch.schedulers import get_adapter
 from cluster_dispatch.transport import (
@@ -81,7 +112,6 @@ TEMPLATES_DIR_NAME = "templates"
 TEMPLATE_FILE_NAME = "scheduler_header.tmpl"
 SWEEPS_DIR_NAME = "sweeps"
 SYNC_EVENTS_DIR_NAME = "sync"
-INDEX_DIR_NAME = "index"
 RUNS_DIR_NAME = "runs"
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 DEFAULT_RESOURCE_PROFILES: dict[str, dict[str, str | int]] = {
@@ -624,128 +654,6 @@ def _sweeps_dir(project_root: Path) -> Path:
     return path
 
 
-def _sync_events_dir(project_root: Path) -> Path:
-    path = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _index_dir(project_root: Path) -> Path:
-    path = project_root / CONFIG_DIR / INDEX_DIR_NAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _index_manifest_path(project_root: Path, target_name: str, analysis_rel: str, scope_rel: str) -> Path:
-    safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_name).strip("._-") or "target"
-    safe_analysis = [re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._-") for part in analysis_rel.split("/") if part]
-    analysis_dir = _index_dir(project_root) / safe_target
-    for part in safe_analysis:
-        analysis_dir = analysis_dir / part
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-    clean_scope = scope_rel.strip("/")
-    if clean_scope in {"", "."}:
-        scope_stem = "root"
-    else:
-        scope_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean_scope.replace("/", "__")).strip("._-") or "scope"
-    return analysis_dir / f"{scope_stem}.json"
-
-
-def _index_manifest_candidate(project_root: Path, target_name: str, analysis_rel: str, scope_rel: str) -> Path:
-    safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_name).strip("._-") or "target"
-    safe_analysis = [re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._-") for part in analysis_rel.split("/") if part]
-    analysis_dir = project_root / CONFIG_DIR / INDEX_DIR_NAME / safe_target
-    for part in safe_analysis:
-        analysis_dir = analysis_dir / part
-    clean_scope = scope_rel.strip("/")
-    if clean_scope in {"", "."}:
-        scope_stem = "root"
-    else:
-        scope_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean_scope.replace("/", "__")).strip("._-") or "scope"
-    return analysis_dir / f"{scope_stem}.json"
-
-
-def _load_index_manifest(
-    project_root: Path,
-    target_name: str,
-    analysis_rel: str,
-    scope_rel: str,
-) -> Optional[dict[str, Any]]:
-    manifest_path = _index_manifest_candidate(project_root, target_name, analysis_rel, scope_rel)
-    if not manifest_path.exists():
-        return None
-    try:
-        payload = json.loads(manifest_path.read_text())
-    except json.JSONDecodeError:
-        return None
-    if str(payload.get("target", "")) != target_name:
-        return None
-    if str(payload.get("analysis", "")).strip("/") != analysis_rel.strip("/"):
-        return None
-    payload["_manifest_path"] = str(manifest_path)
-    return payload
-
-
-def _list_names_from_index_manifest(manifest: dict[str, Any], include_files: bool) -> list[str]:
-    entries = manifest.get("entries", [])
-    if not isinstance(entries, list):
-        return []
-    names: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        rel_path = str(entry.get("path", "")).strip("/")
-        if rel_path in {"", "."}:
-            continue
-        top_name = rel_path.split("/", 1)[0]
-        if not include_files:
-            if "/" in rel_path:
-                names.add(top_name)
-                continue
-            if str(entry.get("type", "")).lower() == "dir":
-                names.add(top_name)
-            continue
-        names.add(top_name)
-    return sorted(names)
-
-
-def _index_entry_path_exists(manifest: dict[str, Any], rel_path: str) -> bool:
-    clean = rel_path.strip("/")
-    if clean in {"", "."}:
-        return True
-    entries = manifest.get("entries", [])
-    if not isinstance(entries, list):
-        return False
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        epath = str(entry.get("path", "")).strip("/")
-        if not epath or epath == ".":
-            continue
-        if epath == clean or epath.startswith(f"{clean}/"):
-            return True
-    return False
-
-
-def _index_file_count_and_bytes(manifest: dict[str, Any]) -> tuple[int, int]:
-    entries = manifest.get("entries", [])
-    if not isinstance(entries, list):
-        return 0, 0
-    file_count = 0
-    total_bytes = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("type", "")).lower() != "file":
-            continue
-        file_count += 1
-        try:
-            total_bytes += int(entry.get("size", 0))
-        except Exception:
-            pass
-    return file_count, total_bytes
-
-
 def _humanize_bytes(num_bytes: int) -> str:
     value = float(max(0, num_bytes))
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -756,79 +664,6 @@ def _humanize_bytes(num_bytes: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{int(num_bytes)} B"
-
-
-def _index_manifest_paths(project_root: Path) -> list[Path]:
-    root = project_root / CONFIG_DIR / INDEX_DIR_NAME
-    if not root.exists():
-        return []
-    return sorted(root.rglob("*.json"))
-
-
-def _load_all_index_manifests(project_root: Path) -> list[dict[str, Any]]:
-    manifests: list[dict[str, Any]] = []
-    for path in _index_manifest_paths(project_root):
-        try:
-            payload = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            continue
-        payload["_manifest_path"] = str(path)
-        manifests.append(payload)
-    return manifests
-
-
-def _write_index_manifest_for_scope(
-    project_root: Path,
-    analysis_rel: str,
-    target_name: str,
-    target_cfg: TargetConfig,
-    scope_rel: str,
-    scope_remote: str,
-) -> dict[str, Any]:
-    if _uses_local_transport(target_cfg):
-        entries = _index_local_scope(Path(scope_remote))
-    else:
-        entries = _index_remote_scope(project_root, load_config(project_root), target_name, target_cfg, scope_remote)
-    manifest = {
-        "indexed_at": datetime.now().isoformat(timespec="seconds"),
-        "project_root": str(project_root),
-        "analysis": analysis_rel,
-        "target": target_name,
-        "transport": target_cfg.transport,
-        "scheduler": target_cfg.scheduler,
-        "scope": scope_rel,
-        "remote_scope": scope_remote,
-        "entry_count": len(entries),
-        "entries": entries,
-    }
-    manifest_path = _index_manifest_path(project_root, target_name, analysis_rel, scope_rel)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    manifest["_manifest_path"] = str(manifest_path)
-    return manifest
-
-
-def _summarize_index_vs_local(local_scope_root: Path, index_manifest: dict[str, Any]) -> dict[str, int]:
-    local_entries = _index_local_scope(local_scope_root) if local_scope_root.exists() else []
-    local_map = {str(e.get("path", "")).strip("/"): e for e in local_entries if isinstance(e, dict)}
-    remote_entries = index_manifest.get("entries", [])
-    remote_map = {
-        str(e.get("path", "")).strip("/"): e for e in remote_entries if isinstance(e, dict) and str(e.get("path", "")).strip("/")
-    } if isinstance(remote_entries, list) else {}
-
-    remote_only = len([k for k in remote_map.keys() if k not in local_map])
-    local_only = len([k for k in local_map.keys() if k not in remote_map])
-    changed = 0
-    for key in set(local_map.keys()).intersection(remote_map.keys()):
-        lval = local_map[key]
-        rval = remote_map[key]
-        if str(lval.get("type", "")) != str(rval.get("type", "")):
-            changed += 1
-            continue
-        if str(lval.get("type", "")) == "file":
-            if int(lval.get("size", 0) or 0) != int(rval.get("size", 0) or 0):
-                changed += 1
-                continue
-    return {"remote_only": remote_only, "local_only": local_only, "changed": changed}
 
 
 def _complete_index_remote_paths(incomplete: str) -> list[str]:
@@ -863,193 +698,23 @@ def _complete_index_remote_paths(incomplete: str) -> list[str]:
     return _prefix_filter(sorted(values), incomplete)
 
 
-def _auto_index_active_root(project_root: Path, cfg: ProjectConfig, target_name: str, target_cfg: TargetConfig) -> Optional[str]:
-    analysis_rel = (cfg.active_analysis or "").strip("/")
-    if not analysis_rel:
-        return None
-    remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
-    manifest = _write_index_manifest_for_scope(
-        project_root=project_root,
-        analysis_rel=analysis_rel,
-        target_name=target_name,
-        target_cfg=target_cfg,
-        scope_rel=".",
-        scope_remote=remote_analysis_root,
-    )
-    return str(manifest.get("_manifest_path", ""))
+def _write_index_manifest_for_scope(**kwargs: Any) -> dict[str, Any]:
+    return _write_index_manifest_for_scope_impl(**kwargs, run_direct=_run_direct)
 
 
-def _iso_from_epoch(value: float) -> str:
-    return datetime.fromtimestamp(value).isoformat(timespec="seconds")
-
-
-def _index_local_scope(scope_root: Path) -> list[dict[str, Any]]:
-    if not scope_root.exists():
-        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
-
-    entries: list[dict[str, Any]] = []
-    if scope_root.is_file():
-        stats = scope_root.stat()
-        entries.append(
-            {
-                "path": ".",
-                "type": "file",
-                "size": int(stats.st_size),
-                "mtime_epoch": int(stats.st_mtime),
-                "mtime": _iso_from_epoch(stats.st_mtime),
-            }
-        )
-        return entries
-
-    for path in sorted(scope_root.rglob("*")):
-        try:
-            rel = path.relative_to(scope_root).as_posix()
-        except ValueError:
-            continue
-        stats = path.stat()
-        entries.append(
-            {
-                "path": rel,
-                "type": ("dir" if path.is_dir() else "file"),
-                "size": int(stats.st_size),
-                "mtime_epoch": int(stats.st_mtime),
-                "mtime": _iso_from_epoch(stats.st_mtime),
-            }
-        )
-    return entries
-
-
-def _index_remote_scope(
+def _auto_index_active_root(
     project_root: Path,
     cfg: ProjectConfig,
     target_name: str,
     target_cfg: TargetConfig,
-    scope_root: str,
-) -> list[dict[str, Any]]:
-    remote_cmd = (
-        f'P={shlex.quote(scope_root)}; '
-        'if [ ! -e "$P" ]; then exit 3; fi; '
-        'if [ -f "$P" ]; then '
-        'stat -c ".\\tf\\t%s\\t%Y" "$P"; '
-        "else "
-        'find "$P" -mindepth 1 -printf "%P\\t%y\\t%s\\t%T@\\n" | sort; '
-        "fi"
+) -> Optional[str]:
+    return _auto_index_active_root_impl(
+        project_root,
+        cfg,
+        target_name,
+        target_cfg,
+        run_direct=_run_direct,
     )
-    proc = _run_direct(
-        ssh_command(project_root, cfg, target_name, target_cfg, remote_cmd),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode == 3:
-        raise typer.BadParameter(f"Remote scope not found: {scope_root}")
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "unknown remote indexing error").strip()
-        raise typer.BadParameter(f"Failed to index remote scope '{scope_root}': {err}")
-
-    entries: list[dict[str, Any]] = []
-    for line in proc.stdout.splitlines():
-        parts = line.strip().split("\t")
-        if len(parts) != 4:
-            continue
-        rel_path, kind, size_raw, mtime_raw = parts
-        entry_type = "dir" if kind == "d" else "file"
-        try:
-            size_value = int(float(size_raw))
-        except ValueError:
-            size_value = 0
-        try:
-            epoch_value = int(float(mtime_raw))
-        except ValueError:
-            epoch_value = 0
-        entries.append(
-            {
-                "path": rel_path,
-                "type": entry_type,
-                "size": size_value,
-                "mtime_epoch": epoch_value,
-                "mtime": _iso_from_epoch(float(epoch_value)) if epoch_value > 0 else "",
-            }
-        )
-    return entries
-
-
-def _resolve_index_scopes(
-    *,
-    analysis_dir: Path,
-    analysis_rel: str,
-    target_cfg: TargetConfig,
-    remote_analysis_root: str,
-    local_path: str,
-    remote_path: Optional[str],
-    all_tags: bool,
-    analysis_tags: list[str],
-) -> list[dict[str, str]]:
-    scopes: list[str] = []
-    if all_tags:
-        scopes = [tag.strip("/") for tag in analysis_tags if tag.strip("/")]
-        if not scopes:
-            raise typer.BadParameter("No tags found for active analysis. Tag paths with `cdp analysis tag <path>` first.")
-    elif remote_path:
-        normalized = remote_path.strip()
-        if not normalized:
-            raise typer.BadParameter("--remote-path cannot be empty")
-        if normalized.startswith("/"):
-            if normalized != remote_analysis_root and not normalized.startswith(f"{remote_analysis_root.rstrip('/')}/"):
-                raise typer.BadParameter("--remote-path must stay inside the active analysis remote root")
-            normalized = normalized.removeprefix(remote_analysis_root).strip("/")
-        scopes = [normalized]
-    else:
-        candidate = Path(local_path).expanduser()
-        if candidate.is_absolute():
-            raise typer.BadParameter("Path must be relative to the active analysis directory")
-        local_target = (analysis_dir / candidate).resolve()
-        try:
-            rel = local_target.relative_to(analysis_dir).as_posix()
-        except ValueError as exc:
-            raise typer.BadParameter("Path must stay inside the active analysis directory") from exc
-        scopes = ["" if rel == "." else rel]
-
-    resolved: list[dict[str, str]] = []
-    for scope_rel in scopes:
-        clean_scope = scope_rel.strip("/")
-        local_scope = analysis_dir if not clean_scope else (analysis_dir / clean_scope)
-        remote_scope = remote_analysis_root if not clean_scope else f"{remote_analysis_root.rstrip('/')}/{clean_scope}"
-        if _uses_local_transport(target_cfg):
-            local_remote_scope = Path(remote_scope).expanduser()
-            resolved.append(
-                {
-                    "scope": clean_scope or ".",
-                    "local_scope": str(local_scope),
-                    "remote_scope": str(local_remote_scope),
-                }
-            )
-        else:
-            resolved.append(
-                {
-                    "scope": clean_scope or ".",
-                    "local_scope": str(local_scope),
-                    "remote_scope": remote_scope,
-                }
-            )
-    return resolved
-
-
-def _write_sync_event(project_root: Path, payload: dict[str, Any]) -> Path:
-    now = datetime.now().isoformat(timespec="seconds")
-    stamp = now.replace(":", "-")
-    action = str(payload.get("action", "sync")).strip() or "sync"
-    target = str(payload.get("target", "")).strip() or "unknown"
-    stem = f"{stamp}__{action}__{target}"
-    clean_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
-    path = _sync_events_dir(project_root) / f"{clean_stem}.json"
-    counter = 1
-    while path.exists():
-        path = _sync_events_dir(project_root) / f"{clean_stem}__{counter}.json"
-        counter += 1
-    payload["recorded_at"] = now
-    path.write_text(json.dumps(payload, indent=2))
-    return path
 
 
 def _project_config_snapshot(project_root: Path, cfg: ProjectConfig) -> dict[str, Any]:
@@ -1097,18 +762,7 @@ def _project_config_snapshot(project_root: Path, cfg: ProjectConfig) -> dict[str
 
 
 def _load_sync_events(project_root: Path) -> list[dict[str, Any]]:
-    sync_dir = project_root / CONFIG_DIR / SYNC_EVENTS_DIR_NAME
-    if not sync_dir.exists():
-        return []
-    events: list[dict[str, Any]] = []
-    for path in sorted(sync_dir.glob("*.json"), reverse=True):
-        try:
-            payload = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            continue
-        payload["_record_file"] = str(path)
-        events.append(payload)
-    return events
+    return list_syncs(project_root)
 
 
 def _parse_iso_ts(value: Any) -> Optional[datetime]:
@@ -1152,16 +806,15 @@ def _sweep_manifest_path(project_root: Path, sweep_id: str) -> Path:
 
 
 def _load_sweep_manifest(project_root: Path, sweep_id: str) -> dict[str, Any]:
-    path = _sweep_manifest_path(project_root, sweep_id)
-    if not path.exists():
-        raise typer.BadParameter(f"Sweep '{sweep_id}' not found")
-    return json.loads(path.read_text())
+    try:
+        return load_sweep(project_root, sweep_id)
+    except LookupError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _save_sweep_manifest(project_root: Path, manifest: dict[str, Any]) -> None:
-    path = _sweep_manifest_path(project_root, str(manifest["sweep_id"]))
     manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    path.write_text(json.dumps(manifest, indent=2))
+    save_sweep(project_root, str(manifest["sweep_id"]), manifest)
 
 
 def _deterministic_run_id(block_name: str, params: dict[str, Any], command_template: str) -> str:
@@ -1169,24 +822,6 @@ def _deterministic_run_id(block_name: str, params: dict[str, Any], command_templ
         "block_name": block_name,
         "params": params,
         "command_template": command_template,
-    }
-    material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
-
-
-def _deterministic_analysis_run_id(
-    target_name: str,
-    analysis_rel: str,
-    command: str,
-    scheduler: str,
-    resources: dict[str, Any],
-) -> str:
-    payload = {
-        "target": target_name,
-        "analysis": analysis_rel,
-        "command": command,
-        "scheduler": scheduler,
-        "resources": resources,
     }
     material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -1345,22 +980,11 @@ def _sync_analysis_to_target(
     target: TargetConfig,
     remote_analysis_root: str,
 ) -> None:
-    project_ignore = _ignore_file(project_root)
-    local_target_mode = _uses_local_transport(target)
-    if local_target_mode:
-        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_analysis_root))
-
-    rsync_cmd = ["rsync", "-az"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    if local_target_mode:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
-    else:
-        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
-        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target)
-    _run_cmd(rsync_cmd)
+    try:
+        context = resolve_context(start=project_root, target_name=target_name)
+    except ContextError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    execute_push_operation(context, PushRequest(record=False), run_command=_run_cmd)
 
 
 @app.command()
@@ -2309,103 +1933,64 @@ def _submit_sweep_single(
     base_job_name: str,
     submit_delay_ms: int,
 ) -> int:
-    remote_sweep_dir = str(manifest["remote_sweep_dir"])
-    analysis_rel = str(manifest.get("analysis", "")).strip("/")
-    analysis_dir = (project_root / analysis_rel).resolve()
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}" if analysis_rel else target.remote_root
-    sync_source = str((project_root / analysis_rel).resolve()) if analysis_rel else None
-    sync_destination = remote_analysis_root
-    ignore_path = _ignore_file(project_root)
-    ignore_file_path = str(ignore_path) if ignore_path.exists() else None
-    ignore_used = bool(ignore_file_path)
+    try:
+        operation_context = resolve_context(start=project_root, target_name=target_name)
+    except ContextError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
     profile_name = str(manifest.get("resources", {}).get("profile", "")).strip() or None
-    local_target_mode = _uses_local_transport(target)
-    _sync_analysis_to_target(project_root, cfg, analysis_dir, target_name, target, remote_analysis_root)
-    if local_target_mode:
-        Path(remote_sweep_dir).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_sweep_dir))
-    adapter = get_adapter(target.scheduler)
+    resource_spec = ResourceSpec(
+        profile=profile_name,
+        cpus=int(resources["cpus"]),
+        memory=str(resources["memory"]),
+        time=str(resources["time"]),
+        node=str(resources["node"]),
+        queue=str(resources["queue"]),
+        parallel_environment=str(resources["parallel_environment"]),
+    )
+    runtime = OperationRuntime(
+        run_command=_run_cmd,
+        render_scheduler_header=_render_scheduler_header,
+        write_remote_script=_write_remote_script,
+        git_info=get_git_info,
+    )
     submitted_count = 0
-
     for offset, idx in enumerate(run_indexes):
-        run = manifest["runs"][idx]
-        run_slug = _slug_component(str(run["sweep_job"]))
-        run_name = f"{base_job_name}-{run_slug}-{int(run['sweep_index']):03d}"
-        remote_submit_script = f"{remote_sweep_dir}/pc_submit_{run['run_id']}.sh"
-        remote_log_file = f"{remote_sweep_dir}/run_{run['run_id']}.log"
-        submit_script = _build_submit_script(
-            header=_render_scheduler_header(
-                target.template_header,
-                cpus=int(resources["cpus"]),
-                memory=str(resources["memory"]),
-                walltime=str(resources["time"]),
-                job_name=run_name,
-                stdout=run_name,
-                stderr=run_name,
-                working_dir=remote_analysis_root,
-                queue=str(resources["queue"]),
-                node=str(resources["node"]),
-                parallel_environment=str(resources["parallel_environment"]),
-            ),
-            command=str(run["command"]),
-            working_dir=remote_analysis_root,
-            remote_log_file=remote_log_file,
-        )
-        if local_target_mode:
-            submit_path = Path(remote_submit_script)
-            submit_path.parent.mkdir(parents=True, exist_ok=True)
-            submit_path.write_text(submit_script)
-            submit_path.chmod(0o755)
-        else:
-            _write_remote_script(
-                project_root,
-                cfg,
-                target_name,
-                target,
-                remote_submit_script,
-                submit_script,
-                executable=True,
-            )
-        try:
-            submit_result = adapter.submit(
-                target.host,
-                remote_submit_script,
-                transport=target.transport,
-                project_root=project_root,
-                cfg=cfg,
-                target_name=target_name,
-                target_cfg=target,
-            )
-        except Exception as exc:
-            raise typer.BadParameter(f"Failed to submit sweep run {run.get('run_id', '')}: {exc}") from exc
-        submitted_at = datetime.now().isoformat(timespec="seconds")
-        run["job_id"] = submit_result.job_id
-        run["job_name"] = run_name
-        run["status"] = "SUBMITTED"
-        run["submitted_at"] = submitted_at
-        run["submission_mode"] = "single"
-        run["resources"] = resources
-
-        _append_sweep_job_record(
-            project_root=project_root,
-            cfg=cfg,
-            target_name=target_name,
-            target=target,
-            sweep_id=str(manifest["sweep_id"]),
+        sweep_run = manifest["runs"][idx]
+        run_slug = _slug_component(str(sweep_run["sweep_job"]))
+        run_name = f"{base_job_name}-{run_slug}-{int(sweep_run['sweep_index']):03d}"
+        request = RunRequest(
+            command=str(sweep_run["command"]),
+            job_name=run_name,
+            resources=resource_spec,
+            run_id=str(sweep_run["run_id"]),
             submission_mode="single",
-            run=run,
-            remote_sweep_dir=remote_sweep_dir,
-            remote_log_file=remote_log_file,
-            submit_script_path=remote_submit_script,
-            sync_source=sync_source,
-            sync_destination=sync_destination,
-            ignore_file_path=ignore_file_path,
-            ignore_used=ignore_used,
-            profile_name=profile_name,
-            submitted_at=submitted_at,
-            working_dir=remote_analysis_root,
+            sync_before=offset == 0,
+            record_fields={
+                "sweep_id": str(manifest["sweep_id"]),
+                "sweep_job": sweep_run.get("sweep_job", ""),
+                "sweep_index": sweep_run.get("sweep_index"),
+                "sweep_params": sweep_run.get("sweep_params", {}),
+            },
         )
+        try:
+            result = execute_run_operation(
+                operation_context,
+                request,
+                dry_run=False,
+                runtime=runtime,
+            )
+        except OperationError as exc:
+            raise typer.BadParameter(
+                f"Failed to submit sweep run {sweep_run.get('run_id', '')}: {exc}"
+            ) from exc
+
+        sweep_run["job_id"] = result.job_id
+        sweep_run["job_name"] = run_name
+        sweep_run["status"] = "SUBMITTED"
+        sweep_run["submitted_at"] = datetime.now().isoformat(timespec="seconds")
+        sweep_run["submission_mode"] = "single"
+        sweep_run["resources"] = resources
         submitted_count += 1
         if offset < len(run_indexes) - 1:
             time.sleep(submit_delay_ms / 1000.0)
@@ -3319,6 +2904,65 @@ def analysis_list(
         typer.echo(f"- {name}")
 
 
+def _perform_run(operation_context: Context, request: RunRequest, *, dry_run: bool, index_after: bool) -> None:
+    try:
+        result = execute_run_operation(
+            operation_context,
+            request,
+            dry_run=dry_run,
+            runtime=OperationRuntime(
+                run_command=_run_cmd,
+                render_scheduler_header=_render_scheduler_header,
+                write_remote_script=_write_remote_script,
+                git_info=get_git_info,
+            ),
+        )
+    except OperationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    plan = result.plan
+    if result.dry_run:
+        typer.echo("Dry run: no changes will be made")
+        typer.echo("")
+        typer.echo(f"Project root: {operation_context.project_root}")
+        typer.echo(f"Analysis: {operation_context.analysis.as_posix()}")
+        typer.echo(f"Target: {operation_context.target_name}")
+        typer.echo(f"Scheduler: {operation_context.target.scheduler}")
+        typer.echo(f"Remote analysis path: {operation_context.remote_analysis}")
+        typer.echo(f"Remote run path: {plan.paths.remote_run_dir}")
+        typer.echo(
+            f"Sync exclusions: {IGNORE_FILE_NAME} detected"
+            if plan.push_plan.ignore_file
+            else f"Sync exclusions: {IGNORE_FILE_NAME} not found"
+        )
+        typer.echo(f"Command: {request.command}")
+        typer.echo("\nPlanned actions:")
+        typer.echo("1. Sync analysis directory to remote target")
+        typer.echo("2. Prepare scheduler submission in isolated run directory")
+        typer.echo("3. Submit job to scheduler")
+        typer.echo("4. Record job metadata locally")
+        typer.echo("\nSubmission script preview:")
+        for line in plan.submit_script.splitlines()[:16]:
+            typer.echo(line)
+        return
+
+    typer.echo(f"Submitted job_id={result.job_id} target={operation_context.target_name}")
+    typer.echo(f"Run id: {plan.run_id}")
+    typer.echo(f"Job name: {request.job_name}")
+    typer.echo(f"Node: {request.resources.node}")
+    typer.echo(f"Remote run dir: {plan.paths.remote_run_dir}")
+    typer.echo(f"Remote log: {plan.paths.remote_log_file}")
+    if index_after:
+        manifest_path = _auto_index_active_root(
+            operation_context.project_root,
+            operation_context.config,
+            operation_context.target_name,
+            operation_context.target,
+        )
+        if manifest_path:
+            typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
+
+
 @analysis_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
     ctx: typer.Context,
@@ -3361,47 +3005,30 @@ def run(
         raise typer.BadParameter("Provide a command to execute, e.g. cdp analysis run python main.py")
 
     command = " ".join(shlex.quote(arg) for arg in ctx.args)
-
-    project_root = _project_root()
-    cfg = load_config(project_root)
-    analysis_dir = _require_active_analysis(cfg, project_root)
-    target_name, target = _active_target(cfg)
-    if not target.remote_root:
-        raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
+    try:
+        operation_context = resolve_context()
+        target = operation_context.target
+        profile_values = _resolve_resource_profile(profile, operation_context.config)
+        request = RunRequest(
+            command=command,
+            job_name=job_name or f"cdp-{secrets.token_hex(4)}",
+            resources=ResourceSpec(
+                profile=profile,
+                cpus=cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus)),
+                memory=memory if memory is not None else str(profile_values.get("memory", target.default_memory)),
+                time=job_time if job_time is not None else str(profile_values.get("time", target.default_time)),
+                node=node or str(profile_values.get("node", target.default_node or "1")),
+                queue=queue if queue is not None else str(profile_values.get("queue", target.default_queue)),
+                parallel_environment=(
+                    parallel_environment
+                    if parallel_environment is not None
+                    else str(profile_values.get("parallel_environment", target.default_parallel_environment))
+                ),
+            ),
         )
-    profile_values = _resolve_resource_profile(profile, cfg)
-    resolved_cpus = cpus if cpus is not None else int(profile_values.get("cpus", target.default_cpus))
-    resolved_memory = memory if memory is not None else str(profile_values.get("memory", target.default_memory))
-    resolved_time = job_time if job_time is not None else str(profile_values.get("time", target.default_time))
-    resolved_job_name = job_name or f"cdp-{secrets.token_hex(4)}"
-    resolved_node = node or str(profile_values.get("node", target.default_node or "1"))
-    resolved_queue = queue if queue is not None else str(profile_values.get("queue", target.default_queue))
-    resolved_parallel_environment = (
-        parallel_environment
-        if parallel_environment is not None
-        else str(profile_values.get("parallel_environment", target.default_parallel_environment))
-    )
-    analysis_rel = (cfg.active_analysis or "").strip("/")
-    _submit_or_preview_analysis_run(
-        project_root=project_root,
-        cfg=cfg,
-        analysis_dir=analysis_dir,
-        analysis_rel=analysis_rel,
-        target_name=target_name,
-        target=target,
-        command=command,
-        profile_name=profile,
-        cpus=resolved_cpus,
-        memory=resolved_memory,
-        walltime=resolved_time,
-        job_name=resolved_job_name,
-        queue=resolved_queue,
-        node=resolved_node,
-        parallel_environment=resolved_parallel_environment,
-        dry_run=dry_run,
-        index_after=index_after,
-    )
+    except ContextError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _perform_run(operation_context, request, dry_run=dry_run, index_after=index_after)
 
 
 def _show_last_status(follow: bool = False) -> None:
@@ -3518,28 +3145,6 @@ def _is_terminal_state(state: str) -> bool:
     return normalized not in {"UNKNOWN", "NOT_FOUND"}
 
 
-def _output_check_from_index(project_root: Path, payload: dict[str, Any]) -> str:
-    analysis_name = str(payload.get("analysis", "")).strip("/")
-    target_name = str(payload.get("target", "")).strip()
-    if not analysis_name or not target_name:
-        return "N/A"
-    tags = payload.get("analysis_tags")
-    if not isinstance(tags, list) or not tags:
-        return "NO_TAGS"
-    root_manifest = _load_index_manifest(project_root, target_name, analysis_name, ".")
-    if root_manifest is None:
-        return "INDEX_MISSING"
-    clean_tags = [str(tag).strip("/") for tag in tags if str(tag).strip("/")]
-    if not clean_tags:
-        return "NO_TAGS"
-    present = len([tag for tag in clean_tags if _index_entry_path_exists(root_manifest, tag)])
-    if present == len(clean_tags):
-        return "OK"
-    if present == 0:
-        return "MISSING"
-    return f"PARTIAL {present}/{len(clean_tags)}"
-
-
 def _resolve_and_persist_job_state(
     cfg: ProjectConfig,
     job_file: Path,
@@ -3600,19 +3205,7 @@ def _resolve_and_persist_job_state(
 
 
 def _load_job_records(project_root: Path) -> list[dict[str, str]]:
-    jobs_dir = project_root / CONFIG_DIR / JOBS_DIR
-    if not jobs_dir.exists():
-        return []
-
-    records: list[dict[str, str]] = []
-    for job_file in sorted(jobs_dir.glob("*.json"), reverse=True):
-        try:
-            payload = json.loads(job_file.read_text())
-        except json.JSONDecodeError:
-            continue
-        payload["_record_file"] = str(job_file)
-        records.append(payload)
-    return records
+    return list_jobs(project_root)
 
 
 def _resolve_log_job(
@@ -3623,7 +3216,7 @@ def _resolve_log_job(
     job_name: Optional[str],
     analysis: Optional[str],
 ) -> dict[str, str]:
-    records = _load_job_records(project_root)
+    records = list_jobs(project_root)
 
     def _matches(rec: dict[str, str]) -> bool:
         if target and str(rec.get("target", "")) != target:
@@ -3636,7 +3229,16 @@ def _resolve_log_job(
             return False
         return True
 
-    has_filters = any([target, job_id, job_name, analysis])
+    if job_id:
+        try:
+            selected = resolve_job(project_root, job_id)
+        except LookupError as exc:
+            raise typer.BadParameter("No matching job records found for the provided filters") from exc
+        if not _matches(selected):
+            raise typer.BadParameter("No matching job records found for the provided filters")
+        return selected
+
+    has_filters = any([target, job_name, analysis])
     if has_filters:
         matched = [rec for rec in records if _matches(rec)]
         if not matched:
@@ -3645,26 +3247,10 @@ def _resolve_log_job(
             typer.echo(f"Multiple matches found ({len(matched)}). Showing most recent match.")
         return matched[0]
 
-    state = load_state(project_root)
-    last = state.get("last_job")
-    if last:
-        for rec in records:
-            if str(rec.get("job_id", "")) == str(last.get("job_id", "")) and str(rec.get("target", "")) == str(
-                last.get("target", "")
-            ):
-                return rec
-        return {
-            "job_id": str(last.get("job_id", "")),
-            "job_name": "",
-            "target": str(last.get("target", "")),
-            "scheduler": str(last.get("scheduler", "")),
-            "remote_log_file": str(last.get("remote_log_file", "")),
-            "analysis": "",
-        }
-
-    if not records:
-        raise typer.BadParameter("No job records found. Run `cdp analysis run ...` first.")
-    return records[0]
+    try:
+        return resolve_job(project_root)
+    except LookupError as exc:
+        raise typer.BadParameter("No job records found. Run `cdp analysis run ...` first.") from exc
 
 
 def _show_local_log(log_file: Path, follow: bool, head: Optional[int], tail: Optional[int]) -> None:
@@ -4689,25 +4275,29 @@ def retry(
     )
     retry_job_name = str(selected.get("job_name", "")).strip() or f"cdp-{secrets.token_hex(4)}"
 
-    _submit_or_preview_analysis_run(
-        project_root=project_root,
-        cfg=cfg,
-        analysis_dir=analysis_dir,
-        analysis_rel=analysis_rel,
-        target_name=target_name,
-        target=target_cfg,
+    try:
+        operation_context = resolve_context(start=project_root, target_name=target_name)
+    except ContextError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if operation_context.analysis.as_posix() != analysis_rel:
+        raise typer.BadParameter(
+            f"Selected job belongs to analysis '{analysis_rel}', but active analysis is "
+            f"'{operation_context.analysis.as_posix()}'. Switch with `cdp analysis use {analysis_rel}`."
+        )
+    request = RunRequest(
         command=command,
-        profile_name=profile_name,
-        cpus=int(cpus_value),
-        memory=str(memory_value),
-        walltime=str(time_value),
         job_name=retry_job_name,
-        queue=str(queue_value),
-        node=str(node_value),
-        parallel_environment=str(pe_value),
-        dry_run=dry_run,
-        index_after=False,
+        resources=ResourceSpec(
+            profile=profile_name,
+            cpus=int(cpus_value),
+            memory=str(memory_value),
+            time=str(time_value),
+            node=str(node_value),
+            queue=str(queue_value),
+            parallel_environment=str(pe_value),
+        ),
     )
+    _perform_run(operation_context, request, dry_run=dry_run, index_after=False)
 
 
 @app.command("collect")
@@ -5444,478 +5034,108 @@ def status_global(
     _show_global_status(limit=limit)
 
 
-def _resolve_sync_context() -> tuple[Path, ProjectConfig, Path, str, TargetConfig, str, str]:
-    project_root = _project_root()
-    cfg = load_config(project_root)
-    analysis_dir = _require_active_analysis(cfg, project_root)
-    target_name, target_cfg = _active_target(cfg)
-    if not target_cfg.remote_root:
-        raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
+def _run_sync_push(dry_run: bool) -> None:
+    try:
+        operation_context = resolve_context()
+        result = execute_push_operation(
+            operation_context,
+            PushRequest(dry_run=dry_run),
+            run_command=_run_cmd,
         )
-    analysis_rel = (cfg.active_analysis or "").strip("/")
-    if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
-    remote_analysis_root = f"{target_cfg.remote_root.rstrip('/')}/{analysis_rel}"
-    return project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root
+    except (ContextError, OperationError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-
-def _sync_push(dry_run: bool) -> None:
-    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
-    project_ignore = _ignore_file(project_root)
-    local_target_mode = _uses_local_transport(target_cfg)
-
-    mkdir_cmd = ["mkdir", "-p", remote_analysis_root]
-    rsync_cmd = ["rsync", "-az"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    if local_target_mode:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
-    else:
-        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
-        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target_cfg)
-
-    if dry_run:
+    plan = result.plan
+    if result.dry_run:
         typer.echo("Dry run: no changes will be made")
-        typer.echo(f"Action: sync push")
-        typer.echo(f"Project root: {project_root}")
-        typer.echo(f"Analysis: {analysis_rel}")
-        typer.echo(f"Target: {target_name}")
-        typer.echo(f"Transport: {target_cfg.transport}")
-        typer.echo(f"Source: {analysis_dir}/")
-        typer.echo(f"Destination: {remote_analysis_root}/")
+        typer.echo("Action: sync push")
+        typer.echo(f"Project root: {operation_context.project_root}")
+        typer.echo(f"Analysis: {operation_context.analysis.as_posix()}")
+        typer.echo(f"Target: {operation_context.target_name}")
+        typer.echo(f"Transport: {operation_context.target.transport}")
+        typer.echo(f"Source: {plan.source}/")
+        typer.echo(f"Destination: {plan.destination}/")
         typer.echo(
-            f"Sync exclusions: {IGNORE_FILE_NAME} detected" if project_ignore.exists() else f"Sync exclusions: {IGNORE_FILE_NAME} not found"
+            f"Sync exclusions: {IGNORE_FILE_NAME} detected"
+            if plan.ignore_file
+            else f"Sync exclusions: {IGNORE_FILE_NAME} not found"
         )
-        if local_target_mode:
-            typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in mkdir_cmd)}")
-        else:
-            typer.echo(f"Would run: ssh {shlex.quote(target_cfg.host)} {' '.join(shlex.quote(arg) for arg in mkdir_cmd)}")
-        typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in rsync_cmd)}")
+        typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in (plan.mkdir_command or []))}")
+        typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in plan.commands[0])}")
         return
-
-    if local_target_mode:
-        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(ssh_command(project_root, cfg, target_name, target_cfg, *mkdir_cmd))
-    _run_cmd(rsync_cmd)
-
-    record_path = _write_sync_event(
-        project_root,
-        {
-            "action": "push",
-            "target": target_name,
-            "analysis": cfg.active_analysis,
-            "scheduler": target_cfg.scheduler,
-            "transport": target_cfg.transport,
-            "source": str(analysis_dir.resolve()),
-            "destination": remote_analysis_root,
-            "ignore_file": str(project_ignore) if project_ignore.exists() else None,
-            "ignore_used": project_ignore.exists(),
-        },
+    typer.echo(
+        f"Synced analysis to target '{operation_context.target_name}': "
+        f"{operation_context.local_analysis} -> {operation_context.remote_analysis}"
     )
-    typer.echo(f"Synced analysis to target '{target_name}': {analysis_dir} -> {remote_analysis_root}")
-    typer.echo(f"Recorded sync event: {record_path}")
+    typer.echo(f"Recorded sync event: {result.record_path}")
 
 
-def _sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool = False, yes: bool = False) -> None:
-    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
-    local_target_mode = _uses_local_transport(target_cfg)
-
-    if all_paths:
-        if not dry_run:
-            _require_yes(
-                yes,
-                "Full analysis pull may overwrite local files. Re-run with --yes to confirm.",
-            )
-        rsync_cmd = ["rsync", "-az"]
-        if local_target_mode:
-            rsync_cmd.extend([f"{remote_analysis_root}/", f"{analysis_dir}/"])
-        else:
-            rsync_cmd.extend([remote_spec(target_name, f"{remote_analysis_root}/"), f"{analysis_dir}/"])
-            rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target_cfg)
-
-        if dry_run:
-            root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
-            if root_index is not None:
-                delta = _summarize_index_vs_local(analysis_dir, root_index)
-                typer.echo(
-                    "Index diff summary (preview): "
-                    f"remote_only={delta['remote_only']} local_only={delta['local_only']} changed={delta['changed']}"
-                )
-            typer.echo("Dry run: no changes will be made")
-            typer.echo("Action: sync pull")
-            typer.echo(f"Project root: {project_root}")
-            typer.echo(f"Analysis: {analysis_rel}")
-            typer.echo(f"Target: {target_name}")
-            typer.echo(f"Transport: {target_cfg.transport}")
-            typer.echo(f"Source: {remote_analysis_root}/")
-            typer.echo(f"Destination: {analysis_dir}/")
-            typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in rsync_cmd)}")
-            return
-
-        root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
-        if root_index is not None:
-            delta = _summarize_index_vs_local(analysis_dir, root_index)
-            typer.echo(
-                "Index diff summary (before pull): "
-                f"remote_only={delta['remote_only']} local_only={delta['local_only']} changed={delta['changed']}"
-            )
-        _run_cmd(rsync_cmd)
-        record_path = _write_sync_event(
-            project_root,
-            {
-                "action": "pull",
-                "mode": "all",
-                "target": target_name,
-                "analysis": cfg.active_analysis,
-                "scheduler": target_cfg.scheduler,
-                "transport": target_cfg.transport,
-                "source": remote_analysis_root,
-                "destination": str(analysis_dir.resolve()),
-                "ignore_file": None,
-                "ignore_used": False,
-            },
+def _run_sync_pull(remote: bool, all_paths: bool, dry_run: bool, index_after: bool, yes: bool) -> None:
+    try:
+        operation_context = resolve_context()
+        request = PullRequest(
+            include_remote_only=remote,
+            all_paths=all_paths,
+            dry_run=dry_run,
+            confirmed=yes,
         )
-        typer.echo(f"Pulled full analysis from target '{target_name}': {remote_analysis_root} -> {analysis_dir}")
-        typer.echo(f"Recorded sync event: {record_path}")
-        if index_after:
-            manifest_path = _auto_index_active_root(project_root, cfg, target_name, target_cfg)
-            if manifest_path:
-                typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
-        return
+        result = execute_pull_operation(operation_context, request, run_command=_run_cmd)
+    except (ContextError, OperationError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
-    analysis_tags = cfg.analysis_tags.get(cfg.active_analysis or "", [])
-    if not analysis_tags:
-        raise typer.BadParameter(
-            "No tags found for active analysis. Tag paths with `cdp analysis tag <path>` before pulling."
+    plan = result.plan
+    root_index = _load_index_manifest(
+        operation_context.project_root,
+        operation_context.target_name,
+        operation_context.analysis.as_posix(),
+        ".",
+    )
+    if plan.mode == "all" and root_index is not None:
+        delta = _summarize_index_vs_local(operation_context.local_analysis, root_index)
+        label = "preview" if result.dry_run else "before pull"
+        typer.echo(
+            f"Index diff summary ({label}): remote_only={delta['remote_only']} "
+            f"local_only={delta['local_only']} changed={delta['changed']}"
         )
-
-    pulled: list[str] = []
-    skipped: list[str] = []
-    missing_in_index: list[str] = []
-    planned_cmds: list[list[str]] = []
-    root_index = _load_index_manifest(project_root, target_name, analysis_rel, ".")
-    for tag_dir in analysis_tags:
-        clean_tag = tag_dir.strip("/")
-        if not clean_tag:
-            continue
-        if root_index is not None and not _index_entry_path_exists(root_index, clean_tag):
-            missing_in_index.append(clean_tag)
-        if not remote and not (analysis_dir / clean_tag).exists():
-            skipped.append(clean_tag)
-            continue
-        tagged_remote = f"{remote_analysis_root}/./{clean_tag}"
-        if local_target_mode:
-            cmd = ["rsync", "-az", "--relative", tagged_remote, f"{analysis_dir}/"]
-        else:
-            cmd = rsync_command(
-                ["rsync", "-az", "--relative", remote_spec(target_name, tagged_remote), f"{analysis_dir}/"],
-                project_root,
-                cfg,
-                target_name,
-                target_cfg,
-            )
-        planned_cmds.append(cmd)
-
-    if dry_run:
+    if result.dry_run:
         typer.echo("Dry run: no changes will be made")
         typer.echo("Action: sync pull")
-        typer.echo(f"Project root: {project_root}")
-        typer.echo(f"Analysis: {analysis_rel}")
-        typer.echo(f"Target: {target_name}")
-        typer.echo(f"Transport: {target_cfg.transport}")
-        typer.echo(f"Mode: tagged ({'include remote-only tags' if remote else 'local-existing tags only'})")
-        if planned_cmds:
-            for cmd in planned_cmds:
-                typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in cmd)}")
-        else:
+        typer.echo(f"Project root: {operation_context.project_root}")
+        typer.echo(f"Analysis: {operation_context.analysis.as_posix()}")
+        typer.echo(f"Target: {operation_context.target_name}")
+        typer.echo(f"Transport: {operation_context.target.transport}")
+        typer.echo(f"Mode: {plan.mode}")
+        for command in plan.commands:
+            typer.echo(f"Would run: {' '.join(shlex.quote(arg) for arg in command)}")
+        if not plan.commands:
             typer.echo("No tagged paths selected for pull")
-        if missing_in_index:
-            typer.echo("Index warnings (not found in latest root index):")
-            for item in sorted(set(missing_in_index)):
-                typer.echo(f"- {item}")
-        if skipped:
+        if result.skipped:
             typer.echo("Would skip tagged paths:")
-            for item in skipped:
+            for item in result.skipped:
                 typer.echo(f"- {item}")
         return
-
-    for cmd in planned_cmds:
-        proc = _run_cmd(cmd, check=False)
-        if proc.returncode == 0:
-            clean_tag = cmd[-2].split("/./", 1)[-1] if "/./" in cmd[-2] else ""
-            if clean_tag:
-                pulled.append(clean_tag)
-        else:
-            clean_tag = cmd[-2].split("/./", 1)[-1] if "/./" in cmd[-2] else ""
-            if clean_tag:
-                skipped.append(clean_tag)
-
-    record_path = _write_sync_event(
-        project_root,
-        {
-            "action": "pull",
-            "mode": "tagged",
-            "target": target_name,
-            "analysis": cfg.active_analysis,
-            "scheduler": target_cfg.scheduler,
-            "transport": target_cfg.transport,
-            "source": remote_analysis_root,
-            "destination": str(analysis_dir.resolve()),
-            "include_remote_only_tags": remote,
-            "pulled": pulled,
-            "skipped": skipped,
-            "ignore_file": None,
-            "ignore_used": False,
-        },
-    )
-
-    if pulled:
-        typer.echo("Pulled tagged paths:")
-        for item in pulled:
-            typer.echo(f"- {analysis_dir / item}")
-    if skipped:
-        typer.echo("Skipped tagged paths:")
-        for item in skipped:
-            typer.echo(f"- {item}")
-    if missing_in_index:
-        typer.echo("Index warnings (not found in latest root index):")
-        for item in sorted(set(missing_in_index)):
-            typer.echo(f"- {item}")
-    typer.echo(f"Recorded sync event: {record_path}")
+    if plan.mode == "all":
+        typer.echo(
+            f"Pulled full analysis from target '{operation_context.target_name}': "
+            f"{operation_context.remote_analysis} -> {operation_context.local_analysis}"
+        )
+    else:
+        if result.pulled:
+            typer.echo("Pulled tagged paths:")
+            for item in result.pulled:
+                typer.echo(f"- {operation_context.local_analysis / item}")
+        if result.skipped:
+            typer.echo("Skipped tagged paths:")
+            for item in result.skipped:
+                typer.echo(f"- {item}")
+    typer.echo(f"Recorded sync event: {result.record_path}")
     if index_after:
-        manifest_path = _auto_index_active_root(project_root, cfg, target_name, target_cfg)
-        if manifest_path:
-            typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
-
-
-def _submit_or_preview_analysis_run(
-    *,
-    project_root: Path,
-    cfg: ProjectConfig,
-    analysis_dir: Path,
-    analysis_rel: str,
-    target_name: str,
-    target: TargetConfig,
-    command: str,
-    profile_name: Optional[str],
-    cpus: int,
-    memory: str,
-    walltime: str,
-    job_name: str,
-    queue: str,
-    node: str,
-    parallel_environment: str,
-    dry_run: bool,
-    index_after: bool,
-) -> None:
-    if not analysis_rel:
-        raise typer.BadParameter("Active analysis path is empty. Re-run: cdp analysis use <path>")
-    if not target.remote_root:
-        raise typer.BadParameter(
-            f"Target '{target_name}' has no remote_root configured. Update it with `cdp target add {target_name} --remote-root ...`."
+        manifest_path = _auto_index_active_root(
+            operation_context.project_root,
+            operation_context.config,
+            operation_context.target_name,
+            operation_context.target,
         )
-
-    requires_queue = "{queue}" in target.template_header
-    requires_pe = "{parallel_environment}" in target.template_header
-    if requires_queue and not queue:
-        raise typer.BadParameter(
-            "--queue is required (or set target default_queue) because template includes {queue}."
-        )
-    if requires_pe and not parallel_environment:
-        raise typer.BadParameter(
-            "--parallel-environment is required (or set target default_parallel_environment) because template includes {parallel_environment}."
-        )
-
-    remote_analysis_root = f"{target.remote_root.rstrip('/')}/{analysis_rel}"
-    remote_runs_root = f"{target.remote_root.rstrip('/')}/{CONFIG_DIR}/{RUNS_DIR_NAME}/{analysis_rel}"
-    resolved_working_dir = remote_analysis_root
-    try:
-        local_cwd_rel = Path.cwd().resolve().relative_to(analysis_dir.resolve()).as_posix()
-    except ValueError:
-        local_cwd_rel = "."
-    if local_cwd_rel not in {"", "."}:
-        resolved_working_dir = f"{remote_analysis_root.rstrip('/')}/{local_cwd_rel}"
-    run_id = _deterministic_analysis_run_id(
-        target_name=target_name,
-        analysis_rel=analysis_rel,
-        command=command,
-        scheduler=target.scheduler,
-        resources={
-            "cpus": cpus,
-            "memory": memory,
-            "time": walltime,
-            "node": node,
-            "queue": queue,
-            "parallel_environment": parallel_environment,
-            "job_name": job_name,
-        },
-    )
-    run_id = f"run-{run_id}"
-    remote_run_dir = f"{remote_runs_root}/{run_id}"
-    remote_submit_script = f"{remote_run_dir}/pc_submit.sh"
-    remote_log_file = f"{remote_run_dir}/run.log"
-    resolved_stdout = f"{remote_run_dir}/stdout"
-    resolved_stderr = f"{remote_run_dir}/stderr"
-
-    submit_script = _build_submit_script(
-        header=_render_scheduler_header(
-            target.template_header,
-            cpus=cpus,
-            memory=memory,
-            walltime=walltime,
-            job_name=job_name,
-            stdout=resolved_stdout,
-            stderr=resolved_stderr,
-            working_dir=resolved_working_dir,
-            queue=queue or "",
-            node=node,
-            parallel_environment=parallel_environment or "",
-        ),
-        command=command,
-        working_dir=resolved_working_dir,
-        remote_log_file=remote_log_file,
-    )
-
-    project_ignore = _ignore_file(project_root)
-    local_target_mode = _uses_local_transport(target)
-    if dry_run:
-        typer.echo("Dry run: no changes will be made")
-        typer.echo("")
-        typer.echo(f"Project root: {project_root}")
-        typer.echo(f"Analysis: {analysis_rel}")
-        typer.echo(f"Target: {target_name}")
-        typer.echo(f"Scheduler: {target.scheduler}")
-        typer.echo(f"Remote analysis path: {remote_analysis_root}")
-        typer.echo(f"Remote run path: {remote_run_dir}")
-        if project_ignore.exists():
-            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} detected")
-        else:
-            typer.echo(f"Sync exclusions: {IGNORE_FILE_NAME} not found")
-        typer.echo(f"Command: {command}")
-        typer.echo("")
-        typer.echo("Planned actions:")
-        typer.echo("1. Sync analysis directory to remote target")
-        typer.echo("2. Prepare scheduler submission in isolated run directory")
-        typer.echo("3. Submit job to scheduler")
-        typer.echo("4. Record job metadata locally")
-        typer.echo("Record preview: includes identity, resources, paths, sync, environment, and optional git metadata")
-        typer.echo("")
-        typer.echo("Submission script preview:")
-        for line in submit_script.splitlines()[:16]:
-            typer.echo(line)
-        if len(submit_script.splitlines()) > 16:
-            typer.echo("...")
-        return
-
-    if local_target_mode:
-        Path(remote_analysis_root).mkdir(parents=True, exist_ok=True)
-    else:
-        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_analysis_root))
-
-    rsync_cmd = ["rsync", "-az"]
-    if project_ignore.exists():
-        rsync_cmd.extend(["--exclude-from", str(project_ignore)])
-    if local_target_mode:
-        rsync_cmd.extend([f"{analysis_dir}/", f"{remote_analysis_root}/"])
-    else:
-        rsync_cmd.extend([f"{analysis_dir}/", remote_spec(target_name, f"{remote_analysis_root}/")])
-        rsync_cmd = rsync_command(rsync_cmd, project_root, cfg, target_name, target)
-    _run_cmd(rsync_cmd)
-
-    if local_target_mode:
-        Path(remote_run_dir).mkdir(parents=True, exist_ok=True)
-        submit_path = Path(remote_submit_script)
-        submit_path.parent.mkdir(parents=True, exist_ok=True)
-        submit_path.write_text(submit_script)
-        submit_path.chmod(0o755)
-    else:
-        _run_cmd(ssh_command(project_root, cfg, target_name, target, "mkdir", "-p", remote_run_dir))
-        _write_remote_script(
-            project_root,
-            cfg,
-            target_name,
-            target,
-            remote_submit_script,
-            submit_script,
-            executable=True,
-        )
-
-    adapter = get_adapter(target.scheduler)
-    try:
-        job_id = adapter.submit(
-            target.host,
-            remote_submit_script,
-            transport=target.transport,
-            project_root=project_root,
-            cfg=cfg,
-            target_name=target_name,
-            target_cfg=target,
-        ).job_id
-    except Exception as exc:
-        raise typer.BadParameter(f"Failed to submit job: {exc}") from exc
-
-    now = datetime.now().isoformat(timespec="seconds")
-    last_job = LastJob(
-        job_id=job_id,
-        target=target_name,
-        scheduler=target.scheduler,
-        remote_run_dir=remote_run_dir,
-        remote_log_file=remote_log_file,
-        run_id=run_id,
-    )
-
-    state = load_state(project_root)
-    state["last_job"] = last_job.__dict__
-    state["last_updated"] = now
-    save_state(project_root, state)
-
-    append_job_record(
-        project_root,
-        _build_job_record(
-            project_root=project_root,
-            submitted_at=now,
-            analysis=analysis_rel,
-            analysis_tags=cfg.analysis_tags.get(analysis_rel, []),
-            target_name=target_name,
-            scheduler=target.scheduler,
-            job_id=job_id,
-            run_id=run_id,
-            job_name=job_name,
-            state=("RUNNING" if target.scheduler == "none" else "RUNNING_OR_QUEUED"),
-            command=command,
-            remote_run_dir=remote_run_dir,
-            remote_log_file=remote_log_file,
-            working_dir=resolved_working_dir,
-            cpus=cpus,
-            memory=memory,
-            walltime=walltime,
-            node=node,
-            queue=queue,
-            parallel_environment=parallel_environment,
-            profile_name=profile_name,
-            submit_script_path=remote_submit_script,
-            submission_mode="single",
-            sync_source=str(analysis_dir.resolve()),
-            sync_destination=remote_analysis_root,
-            ignore_file_path=(str(project_ignore) if project_ignore.exists() else None),
-            ignore_used=project_ignore.exists(),
-            extra={
-                "stdout": resolved_stdout,
-                "stderr": resolved_stderr,
-            },
-        ),
-    )
-
-    typer.echo(f"Submitted job_id={job_id} target={target_name}")
-    typer.echo(f"Run id: {run_id}")
-    typer.echo(f"Job name: {job_name}")
-    typer.echo(f"Node: {node}")
-    typer.echo(f"Remote run dir: {remote_run_dir}")
-    typer.echo(f"Remote log: {remote_log_file}")
-    if index_after:
-        manifest_path = _auto_index_active_root(project_root, cfg, target_name, target)
         if manifest_path:
             typer.echo(f"Auto-indexed active analysis root: {manifest_path}")
 
@@ -5925,7 +5145,7 @@ def sync_push(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview sync actions without any modifications"),
 ) -> None:
     """Push active analysis directory to the active target."""
-    _sync_push(dry_run=dry_run)
+    _run_sync_push(dry_run=dry_run)
 
 
 @sync_app.command("pull")
@@ -5939,7 +5159,7 @@ def sync_pull(
     yes: bool = typer.Option(False, "--yes", help="Confirm destructive pull operations"),
 ) -> None:
     """Pull active analysis data from the active target."""
-    _sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run, index_after=index_after, yes=yes)
+    _run_sync_pull(remote=remote, all_paths=all_paths, dry_run=dry_run, index_after=index_after, yes=yes)
 
 
 @sync_app.command("status")
@@ -6012,41 +5232,37 @@ def index_remote(
         autocompletion=_complete_index_remote_paths,
     ),
     all_tags: bool = typer.Option(False, "--all-tags", help="Index all tagged paths for the active analysis"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview index scopes without writing manifests"),
     as_json: bool = typer.Option(False, "--json", help="Print resulting index payload as JSON"),
 ) -> None:
     """Create metadata-only index manifests for remote analysis paths without pulling files."""
-    project_root, cfg, analysis_dir, target_name, target_cfg, analysis_rel, remote_analysis_root = _resolve_sync_context()
-    scopes = _resolve_index_scopes(
-        analysis_dir=analysis_dir,
-        analysis_rel=analysis_rel,
-        target_cfg=target_cfg,
-        remote_analysis_root=remote_analysis_root,
-        local_path=path,
-        remote_path=remote_path,
-        all_tags=all_tags,
-        analysis_tags=cfg.analysis_tags.get(cfg.active_analysis or "", []),
-    )
-
-    indexed_manifests: list[dict[str, Any]] = []
-    for scope in scopes:
-        scope_rel = scope["scope"]
-        scope_remote = scope["remote_scope"]
-        manifest = _write_index_manifest_for_scope(
-            project_root=project_root,
-            analysis_rel=analysis_rel,
-            target_name=target_name,
-            target_cfg=target_cfg,
-            scope_rel=scope_rel,
-            scope_remote=scope_remote,
+    try:
+        operation_context = resolve_context()
+        result = execute_index_operation(
+            operation_context,
+            IndexRequest(local_path=path, remote_path=remote_path, all_tags=all_tags, dry_run=dry_run),
+            resolve_scopes=_resolve_index_scopes,
+            write_manifest=_write_index_manifest_for_scope,
         )
-        indexed_manifests.append({"scope": scope_rel, "manifest_path": str(manifest.get("_manifest_path", "")), **manifest})
+    except (ContextError, OperationError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if result.dry_run:
+        payload = {"dry_run": True, "scopes": result.plan.scopes}
+        if as_json:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            typer.echo("Dry run: no changes will be made")
+            for scope in result.plan.scopes:
+                typer.echo(f"- scope={scope['scope']} remote={scope['remote_scope']}")
+        return
 
     if as_json:
-        typer.echo(json.dumps(indexed_manifests, indent=2))
+        typer.echo(json.dumps(result.manifests, indent=2))
         return
 
     typer.echo("Index complete (metadata only, no file transfer).")
-    for item in indexed_manifests:
+    for item in result.manifests:
         typer.echo(
             f"- scope={item['scope']} entries={item['entry_count']} remote={item['remote_scope']} manifest={item['manifest_path']}"
         )
@@ -6406,7 +5622,7 @@ def pull(
     yes: bool = typer.Option(False, "--yes", help="Confirm destructive pull operations"),
 ) -> None:
     """Pull all tagged paths into the active analysis directory."""
-    _sync_pull(remote=remote, all_paths=False, dry_run=False, index_after=index_after, yes=yes)
+    _run_sync_pull(remote=remote, all_paths=False, dry_run=False, index_after=index_after, yes=yes)
 
 
 if __name__ == "__main__":
