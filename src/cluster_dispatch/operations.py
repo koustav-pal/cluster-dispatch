@@ -3,11 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-import socket
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,7 +12,6 @@ from cluster_dispatch.config import CONFIG_DIR, LastJob, load_state, save_state
 from cluster_dispatch.context import Context
 from cluster_dispatch.models import (
     IndexRequest,
-    JobRecord,
     PullRequest,
     PushRequest,
     ResourceSpec,
@@ -23,7 +19,7 @@ from cluster_dispatch.models import (
     RunRequest,
     SyncRecord,
 )
-from cluster_dispatch.records import save_job, save_sync
+from cluster_dispatch.records import build_job_record, save_job, save_sync
 from cluster_dispatch.schedulers import get_adapter
 from cluster_dispatch.transport import ensure_ssh_config, is_local_transport, remote_spec, ssh_config_path
 
@@ -88,6 +84,8 @@ class RunResult:
     dry_run: bool
     job_id: str | None = None
     record_path: Path | None = None
+    state: str | None = None
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -365,66 +363,53 @@ def prepare_run(context: Context, request: RunRequest, *, render_scheduler_heade
     )
 
 
-def _package_version() -> str | None:
-    try:
-        return version("cluster-dispatch")
-    except PackageNotFoundError:
-        return None
-
-
-def _job_record(plan: RunPlan, job_id: str, submitted_at: str, git_info: dict[str, Any] | None) -> dict[str, Any]:
+def _job_record(
+    plan: RunPlan,
+    job_id: str,
+    submitted_at: str,
+    state: str,
+    exit_code: int | None,
+    git_info: dict[str, Any] | None,
+) -> dict[str, Any]:
     context = plan.context
     request = plan.request
     resources: ResourceSpec = request.resources
-    record = JobRecord(
+    return build_job_record(
+        project_root=context.project_root,
         submitted_at=submitted_at,
         analysis=context.analysis.as_posix(),
         analysis_tags=context.config.analysis_tags.get(context.analysis.as_posix(), []),
-        target=context.target_name,
+        target_name=context.target_name,
         scheduler=context.target.scheduler,
         job_id=job_id,
         run_id=plan.run_id,
         job_name=request.job_name,
-        state="RUNNING" if context.target.scheduler == "none" else "RUNNING_OR_QUEUED",
-        stdout=plan.stdout,
-        stderr=plan.stderr,
+        state=state,
         working_dir=plan.paths.working_dir,
         cpus=resources.cpus,
         memory=resources.memory,
-        time=resources.time,
+        walltime=resources.time,
         queue=resources.queue,
         parallel_environment=resources.parallel_environment,
         node=resources.node,
         command=request.command,
-        command_resolved=request.command,
         remote_run_dir=plan.paths.remote_run_dir,
         remote_log_file=plan.paths.remote_log_file,
         submission_mode=request.submission_mode,
-        record_version=2,
-        resources=resources,
-        paths=plan.paths,
-        sync={
-            "ignore_file": str(plan.push_plan.ignore_file) if plan.push_plan.ignore_file else None,
-            "ignore_detected": plan.push_plan.ignore_file is not None,
-            "ignore_used": plan.push_plan.ignore_file is not None,
-            "source": plan.push_plan.source,
-            "destination": plan.push_plan.destination,
+        profile_name=resources.profile,
+        submit_script_path=plan.paths.submit_script,
+        sync_source=plan.push_plan.source,
+        sync_destination=plan.push_plan.destination,
+        ignore_file_path=str(plan.push_plan.ignore_file) if plan.push_plan.ignore_file else None,
+        ignore_used=plan.push_plan.ignore_file is not None,
+        git_info=git_info,
+        record_fields=request.record_fields,
+        extra={
+            "stdout": plan.stdout,
+            "stderr": plan.stderr,
+            **({"exit_code": exit_code, "completed_at": datetime.now().isoformat(timespec="seconds")} if exit_code is not None else {}),
         },
-        environment={
-            "cluster_dispatch_version": _package_version(),
-            "python_version": sys.version.split()[0],
-            "hostname": socket.gethostname(),
-        },
-    ).to_dict()
-    record.update(request.record_fields)
-    if git_info is not None:
-        record["git"] = {
-            "repo_root": git_info.get("repo_root"),
-            "branch": git_info.get("branch"),
-            "commit": git_info.get("head"),
-            "dirty": git_info.get("dirty"),
-        }
-    return record
+    )
 
 
 def execute_run(plan: RunPlan, *, runtime: OperationRuntime) -> RunResult:
@@ -447,18 +432,28 @@ def execute_run(plan: RunPlan, *, runtime: OperationRuntime) -> RunResult:
             plan.submit_script,
             executable=True,
         )
-    try:
-        job_id = get_adapter(context.target.scheduler).submit(
-            context.target.host,
-            plan.paths.submit_script,
-            transport=context.target.transport,
-            project_root=context.project_root,
-            cfg=context.config,
-            target_name=context.target_name,
-            target_cfg=context.target,
-        ).job_id
-    except Exception as exc:
-        raise OperationError(f"Failed to submit job: {exc}") from exc
+    exit_code: int | None = None
+    if plan.request.wait_for_completion:
+        if not is_local_transport(context.target.transport, context.target.host) or context.target.scheduler != "none":
+            raise OperationError("Synchronous execution requires local transport with scheduler 'none'")
+        proc = runtime.run_command(["bash", plan.paths.submit_script], check=False)
+        exit_code = int(proc.returncode)
+        job_id = f"local-{plan.run_id}"
+        job_state = "COMPLETED" if exit_code == 0 else "FAILED"
+    else:
+        try:
+            job_id = get_adapter(context.target.scheduler).submit(
+                context.target.host,
+                plan.paths.submit_script,
+                transport=context.target.transport,
+                project_root=context.project_root,
+                cfg=context.config,
+                target_name=context.target_name,
+                target_cfg=context.target,
+            ).job_id
+        except Exception as exc:
+            raise OperationError(f"Failed to submit job: {exc}") from exc
+        job_state = "RUNNING" if context.target.scheduler == "none" else "RUNNING_OR_QUEUED"
 
     submitted_at = datetime.now().isoformat(timespec="seconds")
     state = load_state(context.project_root)
@@ -474,9 +469,16 @@ def execute_run(plan: RunPlan, *, runtime: OperationRuntime) -> RunResult:
     save_state(context.project_root, state)
     record_path = save_job(
         context.project_root,
-        _job_record(plan, job_id, submitted_at, runtime.git_info(context.project_root)),
+        _job_record(plan, job_id, submitted_at, job_state, exit_code, runtime.git_info(context.project_root)),
     )
-    return RunResult(plan=plan, dry_run=False, job_id=job_id, record_path=record_path)
+    return RunResult(
+        plan=plan,
+        dry_run=False,
+        job_id=job_id,
+        record_path=record_path,
+        state=job_state,
+        exit_code=exit_code,
+    )
 
 
 def run(context: Context, request: RunRequest, *, dry_run: bool, runtime: OperationRuntime) -> RunResult:

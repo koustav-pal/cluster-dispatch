@@ -23,7 +23,17 @@ class StatusResult:
     raw: str
 
 
+@dataclass(frozen=True)
+class ArraySpec:
+    directive: str
+    directive_prefix: str
+    task_id_expression: str
+
+
 class SchedulerAdapter(Protocol):
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        ...
+
     def submit(
         self,
         host: str,
@@ -113,6 +123,13 @@ def _run_shell(
 
 
 class SGEAdapter:
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        return ArraySpec(
+            directive=f"#$ -t 1-{task_count}",
+            directive_prefix="#$",
+            task_id_expression="${SGE_TASK_ID:?SGE_TASK_ID not set}",
+        )
+
     def submit(
         self,
         host: str,
@@ -212,6 +229,13 @@ class UnivaAdapter(SGEAdapter):
 
 
 class PBSAdapter:
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        return ArraySpec(
+            directive=f"#PBS -J 1-{task_count}",
+            directive_prefix="#PBS",
+            task_id_expression="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:?PBS_ARRAY_INDEX/PBS_ARRAYID not set}}",
+        )
+
     def submit(
         self,
         host: str,
@@ -313,6 +337,13 @@ class PBSAdapter:
 
 
 class SlurmAdapter:
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        return ArraySpec(
+            directive=f"#SBATCH --array=1-{task_count}",
+            directive_prefix="#SBATCH",
+            task_id_expression="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}",
+        )
+
     def submit(
         self,
         host: str,
@@ -400,6 +431,13 @@ class SlurmAdapter:
 
 
 class LSFAdapter:
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        return ArraySpec(
+            directive=f'#BSUB -J "{job_name}[1-{task_count}]"',
+            directive_prefix="#BSUB",
+            task_id_expression="${LSB_JOBINDEX:?LSB_JOBINDEX not set}",
+        )
+
     def submit(
         self,
         host: str,
@@ -490,6 +528,9 @@ class LSFAdapter:
 
 
 class LocalAdapter:
+    def array_spec(self, *, job_name: str, task_count: int) -> ArraySpec:
+        raise RuntimeError("Array submission mode is not supported for scheduler 'none'")
+
     def submit(
         self,
         host: str,
@@ -568,3 +609,17 @@ def get_adapter(scheduler: str) -> SchedulerAdapter:
     if scheduler == "none":
         return LocalAdapter()
     raise ValueError(f"Unsupported scheduler: {scheduler}")
+
+
+def cancel_command(scheduler: str, job_id: str) -> str:
+    quoted = shlex.quote(job_id)
+    scheduler_lc = scheduler.lower()
+    if scheduler_lc in {"sge", "univa", "pbs"}:
+        return f"qdel {quoted}"
+    if scheduler_lc == "slurm":
+        return f"scancel {quoted}"
+    if scheduler_lc == "lsf":
+        return f"bkill {quoted}"
+    if scheduler_lc == "none":
+        return f"kill {quoted}"
+    raise ValueError(f"Unsupported scheduler for cancel: {scheduler}")

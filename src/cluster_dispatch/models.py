@@ -22,6 +22,7 @@ class RunRequest:
     run_id: str | None = None
     submission_mode: str = "single"
     sync_before: bool = True
+    wait_for_completion: bool = False
     record_fields: dict[str, object] = field(default_factory=dict)
 
 

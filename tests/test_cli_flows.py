@@ -926,6 +926,17 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("jobs_by_state", payload)
         self.assertIn("resources", payload)
 
+    def test_stats_uses_reporting_service_for_local_job(self) -> None:
+        run_result = _invoke(self.runner, self.project, ["analysis", "run", "true"])
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        record = _latest_job_record(self.project)
+
+        result = _invoke(self.runner, self.project, ["stats", "--job-id", str(record["job_id"])])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Job Stats", result.output)
+        self.assertIn("EXITED", result.output)
+
     def test_export_bundle_includes_optional_sections(self) -> None:
         run_result = _invoke(self.runner, self.project, ["analysis", "run", "python", "-c", "print(7)"])
         self.assertEqual(run_result.exit_code, 0, run_result.output)
