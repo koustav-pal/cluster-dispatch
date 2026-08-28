@@ -251,7 +251,7 @@ class TestClusterDispatchFlows(TestCase):
             calls.append(cmd)
             return __import__("subprocess").CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        with mock.patch("cluster_dispatch.commands.core._SUBPROCESS_RUN", side_effect=_fake_run):
+        with mock.patch("cluster_dispatch.commands.runtime._SUBPROCESS_RUN", side_effect=_fake_run):
             result = _invoke(self.runner, self.project, ["sync", "push"])
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -457,7 +457,7 @@ class TestClusterDispatchFlows(TestCase):
             sched_calls.append(cmd)
             return __import__("subprocess").CompletedProcess(cmd, 0, stdout="999\n", stderr="")
 
-        with mock.patch("cluster_dispatch.commands.core._SUBPROCESS_RUN", side_effect=_fake_cli_run):
+        with mock.patch("cluster_dispatch.commands.runtime._SUBPROCESS_RUN", side_effect=_fake_cli_run):
             with mock.patch("cluster_dispatch.schedulers.subprocess.run", side_effect=_fake_sched_run):
                 result = _invoke(
                     self.runner,
