@@ -11,6 +11,7 @@ from cluster_dispatch.diagnostics import diagnose_target
 from cluster_dispatch.maintenance import prune_target_records, target_record_refs
 from cluster_dispatch.commands.common import complete_targets as _complete_target_names, require_yes as _require_yes, template_path as _template_path
 from cluster_dispatch.commands.runtime import project_root as _project_root, run_direct as _run_direct
+from cluster_dispatch.transport import SSH_CONTROL_PERSIST, open_ssh_control_connection
 
 BASE_REQUIRED_TEMPLATE_VARS = ("cpus", "memory", "time", "job_name", "stdout", "stderr", "working_dir")
 
@@ -148,6 +149,27 @@ def register(target_app: typer.Typer) -> None:
         for name, t in cfg.targets.items():
             marker = "*" if name == cfg.default_target else " "
             typer.echo(f"{marker} {name}: host={t.host} transport={t.transport} scheduler={t.scheduler}")
+
+    @target_app.command("login")
+    def target_login(
+        name: str = typer.Argument(..., help="Target name", autocompletion=_complete_target_names),
+    ) -> None:
+        """Authenticate interactively and keep target SSH connection alive."""
+        project_root = _project_root()
+        cfg = load_config(project_root)
+        if name not in cfg.targets:
+            raise typer.BadParameter(f"Target '{name}' not found")
+        try:
+            result = open_ssh_control_connection(project_root, cfg, name, cfg.targets[name])
+        except (ValueError, RuntimeError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if result.already_connected:
+            typer.echo(f"SSH control connection already active for target '{name}'")
+        else:
+            typer.echo(
+                f"SSH control connection ready for target '{name}' "
+                f"(persists up to {SSH_CONTROL_PERSIST} after last use)"
+            )
 
     @target_app.command("remove")
     def target_remove(

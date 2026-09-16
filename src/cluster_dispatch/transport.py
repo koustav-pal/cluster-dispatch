@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -11,8 +12,15 @@ from cluster_dispatch.config import CONFIG_DIR, ProjectConfig, TargetConfig
 SSH_DIR_NAME = "ssh"
 SSH_CONFIG_NAME = "config"
 SSH_CONNECT_TIMEOUT = 20
-SSH_CONTROL_PERSIST = "10m"
+SSH_CONTROL_PERSIST = "8h"
+SSH_SERVER_ALIVE_INTERVAL = 30
+SSH_SERVER_ALIVE_COUNT_MAX = 3
 SSH_CONTROL_SOCKET_ROOT = Path("/tmp/cluster-dispatch-ssh")
+
+
+@dataclass(frozen=True)
+class SSHLoginResult:
+    already_connected: bool
 
 
 def is_local_transport(transport: str, host: str) -> bool:
@@ -69,6 +77,9 @@ def _render_target_block(target_name: str, target_cfg: TargetConfig) -> str:
             "    ControlMaster auto",
             f"    ControlPath {control_socket_path(target_cfg.host)}",
             f"    ControlPersist {SSH_CONTROL_PERSIST}",
+            f"    ServerAliveInterval {SSH_SERVER_ALIVE_INTERVAL}",
+            f"    ServerAliveCountMax {SSH_SERVER_ALIVE_COUNT_MAX}",
+            "    TCPKeepAlive yes",
         ]
     )
     return "\n".join(lines)
@@ -113,6 +124,37 @@ def ssh_command(
     cmd.append(target_alias(target_name))
     cmd.extend(remote_args)
     return cmd
+
+
+def open_ssh_control_connection(
+    project_root: Path,
+    cfg: ProjectConfig,
+    target_name: str,
+    target_cfg: TargetConfig,
+) -> SSHLoginResult:
+    """Authenticate interactively, then leave multiplexed SSH master running."""
+    if is_local_transport(target_cfg.transport, target_cfg.host):
+        raise ValueError(f"Target '{target_name}' uses local transport; SSH login is unavailable")
+
+    config_file = ensure_ssh_config(project_root, cfg)
+    base = ["ssh", "-F", str(config_file)]
+    alias = target_alias(target_name)
+    check = subprocess.run(
+        [*base, "-O", "check", alias],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if check.returncode == 0:
+        return SSHLoginResult(already_connected=True)
+
+    login = subprocess.run(
+        [*base, "-o", "BatchMode=no", "-fN", alias],
+        check=False,
+    )
+    if login.returncode != 0:
+        raise RuntimeError(f"SSH login failed for target '{target_name}' (exit code {login.returncode})")
+    return SSHLoginResult(already_connected=False)
 
 
 def rsync_remote_shell(

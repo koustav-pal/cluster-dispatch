@@ -20,7 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from cluster_dispatch.cli import app  # noqa: E402
 from cluster_dispatch.operations import build_submit_script  # noqa: E402
-from cluster_dispatch.config import load_config  # noqa: E402
+from cluster_dispatch.config import TargetConfig, load_config, save_config  # noqa: E402
 from cluster_dispatch.context import resolve_context  # noqa: E402
 from cluster_dispatch.records import resolve_job  # noqa: E402
 from cluster_dispatch.schedulers import get_adapter  # noqa: E402
@@ -267,7 +267,10 @@ class TestClusterDispatchFlows(TestCase):
         self.assertIn("Host remote-sync", config_text)
         self.assertIn("HostName example.org", config_text)
         self.assertIn("ControlMaster auto", config_text)
-        self.assertIn("ControlPersist 10m", config_text)
+        self.assertIn("ControlPersist 8h", config_text)
+        self.assertIn("ServerAliveInterval 30", config_text)
+        self.assertIn("ServerAliveCountMax 3", config_text)
+        self.assertIn("TCPKeepAlive yes", config_text)
         self.assertRegex(config_text, r"ControlPath /tmp/cluster-dispatch-ssh/[0-9a-f]{16}\.sock")
         self.assertIn("-e", rsync_calls[0])
         rsync_shell = rsync_calls[0][rsync_calls[0].index("-e") + 1]
@@ -819,6 +822,63 @@ class TestClusterDispatchFlows(TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Summary:", result.output)
         self.assertIn("[PASS] scheduler:", result.output)
+
+    def test_target_login_opens_persistent_password_capable_connection(self) -> None:
+        template = self.project / "login.tmpl"
+        template.write_text(
+            "# job={job_name}\n# out={stdout}\n# err={stderr}\n# cpus={cpus}\n"
+            "# mem={memory}\n# time={time}\n# wd={working_dir}\n"
+        )
+        added = _invoke(
+            self.runner,
+            self.project,
+            [
+                "target", "add", "password-host", "--transport", "ssh",
+                "--host", "user@example.org", "--scheduler", "none",
+                "--remote-root", "/tmp/password-host", "--template-file", str(template),
+            ],
+        )
+        self.assertEqual(added.exit_code, 0, added.output)
+
+        completed = __import__("subprocess").CompletedProcess
+        with mock.patch("cluster_dispatch.transport.subprocess.run") as run:
+            run.side_effect = [
+                completed(["ssh"], 1, stdout="", stderr=""),
+                completed(["ssh"], 0, stdout="", stderr=""),
+            ]
+            result = _invoke(self.runner, self.project, ["target", "login", "password-host"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("connection ready", result.output)
+        check_cmd = run.call_args_list[0].args[0]
+        login_cmd = run.call_args_list[1].args[0]
+        self.assertIn("check", check_cmd)
+        self.assertIn("BatchMode=no", login_cmd)
+        self.assertIn("-fN", login_cmd)
+        self.assertEqual(login_cmd[-1], "password-host")
+
+        ssh_config = (self.project / ".cluster_dispatch" / "ssh" / "config").read_text()
+        self.assertIn("ControlPersist 8h", ssh_config)
+        self.assertIn("ServerAliveInterval 30", ssh_config)
+        self.assertIn("ServerAliveCountMax 3", ssh_config)
+        self.assertIn("TCPKeepAlive yes", ssh_config)
+
+    def test_target_login_reuses_existing_control_connection(self) -> None:
+        cfg = load_config(self.project)
+        cfg.targets["remote"] = TargetConfig(
+            host="example.org", scheduler="none", remote_root="/tmp/remote", transport="ssh"
+        )
+        save_config(self.project, cfg)
+        completed = __import__("subprocess").CompletedProcess
+        with mock.patch(
+            "cluster_dispatch.transport.subprocess.run",
+            return_value=completed(["ssh"], 0, stdout="", stderr=""),
+        ) as run:
+            result = _invoke(self.runner, self.project, ["target", "login", "remote"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("already active", result.output)
+        self.assertEqual(run.call_count, 1)
 
     def test_target_test_json_output(self) -> None:
         result = _invoke(self.runner, self.project, ["target", "test", "local", "--json"])
